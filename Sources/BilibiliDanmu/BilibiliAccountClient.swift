@@ -150,7 +150,11 @@ public actor BilibiliAccountClient {
         try await credentialStore.clear()
     }
 
-    public func sendDanmu(message: String, roomID: String) async throws {
+    public func sendDanmu(
+        message: String,
+        roomID: String,
+        replyToAuthorID: String? = nil
+    ) async throws {
         guard let credential = await credentialProvider.currentCredential(), credential.isUsable else {
             throw AccountError.notSignedIn
         }
@@ -164,6 +168,7 @@ public actor BilibiliAccountClient {
         }
 
         let sanitizedRoomID = roomID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let replyMID = replyToAuthorID?.nonEmptyTrimmed ?? "0"
         var request = URLRequest(url: URL(string: "https://api.live.bilibili.com/msg/send")!)
         request.httpMethod = "POST"
         request.setValue("https://live.bilibili.com", forHTTPHeaderField: "Origin")
@@ -181,6 +186,14 @@ public actor BilibiliAccountClient {
             URLQueryItem(name: "msg", value: sanitizedMessage),
             URLQueryItem(name: "color", value: "16777215"),
             URLQueryItem(name: "mode", value: "1"),
+            URLQueryItem(name: "room_type", value: "0"),
+            URLQueryItem(name: "jumpfrom", value: "0"),
+            URLQueryItem(name: "reply_mid", value: replyMID),
+            URLQueryItem(name: "reply_attr", value: "0"),
+            URLQueryItem(name: "reply_uname", value: ""),
+            URLQueryItem(name: "replay_dmid", value: ""),
+            URLQueryItem(name: "statistics", value: #"{"appId":100,"platform":5}"#),
+            URLQueryItem(name: "reply_type", value: "0"),
             URLQueryItem(name: "fontsize", value: "25"),
             URLQueryItem(name: "rnd", value: String(Int(now().timeIntervalSince1970))),
             URLQueryItem(name: "roomid", value: sanitizedRoomID),

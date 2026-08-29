@@ -144,6 +144,25 @@ struct BiliLiveCommandParserTests {
         #expect(event?.content == "回复 @WenjunXueCPP: test一下")
     }
 
+    @Test func replyMetadataRestoresMaskedInlineMentionWithoutDuplicatingIt() {
+        let raw: [String: Any] = [
+            "cmd": "DANMU_MSG",
+            "info": [
+                [
+                    0, 1, 25, 16_777_215, 1_700_000_000, 0, 0, "hash",
+                    0, 0, 0, "", 0, [:], "",
+                    ["reply_mid": 12345, "reply_uname": "观众甲"],
+                ],
+                "@观*** 这个方案可行",
+                [67890, "主播"],
+            ],
+        ]
+
+        let event = BiliLiveCommandParser.parse(rawCommand: raw, id: "masked-inline-reply")
+
+        #expect(event?.content == "@观众甲 这个方案可行")
+    }
+
     @Test func giftCommandBecomesStandardGiftEvent() {
         let raw: [String: Any] = [
             "cmd": "SEND_GIFT",

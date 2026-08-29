@@ -58,6 +58,43 @@ struct TerminalRendererTests {
         )
     }
 
+    @Test func statusLineDistinguishesUnknownLiveAndMutedStates() throws {
+        let configuration = try TerminalConfiguration.load(arguments: ["--room", "1"])
+        var state = TerminalViewState(
+            configuration: configuration,
+            connectionState: .connected(roomID: "1"),
+            room: nil,
+            events: [],
+            questions: [],
+            featuredEvent: nil,
+            broadcasterNickname: nil,
+            broadcasterAuthorID: nil,
+            editor: TerminalEditorSnapshot(text: "", cursor: 0),
+            notice: nil,
+            totalEventCount: 0,
+            revision: 1
+        )
+        let renderer = TerminalRenderer()
+        let size = TerminalSize(columns: 120, rows: 16)
+
+        let unknown = renderer.render(state, size: size)
+        #expect(unknown.contains("\u{001B}[38;2;132;146;166m直播 --"))
+        #expect(unknown.contains("\u{001B}[38;2;132;146;166mMIC --"))
+
+        state.obsStatus.connection = .connected
+        state.obsStatus.stream = .live
+        state.obsStatus.microphone = .muted
+        let liveAndMuted = renderer.render(state, size: size)
+        #expect(liveAndMuted.contains("\u{001B}[1;38;2;255;159;110m● 直播中"))
+        #expect(liveAndMuted.contains("\u{001B}[1;38;2;255;159;110mMIC 静音"))
+
+        state.obsStatus.stream = .stopped
+        state.obsStatus.microphone = .unmuted
+        let stoppedAndOpen = renderer.render(state, size: size)
+        #expect(stoppedAndOpen.contains("未直播"))
+        #expect(stoppedAndOpen.contains("\u{001B}[1;38;2;105;214;193mMIC 开启"))
+    }
+
     @Test func slashSuggestionsRenderWithDescriptionsWithoutHidingInput() throws {
         let configuration = try TerminalConfiguration.load(arguments: ["--room", "1"])
         let state = TerminalViewState(
@@ -259,13 +296,118 @@ struct TerminalRendererTests {
         )
 
         let lines = terminalContentLines(
-            TerminalRenderer().render(state, size: TerminalSize(columns: 41, rows: 16))
+            TerminalRenderer().render(state, size: TerminalSize(columns: 39, rows: 16))
         )
         let firstLineIndex = try #require(lines.firstIndex { $0.contains("让它做个放烟花的效果") })
 
         #expect(!lines[firstLineIndex].contains("，"))
         #expect(lines[firstLineIndex + 1].contains("，然后"))
-        #expect(lines.allSatisfy { terminalDisplayWidth($0) <= 41 })
+        #expect(lines.allSatisfy { terminalDisplayWidth($0) <= 39 })
+    }
+
+    @Test func bilibiliEmoteShortcodesRenderAsEmojiAndUnknownCodesRemainVisible() throws {
+        var configuration = try TerminalConfiguration.load(arguments: ["--room", "1", "--theme", "pure"])
+        configuration.chatLayout = false
+        configuration.singleLine = true
+        configuration.showTime = false
+        let event = DanmuEvent(
+            id: "emote-message",
+            kind: .danmu,
+            timestamp: .now,
+            username: "表情观众",
+            content: "来了[dog][笑哭][未知表情]"
+        )
+        let state = TerminalViewState(
+            configuration: configuration,
+            connectionState: .connected(roomID: "1"),
+            room: nil,
+            events: [event],
+            questions: [],
+            featuredEvent: nil,
+            broadcasterNickname: nil,
+            broadcasterAuthorID: nil,
+            editor: TerminalEditorSnapshot(text: "", cursor: 0),
+            notice: nil,
+            totalEventCount: 1,
+            revision: 1
+        )
+
+        let output = TerminalRenderer().render(state, size: TerminalSize(columns: 50, rows: 16))
+
+        #expect(output.contains("来了🐶😂[未知表情]"))
+        #expect(!output.contains("[dog]"))
+        #expect(!output.contains("[笑哭]"))
+    }
+    @Test func metadataOnlyRoomEmoteKeepsItsReadableShortcode() throws {
+        var configuration = try TerminalConfiguration.load(arguments: ["--room", "1", "--theme", "pure"])
+        configuration.chatLayout = false
+        configuration.singleLine = true
+        configuration.showTime = false
+        let event = DanmuEvent(
+            id: "room-emote",
+            kind: .danmu,
+            timestamp: .now,
+            username: "表情观众",
+            content: "",
+            emotes: [
+                DanmuEmote(
+                    text: "[主播专属]",
+                    imageURL: try #require(URL(string: "https://i0.hdslb.com/bfs/live/room.png"))
+                ),
+            ]
+        )
+        let state = TerminalViewState(
+            configuration: configuration,
+            connectionState: .connected(roomID: "1"),
+            room: nil,
+            events: [event],
+            questions: [],
+            featuredEvent: nil,
+            broadcasterNickname: nil,
+            broadcasterAuthorID: nil,
+            editor: TerminalEditorSnapshot(text: "", cursor: 0),
+            notice: nil,
+            totalEventCount: 1,
+            revision: 1
+        )
+
+        let output = TerminalRenderer().render(state, size: TerminalSize(columns: 50, rows: 16))
+
+        #expect(output.contains("[主播专属]"))
+    }
+
+    @Test func compoundEmojiOccupyOneDoubleWidthTerminalCell() throws {
+        var configuration = try TerminalConfiguration.load(arguments: ["--room", "1", "--theme", "pure"])
+        configuration.chatLayout = false
+        configuration.singleLine = true
+        configuration.showTime = false
+        let event = DanmuEvent(
+            id: "compound-emoji",
+            kind: .danmu,
+            timestamp: .now,
+            username: "甲",
+            content: "家庭👨‍👩‍👧‍👦点赞👍🏽结尾"
+        )
+        let state = TerminalViewState(
+            configuration: configuration,
+            connectionState: .connected(roomID: "1"),
+            room: nil,
+            events: [event],
+            questions: [],
+            featuredEvent: nil,
+            broadcasterNickname: nil,
+            broadcasterAuthorID: nil,
+            editor: TerminalEditorSnapshot(text: "", cursor: 0),
+            notice: nil,
+            totalEventCount: 1,
+            revision: 1
+        )
+
+        let lines = terminalContentLines(
+            TerminalRenderer().render(state, size: TerminalSize(columns: 22, rows: 16))
+        )
+
+        #expect(lines.contains { $0.contains("甲  家庭👨‍👩‍👧‍👦点赞👍🏽结尾") })
     }
 
     @Test func replyDanmuKeepsMentionTargetVisible() throws {
@@ -471,85 +613,64 @@ struct TerminalRendererTests {
         #expect(output.contains("前缀19"))
         #expect(output.contains("\u{001B}[7m"))
     }
-    @Test func bilibiliEmotesUseUnicodeOrReadableShortcodes() throws {
+
+    @Test func narrowLayoutSpendsRowsOnMessagesInsteadOfFrames() throws {
         var configuration = try TerminalConfiguration.load(arguments: ["--room", "1", "--theme", "pure"])
         configuration.chatLayout = false
         configuration.singleLine = true
         configuration.showTime = false
-        let event = DanmuEvent(
-            id: "emote-message",
-            kind: .danmu,
-            timestamp: .now,
-            username: "表情观众",
-            content: "来了[dog][主播专属]",
-            emotes: [
-                DanmuEmote(
-                    text: "[dog]",
-                    imageURL: try #require(URL(string: "https://i0.hdslb.com/bfs/live/dog.png"))
-                ),
-                DanmuEmote(
-                    text: "[主播专属]",
-                    imageURL: try #require(URL(string: "https://i0.hdslb.com/bfs/live/room.png"))
-                ),
-            ]
-        )
+        let events = (0..<20).map { index in
+            DanmuEvent(
+                id: "narrow-\(index)",
+                kind: .danmu,
+                timestamp: .now,
+                username: nil,
+                content: "消息\(index)"
+            )
+        }
         let state = TerminalViewState(
             configuration: configuration,
             connectionState: .connected(roomID: "1"),
             room: nil,
-            events: [event],
+            events: events,
             questions: [],
             featuredEvent: nil,
             broadcasterNickname: nil,
             broadcasterAuthorID: nil,
             editor: TerminalEditorSnapshot(text: "", cursor: 0),
             notice: nil,
-            totalEventCount: 1,
+            totalEventCount: events.count,
             revision: 1
         )
 
-        let output = TerminalRenderer().render(state, size: TerminalSize(columns: 50, rows: 16))
+        let output = TerminalRenderer().render(state, size: TerminalSize(columns: 60, rows: 10))
 
-        #expect(output.contains("来了🐶[主播专属]"))
-        #expect(!output.contains("[dog]"))
+        let messageLineCount = terminalContentLines(output).count { $0.contains("消息") }
+        #expect(messageLineCount == 8)
+        #expect(!output.contains("╭"))
     }
 
-    @Test func metadataOnlyRoomEmoteKeepsItsReadableShortcode() throws {
-        var configuration = try TerminalConfiguration.load(arguments: ["--room", "1", "--theme", "pure"])
-        configuration.chatLayout = false
-        configuration.singleLine = true
-        configuration.showTime = false
-        let event = DanmuEvent(
-            id: "room-emote",
-            kind: .danmu,
-            timestamp: .now,
-            username: "表情观众",
-            content: "",
-            emotes: [
-                DanmuEmote(
-                    text: "[主播专属]",
-                    imageURL: try #require(URL(string: "https://i0.hdslb.com/bfs/live/room.png"))
-                ),
-            ]
-        )
+    @Test func compactLayoutRendersAndWrapsNotice() throws {
+        let configuration = try TerminalConfiguration.load(arguments: ["--room", "1"])
         let state = TerminalViewState(
             configuration: configuration,
             connectionState: .connected(roomID: "1"),
             room: nil,
-            events: [event],
+            events: [],
             questions: [],
             featuredEvent: nil,
             broadcasterNickname: nil,
             broadcasterAuthorID: nil,
             editor: TerminalEditorSnapshot(text: "", cursor: 0),
-            notice: nil,
-            totalEventCount: 1,
+            notice: "OBS 临时错误需要展示完整原因",
+            totalEventCount: 0,
             revision: 1
         )
 
-        let output = TerminalRenderer().render(state, size: TerminalSize(columns: 50, rows: 16))
+        let output = TerminalRenderer().render(state, size: TerminalSize(columns: 16, rows: 6))
 
-        #expect(output.contains("[主播专属]"))
+        #expect(output.contains("OBS 临时错误"))
+        #expect(output.contains("完整原因"))
     }
 }
 

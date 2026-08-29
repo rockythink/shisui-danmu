@@ -101,7 +101,6 @@ public struct DanmuEvent: Identifiable, Codable, Equatable, Sendable {
         emotes = try container.decodeIfPresent([DanmuEmote].self, forKey: .emotes) ?? []
     }
 }
-
 public enum QuestionStatus: String, Codable, CaseIterable, Sendable {
     case pending
     case answering

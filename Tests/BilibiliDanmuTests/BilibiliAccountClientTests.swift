@@ -83,6 +83,46 @@ struct BilibiliAccountClientTests {
         try await client.sendDanmu(message: " 主动发弹幕测试 ", roomID: "392612")
     }
 
+    @Test func replyingToObservedUserSendsPlatformMentionMetadata() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BilibiliAccountURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let credential = BilibiliAccountCredential(
+            cookieHeader: "SESSDATA=session-value; bili_jct=csrf-token",
+            csrf: "csrf-token"
+        )
+        let client = BilibiliAccountClient(
+            session: session,
+            credentialProvider: StaticBilibiliCredentialProvider(credential: credential)
+        )
+
+        BilibiliAccountURLProtocol.requestHandler = { request in
+            let body = try #require(Self.requestBodyString(from: request))
+            let items = try #require(URLComponents(string: "?\(body)")?.queryItems)
+            let values = Dictionary(uniqueKeysWithValues: items.map { ($0.name, $0.value ?? "") })
+            #expect(values["msg"] == "@观众甲 这个方案可行")
+            #expect(values["reply_mid"] == "12345")
+            #expect(values["reply_attr"] == "0")
+            #expect(values["room_type"] == "0")
+
+            let data = #"{"code":0,"message":"0"}"#.data(using: .utf8)!
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            return (response, data)
+        }
+        defer { BilibiliAccountURLProtocol.requestHandler = nil }
+
+        try await client.sendDanmu(
+            message: "@观众甲 这个方案可行",
+            roomID: "392612",
+            replyToAuthorID: "12345"
+        )
+    }
+
     @Test func sendingDanmuRequiresLoginState() async {
         let client = BilibiliAccountClient(
             session: URLSession(configuration: .ephemeral),

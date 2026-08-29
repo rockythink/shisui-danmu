@@ -286,8 +286,7 @@ enum BiliLiveCommandParser {
         else {
             return content
         }
-        let replyContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        return "回复 @\(replyUsername): \(replyContent)"
+        return restoringReplyUsername(in: content, username: replyUsername)
     }
 
     private static func danmuEmotes(from info: [Any]) -> [DanmuEmote] {
@@ -356,6 +355,23 @@ enum BiliLiveCommandParser {
         guard let value = intValue(value), value > 0 else { return nil }
         return value
     }
+
+    private static func restoringReplyUsername(in content: String, username: String) -> String {
+        let replyContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fullMention = "@\(username)"
+        if replyContent.hasPrefix(fullMention) {
+            return replyContent
+        }
+        if replyContent.first == "@" {
+            let mentionEnd = replyContent.firstIndex(where: \.isWhitespace) ?? replyContent.endIndex
+            let inlineMention = replyContent[..<mentionEnd]
+            if inlineMention.contains("*") || inlineMention.contains("＊") {
+                return fullMention + replyContent[mentionEnd...]
+            }
+        }
+        return "回复 @\(username): \(replyContent)"
+    }
+
 
     private static func replyUsername(from modeInfo: [String: Any]) -> String? {
         if let direct = stringValue(modeInfo["reply_uname"])?.nonEmptyTrimmed {

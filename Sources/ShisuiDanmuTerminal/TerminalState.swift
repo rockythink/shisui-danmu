@@ -8,6 +8,11 @@ private struct TerminalCanonicalIdentity: Hashable, Sendable {
     let authorID: String
 }
 
+private struct TerminalReplyTarget: Sendable {
+    let username: String
+    let authorID: String
+}
+
 enum TerminalOBSIntent: Equatable, Sendable {
     case connect
     case refresh
@@ -33,7 +38,7 @@ struct TerminalSlashSuggestion: Equatable, Sendable {
 enum TerminalInputAction: Sendable {
     case none
     case quit
-    case send(String)
+    case send(String, replyToAuthorID: String?)
     case obs(TerminalOBSIntent)
     case account(TerminalAccountIntent)
 }
@@ -92,10 +97,18 @@ actor TerminalState {
     private var isSending = false
     private var editor = TerminalLineEditor()
     private var inputDecoder = TerminalInputDecoder()
-    private var notice: String?
+    private let noticeVisibilityDuration: TimeInterval = 8
+    private var noticeUpdatedAt: Date?
+    private var notice: String? {
+        didSet {
+            guard notice != oldValue else { return }
+            noticeUpdatedAt = notice == nil ? nil : .now
+        }
+    }
     private var shouldQuit = false
     private var selectedEventID: String?
     private var frozenSelectionEvents: [DanmuEvent]?
+    private var pendingReplyTarget: TerminalReplyTarget?
     private var revision: UInt64 = 0
 
     init(
@@ -264,8 +277,11 @@ actor TerminalState {
         revision &+= 1
     }
 
-    func snapshot() -> TerminalViewState {
-        TerminalViewState(
+    func snapshot(now: Date = .now) -> TerminalViewState {
+        let visibleNotice = noticeUpdatedAt.map {
+            now.timeIntervalSince($0) < noticeVisibilityDuration
+        } == true ? notice : nil
+        return TerminalViewState(
             configuration: configuration,
             connectionState: connectionState,
             room: room,
@@ -289,7 +305,7 @@ actor TerminalState {
             broadcasterNickname: broadcasterNickname,
             broadcasterAuthorID: broadcasterAuthorID,
             editor: editor.snapshot,
-            notice: notice,
+            notice: visibleNotice,
             totalEventCount: session.metrics.totalEventCount,
             selectedEventID: selectedEventID,
             revision: revision
@@ -299,7 +315,9 @@ actor TerminalState {
     func quitting() -> Bool { shouldQuit }
 
     func updateOBSStatus(_ status: OBSStatus) {
+        let previousError = obsStatus.lastError
         obsStatus = status
+        if let previousError, notice == previousError { notice = nil }
         if status.stream != .live { obsStopConfirmationPending = false }
         revision &+= 1
     }
@@ -454,10 +472,15 @@ actor TerminalState {
                 isSlashPaletteDismissed = false
                 selectedSlashSuggestion = 0
                 if message.hasPrefix("/") {
+                    pendingReplyTarget = nil
                     return handleSlashCommand(message)
                 }
+                let replyToAuthorID = pendingReplyTarget.flatMap { target in
+                    message.contains("@\(target.username)") ? target.authorID : nil
+                }
+                pendingReplyTarget = nil
                 isSending = true
-                return .send(message)
+                return .send(message, replyToAuthorID: replyToAuthorID)
             }
         case .escape:
             if selectedEventID != nil {
@@ -511,8 +534,12 @@ actor TerminalState {
 
     private func mentionSelectedEvent() {
         guard let selectedEventID,
-              let event = eventSelectionCandidates.first(where: { $0.id == selectedEventID }),
-              let username = event.username?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let selectedEvent = eventSelectionCandidates.first(where: { $0.id == selectedEventID }) else {
+            cancelEventSelection()
+            return
+        }
+        let event = canonicalDisplayEvent(selectedEvent)
+        guard let username = event.username?.trimmingCharacters(in: .whitespacesAndNewlines),
               !username.isEmpty else {
             cancelEventSelection()
             return
@@ -523,6 +550,9 @@ actor TerminalState {
             && characters.indices.contains(snapshot.cursor - 1)
             && !characters[snapshot.cursor - 1].isWhitespace
         editor.insert("\(needsLeadingSpace ? " " : "")@\(username) ")
+        pendingReplyTarget = usableAuthorID(event.authorID).map {
+            TerminalReplyTarget(username: username, authorID: $0)
+        }
         cancelEventSelection()
         reopenSlashPalette()
     }

@@ -38,6 +38,9 @@ public actor FoundationOBSProcessRunner: OBSProcessRunning {
         process.executableURL = executableURL
         process.arguments = arguments
         process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+        // App processes launched by Finder or LLDB do not have a reliable stdin.
+        // Never let an external OBS command inherit those process descriptors.
+        process.standardInput = FileHandle.nullDevice
         process.standardOutput = stdout
         process.standardError = stderr
 

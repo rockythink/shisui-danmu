@@ -665,6 +665,41 @@ struct TerminalStateTests {
         #expect(await state.snapshot().draft == "先看这里 @观众甲 继续")
     }
 
+    @Test func submittingCanonicalMentionKeepsFullNameAndTargetAuthorID() async throws {
+        let configuration = try TerminalConfiguration.load(arguments: ["--room", "1"])
+        let state = TerminalState(configuration: configuration)
+        let timestamp = Date(timeIntervalSince1970: 1_000)
+        await state.consume(.event(DanmuEvent(
+            id: "target",
+            kind: .danmu,
+            timestamp: timestamp,
+            username: "观***",
+            authorID: "0",
+            content: "这个问题怎么处理？"
+        )))
+        await state.refreshCanonicalUsernames(from: [DanmuEvent(
+            id: "target-history",
+            kind: .danmu,
+            timestamp: timestamp,
+            username: "观众甲",
+            authorID: "12345",
+            content: "这个问题怎么处理？",
+            origin: .history
+        )])
+
+        _ = await state.handle(bytes: Array("\u{001B}[A".utf8))
+        _ = await state.handle(bytes: Array("\r".utf8))
+        #expect(await state.snapshot().draft == "@观众甲 ")
+        let action = await state.handle(bytes: Array("这个方案可行\r".utf8))
+
+        guard case .send(let message, let replyToAuthorID) = action else {
+            Issue.record("Expected a danmu submission")
+            return
+        }
+        #expect(message == "@观众甲 这个方案可行")
+        #expect(replyToAuthorID == "12345")
+    }
+
     @Test func escapeCancelsDanmuSelectionAndRestoresComposer() async throws {
         let configuration = try TerminalConfiguration.load(arguments: ["--room", "1"])
         let state = TerminalState(configuration: configuration)
@@ -725,5 +760,31 @@ struct TerminalStateTests {
             _ = await state.handle(bytes: Array("\u{001B}[B".utf8))
         }
         #expect(await state.snapshot().selectedEventID == "event-25")
+    }
+
+    @Test func noticesExpireWithoutWaitingForAnotherEvent() async throws {
+        let configuration = try TerminalConfiguration.load(arguments: ["--room", "1"])
+        let state = TerminalState(configuration: configuration)
+        let reportedAt = Date.now
+
+        await state.report("临时系统提示")
+
+        #expect(await state.snapshot(now: reportedAt).notice == "临时系统提示")
+        #expect(await state.snapshot(now: reportedAt.addingTimeInterval(9)).notice == nil)
+    }
+
+    @Test func repeatedOBSErrorDoesNotStayVisibleAndRecoveryClearsIt() async throws {
+        let configuration = try TerminalConfiguration.load(arguments: ["--room", "1"])
+        let state = TerminalState(configuration: configuration)
+        let reportedAt = Date.now
+        let error = OBSControlError.commandTimedOut
+
+        await state.reportOBSError(error)
+        await state.reportOBSError(error)
+        #expect(await state.snapshot(now: reportedAt.addingTimeInterval(9)).notice == nil)
+
+        await state.reportOBSError(error)
+        await state.updateOBSStatus(OBSStatus(connection: .connected))
+        #expect(await state.snapshot().notice == nil)
     }
 }

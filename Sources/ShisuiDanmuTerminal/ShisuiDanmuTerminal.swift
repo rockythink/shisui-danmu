@@ -213,7 +213,7 @@ struct ShisuiDanmuTerminal {
                             state: state
                         )
                     }
-                case .send(let message):
+                case .send(let message, let replyToAuthorID):
                     Task {
                         defer { Task { await state.finishSending() } }
                         do {
@@ -229,7 +229,11 @@ struct ShisuiDanmuTerminal {
                                     broadcasterNickname: nickname,
                                     broadcasterAuthorID: authorID
                                 )
-                                try await accountClient.sendDanmu(message: segment, roomID: configuration.roomID)
+                                try await accountClient.sendDanmu(
+                                    message: segment,
+                                    roomID: configuration.roomID,
+                                    replyToAuthorID: replyToAuthorID
+                                )
                                 await state.markSubmittedUnlessAlreadyConfirmed()
 
                                 let clock = ContinuousClock()

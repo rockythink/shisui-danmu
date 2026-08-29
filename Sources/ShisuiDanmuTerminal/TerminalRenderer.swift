@@ -1,6 +1,7 @@
 import BilibiliDanmu
 import DanmuCore
 import Foundation
+import OBSControl
 
 struct TerminalSize: Equatable, Sendable {
     let columns: Int
@@ -56,7 +57,9 @@ struct TerminalRenderer {
     func renderInteractive(_ state: TerminalViewState, size: TerminalSize, now: Date = .now) -> TerminalRenderResult {
         let width = max(1, size.columns)
         let height = max(1, size.rows)
-        if width < 32 || height < 7 {
+        // Framed panels cost four rows before showing any messages. Narrow and
+        // short terminals stay linear so resizing down preserves information.
+        if width < 72 || height < 10 {
             return compactRender(state, width: width, height: height, now: now)
         }
 
@@ -167,58 +170,19 @@ struct TerminalRenderer {
                 background: backgroundSequence(state.configuration.palette.background)
             )
         }
-        var eventLines: [String] = []
-        for event in state.events.reversed() {
-            let isBroadcaster = isBroadcasterMessage(event, state: state)
-            let trailing = state.configuration.chatLayout && isBroadcaster
-            let username = state.configuration.showUsername ? (event.username ?? kindName(event.kind)) : ""
-            let usernameTint = isBroadcaster ? state.configuration.palette.broadcaster : state.configuration.palette.name
-            let contentTint = tint(event.kind, palette: state.configuration.palette)
-            let time = state.configuration.showTime ? DateFormatter.terminalTime.string(from: event.timestamp) + " " : ""
-            let eventContent = visibleContent(event, state: state)
-            let eventStart = eventLines.count
-            if state.configuration.chatLayout {
-                if !eventLines.isEmpty { eventLines.append("") }
-                let visibleUsername = username.fittedWithoutPadding(to: max(1, width - time.displayWidth))
-                let metadataColumns = min(width, time.displayWidth + visibleUsername.displayWidth)
-                let metadataPadding = trailing ? String(repeating: " ", count: max(0, width - metadataColumns)) : ""
-                if !time.isEmpty || !visibleUsername.isEmpty {
-                    eventLines.append(
-                        metadataPadding
-                            + color(visibleUsername, usernameTint, bold: isBroadcaster)
-                    )
-                }
-                for content in eventContent.wrapped(to: width) {
-                    let contentPadding = trailing ? String(repeating: " ", count: max(0, width - content.displayWidth)) : ""
-                    eventLines.append(contentPadding + color(content, contentTint))
-                }
-            } else {
-                let separator = username.isEmpty ? "" : " "
-                let availableContent = max(1, width - time.displayWidth - username.displayWidth - separator.displayWidth)
-                let contentLines = eventContent.wrapped(
-                    firstLineWidth: availableContent,
-                    continuationWidth: width
-                )
-                let firstContent = contentLines.first ?? ""
-                eventLines.append(
-                    color(time, state.configuration.palette.time)
-                        + color(username, usernameTint, bold: isBroadcaster)
-                        + separator
-                        + color(firstContent, contentTint)
-                )
-                eventLines += contentLines.dropFirst().map { color($0, contentTint) }
-            }
-            if event.id == state.selectedEventID {
-                for index in eventStart..<eventLines.count {
-                    eventLines[index] = "\u{001B}[7m" + eventLines[index] + "\u{001B}[27m"
-                }
-            }
-        }
-        if let selectedIndex = eventLines.lastIndex(where: { $0.contains("\u{001B}[7m") }) {
+        let eventLines = eventRows(state.events, state: state, width: width)
+        let visibleRows: ArraySlice<StyledLine>
+        if let selectedIndex = eventLines.lastIndex(where: \.isSelected) {
             let end = min(eventLines.count, max(eventCapacity, selectedIndex + 1))
-            lines += eventLines[max(0, end - eventCapacity)..<end]
+            visibleRows = eventLines[max(0, end - eventCapacity)..<end]
         } else {
-            lines += eventLines.suffix(eventCapacity)
+            visibleRows = eventLines.suffix(eventCapacity)
+        }
+        lines += visibleRows.map { line in
+            let padding = String(repeating: " ", count: max(0, width - line.columns))
+            return line.isSelected
+                ? "\u{001B}[7m" + line.rendered + padding + "\u{001B}[27m"
+                : line.rendered + padding
         }
         while lines.count < height - 1 {
             lines.append(String(repeating: " ", count: width))
@@ -335,35 +299,153 @@ struct TerminalRenderer {
     }
 
     private func statusLine(_ state: TerminalViewState, width: Int, now: Date) -> String {
-        let connection: String
-        switch state.connectionState {
-        case .disconnected: connection = "OFFLINE"
-        case .connecting: connection = "CONNECTING"
-        case .connected: connection = "● LIVE"
-        case .reconnecting(let attempt, _): connection = "RECONNECT \(attempt)"
-        case .error: connection = "ERROR"
-        }
+        let palette = state.configuration.palette
+        let compact = width < 40
+        let connection = danmuConnectionSegment(state.connectionState, compact: compact, palette: palette)
+        let obsConnection = obsConnectionSegment(state.obsStatus.connection, compact: compact, palette: palette)
+        let stream = streamSegment(state.obsStatus.stream, compact: compact, palette: palette)
+        let microphone = microphoneSegment(state.obsStatus.microphone, compact: compact, palette: palette)
         let pending = state.questions.filter { $0.status == .pending || $0.status == .answering }.count
         let online = state.room.map { "在线 \($0.onlineCount.formatted())" } ?? "在线 --"
         let layout = state.configuration.chatLayout ? "聊天" : "信息流"
-        let obsConnection = state.obsStatus.connection == .connected ? "OBS●" : "OBS○"
-        let obsLive = state.obsStatus.stream == .live ? "LIVE" : "未直播"
-        let obsMic = state.obsStatus.microphone == .muted ? "MIC×" : "MIC"
-        let obsScene = state.obsStatus.currentScene ?? "--"
-        let obs = "\(obsConnection) \(obsLive) \(obsScene) \(obsMic)"
-        let text: String
+        let scene = state.obsStatus.currentScene ?? "--"
+        let segments: [TerminalStatusSegment]
+
         if width < 40 {
-            text = " \(obs)  房间 \(state.configuration.roomID) "
+            segments = [
+                TerminalStatusSegment(" ", tint: palette.content),
+                obsConnection,
+                TerminalStatusSegment(" ", tint: palette.content),
+                stream,
+                TerminalStatusSegment(" ", tint: palette.content),
+                microphone,
+                TerminalStatusSegment(" ", tint: palette.content),
+                connection,
+                TerminalStatusSegment("  房间 \(state.configuration.roomID) ", tint: palette.content),
+            ]
+        } else if width < 56 {
+            segments = [
+                TerminalStatusSegment(" ", tint: palette.content),
+                obsConnection,
+                TerminalStatusSegment("  ", tint: palette.content),
+                stream,
+                TerminalStatusSegment("  ", tint: palette.content),
+                microphone,
+                TerminalStatusSegment("  ", tint: palette.content),
+                connection,
+                TerminalStatusSegment("  房间 \(state.configuration.roomID) ", tint: palette.content),
+            ]
         } else if width < 72 {
-            text = " 拾穗弹幕台  \(layout)  \(obs)  \(connection) "
+            segments = [
+                TerminalStatusSegment(" 拾穗弹幕台  ", tint: palette.content, bold: true),
+                TerminalStatusSegment("\(layout)  ", tint: palette.time),
+                obsConnection,
+                TerminalStatusSegment(" ", tint: palette.content),
+                stream,
+                TerminalStatusSegment(" ", tint: palette.content),
+                microphone,
+                TerminalStatusSegment(" ", tint: palette.content),
+                connection,
+                TerminalStatusSegment(" ", tint: palette.content),
+            ]
         } else {
-            text = " \(obs) │ 拾穗弹幕台  \(layout)  \(connection)  房间 \(state.configuration.roomID)  \(online)  互动 \(state.totalEventCount)  待回答 \(pending) "
+            segments = [
+                TerminalStatusSegment(" ", tint: palette.content),
+                obsConnection,
+                TerminalStatusSegment(" ", tint: palette.content),
+                stream,
+                TerminalStatusSegment("  场景 \(scene)  ", tint: palette.content),
+                microphone,
+                TerminalStatusSegment(" │ 拾穗弹幕台  \(layout)  ", tint: palette.content, bold: true),
+                connection,
+                TerminalStatusSegment(
+                    "  房间 \(state.configuration.roomID)  \(online)  互动 \(state.totalEventCount)  待回答 \(pending) ",
+                    tint: palette.time
+                ),
+            ]
         }
-        return color(
-            text.fitted(to: width),
-            state.connectionState.isConnected ? state.configuration.palette.info : state.configuration.palette.rank,
-            bold: true
-        )
+
+        return styledStatusLine(segments, width: width)
+    }
+
+    private func styledStatusLine(_ segments: [TerminalStatusSegment], width: Int) -> String {
+        var rendered = ""
+        var remaining = width
+        for segment in segments where remaining > 0 {
+            let text = segment.text.fittedWithoutPadding(to: remaining)
+            rendered += color(text, segment.tint, bold: segment.bold)
+            remaining -= text.displayWidth
+            guard text.displayWidth == segment.text.displayWidth else { break }
+        }
+        return rendered + String(repeating: " ", count: max(0, remaining))
+    }
+
+    private func danmuConnectionSegment(
+        _ state: BilibiliConnectionState,
+        compact: Bool,
+        palette: TerminalPalette
+    ) -> TerminalStatusSegment {
+        switch state {
+        case .disconnected:
+            TerminalStatusSegment(compact ? "弹○" : "弹幕○", tint: palette.warning, bold: true)
+        case .connecting:
+            TerminalStatusSegment(compact ? "弹…" : "弹幕连接中", tint: palette.rank, bold: true)
+        case .connected:
+            TerminalStatusSegment(compact ? "弹●" : "弹幕●", tint: palette.info, bold: true)
+        case .reconnecting(let attempt, _):
+            TerminalStatusSegment(compact ? "重\(attempt)" : "弹幕重连 \(attempt)", tint: palette.rank, bold: true)
+        case .error:
+            TerminalStatusSegment(compact ? "弹×" : "弹幕错误", tint: palette.warning, bold: true)
+        }
+    }
+
+    private func obsConnectionSegment(
+        _ state: OBSConnectionState,
+        compact: Bool,
+        palette: TerminalPalette
+    ) -> TerminalStatusSegment {
+        switch state {
+        case .unknown:
+            TerminalStatusSegment(compact ? "OBS?" : "OBS --", tint: palette.time)
+        case .connected:
+            TerminalStatusSegment("OBS●", tint: palette.info, bold: true)
+        case .unavailable:
+            TerminalStatusSegment("OBS×", tint: palette.warning, bold: true)
+        }
+    }
+
+    private func streamSegment(
+        _ state: OBSStreamState,
+        compact: Bool,
+        palette: TerminalPalette
+    ) -> TerminalStatusSegment {
+        switch state {
+        case .unknown:
+            TerminalStatusSegment(compact ? "播?" : "直播 --", tint: palette.time)
+        case .stopped:
+            TerminalStatusSegment(compact ? "播○" : "未直播", tint: palette.time)
+        case .starting:
+            TerminalStatusSegment(compact ? "播…" : "开播中…", tint: palette.rank, bold: true)
+        case .live:
+            TerminalStatusSegment(compact ? "播●" : "● 直播中", tint: palette.warning, bold: true)
+        case .stopping:
+            TerminalStatusSegment(compact ? "停…" : "停播中…", tint: palette.rank, bold: true)
+        }
+    }
+
+    private func microphoneSegment(
+        _ state: OBSMicrophoneState,
+        compact: Bool,
+        palette: TerminalPalette
+    ) -> TerminalStatusSegment {
+        switch state {
+        case .unknown:
+            TerminalStatusSegment(compact ? "麦?" : "MIC --", tint: palette.time)
+        case .unmuted:
+            TerminalStatusSegment(compact ? "麦●" : "MIC 开启", tint: palette.info, bold: true)
+        case .muted:
+            TerminalStatusSegment(compact ? "麦×" : "MIC 静音", tint: palette.warning, bold: true)
+        }
     }
 
     private func chatroom(_ state: TerminalViewState, width: Int, height: Int, now: Date) -> [String] {
@@ -553,10 +635,12 @@ struct TerminalRenderer {
             }
         }
         if let notice = state.notice {
-            rows.append(StyledLine(
-                color("⚠ \(notice)".fitted(to: width), state.configuration.palette.warning),
-                columns: min(width, notice.displayWidth + 2)
-            ))
+            rows += ("⚠ \(notice)").wrapped(to: width).map { line in
+                StyledLine(
+                    color(line, state.configuration.palette.warning),
+                    columns: line.displayWidth
+                )
+            }
         }
         return rows
     }
@@ -625,13 +709,17 @@ struct TerminalRenderer {
 
     private func visibleContent(_ event: DanmuEvent, state: TerminalViewState) -> String {
         let source = event.terminalFallbackContent
-        guard !state.configuration.showUsername,
-              event.kind != .danmu,
-              let username = event.username,
-              source.hasPrefix(username) else { return source.replacingKnownBilibiliEmotes() }
-        let remainder = source.dropFirst(username.count)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let content = remainder.isEmpty ? kindName(event.kind) : remainder
+        let content: String
+        if !state.configuration.showUsername,
+           event.kind != .danmu,
+           let username = event.username,
+           source.hasPrefix(username) {
+            let remainder = source.dropFirst(username.count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            content = remainder.isEmpty ? kindName(event.kind) : remainder
+        } else {
+            content = source
+        }
         return content.replacingKnownBilibiliEmotes()
     }
 
@@ -718,6 +806,18 @@ struct TerminalRenderer {
     }
 }
 
+private struct TerminalStatusSegment {
+    let text: String
+    let tint: String
+    let bold: Bool
+
+    init(_ text: String, tint: String, bold: Bool = false) {
+        self.text = text
+        self.tint = tint
+        self.bold = bold
+    }
+}
+
 private struct StyledLine {
     let rendered: String
     let columns: Int
@@ -729,11 +829,10 @@ private struct StyledLine {
         self.isSelected = isSelected
     }
 
-    static func plain(_ value: String) -> StyledLine {
-        StyledLine(value, columns: value.displayWidth)
+    static func plain(_ text: String, isSelected: Bool = false) -> StyledLine {
+        StyledLine(text, columns: text.displayWidth, isSelected: isSelected)
     }
 }
-
 private struct RGB {
     let r: Int
     let g: Int
@@ -789,16 +888,17 @@ private let bilibiliEmoteEmoji: [String: String] = [
     "[热词系列_三连]": "👍",
     "[热词系列_爷青回]": "🥹",
 ]
-
 private extension DanmuEvent {
     var terminalFallbackContent: String {
         content.isEmpty ? emotes.map(\.text).joined() : content
     }
 }
+
 private extension String {
     var displayWidth: Int {
-        unicodeScalars.reduce(0) { result, scalar in result + scalar.terminalColumnWidth }
+        reduce(0) { result, character in result + character.terminalColumnWidth }
     }
+
     func replacingKnownBilibiliEmotes() -> String {
         guard contains("[") else { return self }
 
@@ -883,6 +983,21 @@ private extension String {
             used += characterWidth
         }
         return result + "…" + String(repeating: " ", count: max(0, width - used - 1))
+    }
+}
+
+private extension Character {
+    var terminalColumnWidth: Int {
+        let scalars = unicodeScalars
+        let containsEmojiPresentation = scalars.contains { $0.properties.isEmojiPresentation }
+        let containsEmojiVariation = scalars.contains { $0.value == 0xFE0F }
+        let containsEmoji = scalars.contains { $0.properties.isEmoji }
+        if containsEmojiPresentation || (containsEmojiVariation && containsEmoji) {
+            return 2
+        }
+        return scalars.reduce(0) { result, scalar in
+            result + scalar.terminalColumnWidth
+        }
     }
 }
 

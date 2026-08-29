@@ -9,6 +9,7 @@ public actor ObsCLIController: OBSControlling {
     private let lockPath: String
     private var cachedCompatibilityWarning: String?
     private var didCheckCompatibility = false
+    private var commandIsRunning = false
 
     public init(
         configuration: OBSConfiguration,
@@ -199,23 +200,56 @@ public actor ObsCLIController: OBSControlling {
         guard let executable = OBSCLIPathResolver.resolve(configuredPath: configuration.executablePath) else {
             throw OBSControlError.cliNotInstalled
         }
+        try await acquireCommandSlot()
+        defer { commandIsRunning = false }
+
         let password = try await passwordProvider()
         var environment = [
             "OBS_API_HOST": configuration.host,
             "OBS_API_PORT": String(configuration.port)
         ]
         if let password, !password.isEmpty { environment["OBS_API_PASSWORD"] = password }
-        let result = try await runner.run(
-            executableURL: executable,
-            arguments: arguments,
-            environment: environment,
-            timeout: .seconds(5)
-        )
-        guard result.exitCode == 0 else {
-            throw classifyFailure(result, password: password)
+
+        for attempt in 0..<3 {
+            do {
+                let result = try await runner.run(
+                    executableURL: executable,
+                    arguments: arguments,
+                    environment: environment,
+                    timeout: .seconds(5)
+                )
+                if result.exitCode == 0 {
+                    if checksExitCodeOnly { return result }
+                    return result
+                }
+                let error = classifyFailure(result, password: password)
+                guard attempt < 2, isRetryable(error) else { throw error }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as OBSControlError {
+                guard attempt < 2, isRetryable(error) else { throw error }
+            }
+            try await Task.sleep(for: attempt == 0 ? .milliseconds(200) : .milliseconds(600))
         }
-        if checksExitCodeOnly { return result }
-        return result
+        throw OBSControlError.commandFailed(exitCode: -1, detail: "OBS 重试未返回结果")
+    }
+
+    private func acquireCommandSlot() async throws {
+        while commandIsRunning {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        commandIsRunning = true
+    }
+
+    private func isRetryable(_ error: OBSControlError) -> Bool {
+        switch error {
+        case .obsUnavailable, .commandTimedOut, .commandFailed:
+            true
+        case .cliNotInstalled, .authenticationFailed, .incompatibleVersion,
+             .sceneNotFound, .inputNotFound, .confirmationFailed,
+             .configurationMissing, .busy, .invalidResponse:
+            false
+        }
     }
 
     private func classifyFailure(_ result: OBSProcessResult, password: String?) -> OBSControlError {
@@ -239,7 +273,26 @@ public actor ObsCLIController: OBSControlling {
         if lower.contains("input") && lower.contains("not found") {
             return .inputNotFound(configuration.microphoneInputName)
         }
-        return .commandFailed(exitCode: result.exitCode, detail: "obs-cli 返回退出码 \(result.exitCode)")
+        let detail = conciseDiagnostic(diagnostic).map {
+            "obs-cli 退出码 \(result.exitCode)：\($0)"
+        } ?? "obs-cli 返回退出码 \(result.exitCode)"
+        return .commandFailed(exitCode: result.exitCode, detail: detail)
+    }
+
+    private func conciseDiagnostic(_ diagnostic: String) -> String? {
+        let borderCharacters = CharacterSet(charactersIn: " │╭╮╰╯─")
+        return diagnostic
+            .split(whereSeparator: \.isNewline)
+            .reversed()
+            .map { $0.trimmingCharacters(in: borderCharacters) }
+            .first { line in
+                !line.isEmpty
+                    && !line.hasPrefix("Traceback")
+                    && !line.hasPrefix("File ")
+                    && !line.hasPrefix("╭")
+                    && !line.hasPrefix("╰")
+            }
+            .map { String($0.prefix(160)) }
     }
 
     private func withMutationLock<T: Sendable>(_ operation: () async throws -> T) async throws -> T {
