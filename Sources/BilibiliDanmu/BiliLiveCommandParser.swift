@@ -32,7 +32,9 @@ enum BiliLiveCommandParser {
             guard let info = raw["info"] as? [Any] else {
                 return nil
             }
-            let content = danmuContent(from: info)
+            let emotes = danmuEmotes(from: info)
+            let parsedContent = danmuContent(from: info)
+            let content = parsedContent.isEmpty ? emotes.map(\.text).joined() : parsedContent
             let user = safeValue(in: info, at: 2) as? [Any] ?? []
             return DanmuEvent(
                 id: eventID,
@@ -41,7 +43,8 @@ enum BiliLiveCommandParser {
                 username: stringValue(safeValue(in: user, at: 1)) ?? "观众",
                 authorID: stringValue(safeValue(in: user, at: 0)),
                 content: content,
-                platformEventID: sourceID
+                platformEventID: sourceID,
+                emotes: emotes
             )
         case "SEND_GIFT", "COMBO_SEND":
             let username = stringValue(data["uname"]) ?? stringValue(data["user_name"]) ?? "观众"
@@ -278,8 +281,7 @@ enum BiliLiveCommandParser {
     private static func danmuContent(from info: [Any]) -> String {
         let content = stringValue(safeValue(in: info, at: 1)) ?? ""
         guard
-            let metadata = safeValue(in: info, at: 0) as? [Any],
-            let modeInfo = safeValue(in: metadata, at: 15) as? [String: Any],
+            let modeInfo = danmuModeInfo(from: info),
             let replyUsername = replyUsername(from: modeInfo)?.nonEmptyTrimmed
         else {
             return content
@@ -288,22 +290,78 @@ enum BiliLiveCommandParser {
         return "回复 @\(replyUsername): \(replyContent)"
     }
 
+    private static func danmuEmotes(from info: [Any]) -> [DanmuEmote] {
+        guard let modeInfo = danmuModeInfo(from: info) else { return [] }
+        let extra = decodedExtra(from: modeInfo)
+        let value = extra?["emots"] ?? modeInfo["emots"]
+        guard let rawEmotes = value as? [String: Any] else { return [] }
+
+        return rawEmotes.compactMap { fallbackText, value in
+            guard
+                let descriptor = value as? [String: Any],
+                let rawURL = stringValue(descriptor["url"]),
+                let imageURL = secureImageURL(rawURL)
+            else {
+                return nil
+            }
+            let text = stringValue(descriptor["emoji"])
+                ?? stringValue(descriptor["text"])
+                ?? stringValue(descriptor["descript"])
+                ?? fallbackText
+            guard !text.isEmpty else { return nil }
+            return DanmuEmote(
+                text: text,
+                imageURL: imageURL,
+                width: positiveIntValue(descriptor["width"]),
+                height: positiveIntValue(descriptor["height"]),
+                isAnimated: intValue(descriptor["is_dynamic"]) == 1
+            )
+        }
+        .sorted { $0.text < $1.text }
+    }
+
+    private static func danmuModeInfo(from info: [Any]) -> [String: Any]? {
+        guard let metadata = safeValue(in: info, at: 0) as? [Any] else { return nil }
+        return safeValue(in: metadata, at: 15) as? [String: Any]
+    }
+
+    private static func decodedExtra(from modeInfo: [String: Any]) -> [String: Any]? {
+        let extra = modeInfo["extra"]
+        if let extra = extra as? [String: Any] {
+            return extra
+        }
+        guard
+            let encoded = stringValue(extra),
+            let data = encoded.data(using: .utf8)
+        else {
+            return nil
+        }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    private static func secureImageURL(_ value: String) -> URL? {
+        guard var components = URLComponents(string: value) else { return nil }
+        switch components.scheme?.lowercased() {
+        case "http":
+            components.scheme = "https"
+        case "https":
+            break
+        default:
+            return nil
+        }
+        return components.url
+    }
+
+    private static func positiveIntValue(_ value: Any?) -> Int? {
+        guard let value = intValue(value), value > 0 else { return nil }
+        return value
+    }
+
     private static func replyUsername(from modeInfo: [String: Any]) -> String? {
         if let direct = stringValue(modeInfo["reply_uname"])?.nonEmptyTrimmed {
             return direct
         }
-        let extra = modeInfo["extra"]
-        if let extra = extra as? [String: Any] {
-            return stringValue(extra["reply_uname"])
-        }
-        guard
-            let encoded = stringValue(extra),
-            let data = encoded.data(using: .utf8),
-            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            return nil
-        }
-        return stringValue(decoded["reply_uname"])
+        return stringValue(decodedExtra(from: modeInfo)?["reply_uname"])
     }
 
     private static func safeValue(in array: [Any], at index: Int) -> Any? {

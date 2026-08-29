@@ -37,7 +37,8 @@ public struct BroadcasterIdentity: Equatable, Sendable {
             authorID: event.authorID ?? authorID,
             content: event.content,
             origin: event.origin,
-            platformEventID: event.platformEventID
+            platformEventID: event.platformEventID,
+            emotes: event.emotes
         )
     }
 }

@@ -32,6 +32,73 @@ struct BiliLiveCommandParserTests {
             content: "为什么数据架构还要学 Flink？"
         ))
     }
+    @Test func danmuEmoteMetadataBecomesStandardInlineEmotes() throws {
+        let raw: [String: Any] = [
+            "cmd": "DANMU_MSG",
+            "info": [
+                [
+                    0, 1, 25, 16_777_215, 1_700_000_000, 0, 0, "hash",
+                    0, 0, 0, "", 0, [:], nil,
+                    [
+                        "extra": [
+                            "emots": [
+                                "[热]": [
+                                    "emoji": "[热]",
+                                    "url": "http://i0.hdslb.com/bfs/live/heat.png",
+                                    "width": 20,
+                                    "height": 20,
+                                    "is_dynamic": 0,
+                                ],
+                                "[主播专属]": [
+                                    "descript": "[主播专属]",
+                                    "url": "https://i1.hdslb.com/bfs/live/room-emote.gif",
+                                    "width": 162,
+                                    "height": 162,
+                                    "is_dynamic": 1,
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+                "一起[热][主播专属]",
+                [12345, "表情观众"],
+            ],
+        ]
+
+        let event = try #require(BiliLiveCommandParser.parse(rawCommand: raw, id: "emote-danmu"))
+        let heat = try #require(event.emotes.first { $0.text == "[热]" })
+        let roomEmote = try #require(event.emotes.first { $0.text == "[主播专属]" })
+
+        #expect(event.content == "一起[热][主播专属]")
+        #expect(event.emotes.count == 2)
+        #expect(heat.imageURL.absoluteString == "https://i0.hdslb.com/bfs/live/heat.png")
+        #expect(heat.width == 20)
+        #expect(heat.height == 20)
+        #expect(!heat.isAnimated)
+        #expect(roomEmote.isAnimated)
+    }
+
+    @Test func emptyEmoteDanmuUsesTheReceivedEmoteTextAsFallback() throws {
+        let raw: [String: Any] = [
+            "cmd": "DANMU_MSG",
+            "info": [
+                [
+                    0, 1, 25, 16_777_215, 1_700_000_000, 0, 0, "hash",
+                    0, 0, 0, "", 0, [:], nil,
+                    [
+                        "extra": #"{"emots":{"[热]":{"emoji":"[热]","url":"https://i0.hdslb.com/bfs/live/heat.png"}}}"#,
+                    ],
+                ],
+                "",
+                [12345, "表情观众"],
+            ],
+        ]
+
+        let event = try #require(BiliLiveCommandParser.parse(rawCommand: raw, id: "empty-emote"))
+
+        #expect(event.content == "[热]")
+        #expect(event.emotes.map(\.text) == ["[热]"])
+    }
 
     @Test func replyDanmuPreservesMentionedUsernameFromModeInfo() {
         let raw: [String: Any] = [

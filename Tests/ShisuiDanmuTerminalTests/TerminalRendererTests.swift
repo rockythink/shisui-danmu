@@ -471,6 +471,86 @@ struct TerminalRendererTests {
         #expect(output.contains("前缀19"))
         #expect(output.contains("\u{001B}[7m"))
     }
+    @Test func bilibiliEmotesUseUnicodeOrReadableShortcodes() throws {
+        var configuration = try TerminalConfiguration.load(arguments: ["--room", "1", "--theme", "pure"])
+        configuration.chatLayout = false
+        configuration.singleLine = true
+        configuration.showTime = false
+        let event = DanmuEvent(
+            id: "emote-message",
+            kind: .danmu,
+            timestamp: .now,
+            username: "表情观众",
+            content: "来了[dog][主播专属]",
+            emotes: [
+                DanmuEmote(
+                    text: "[dog]",
+                    imageURL: try #require(URL(string: "https://i0.hdslb.com/bfs/live/dog.png"))
+                ),
+                DanmuEmote(
+                    text: "[主播专属]",
+                    imageURL: try #require(URL(string: "https://i0.hdslb.com/bfs/live/room.png"))
+                ),
+            ]
+        )
+        let state = TerminalViewState(
+            configuration: configuration,
+            connectionState: .connected(roomID: "1"),
+            room: nil,
+            events: [event],
+            questions: [],
+            featuredEvent: nil,
+            broadcasterNickname: nil,
+            broadcasterAuthorID: nil,
+            editor: TerminalEditorSnapshot(text: "", cursor: 0),
+            notice: nil,
+            totalEventCount: 1,
+            revision: 1
+        )
+
+        let output = TerminalRenderer().render(state, size: TerminalSize(columns: 50, rows: 16))
+
+        #expect(output.contains("来了🐶[主播专属]"))
+        #expect(!output.contains("[dog]"))
+    }
+
+    @Test func metadataOnlyRoomEmoteKeepsItsReadableShortcode() throws {
+        var configuration = try TerminalConfiguration.load(arguments: ["--room", "1", "--theme", "pure"])
+        configuration.chatLayout = false
+        configuration.singleLine = true
+        configuration.showTime = false
+        let event = DanmuEvent(
+            id: "room-emote",
+            kind: .danmu,
+            timestamp: .now,
+            username: "表情观众",
+            content: "",
+            emotes: [
+                DanmuEmote(
+                    text: "[主播专属]",
+                    imageURL: try #require(URL(string: "https://i0.hdslb.com/bfs/live/room.png"))
+                ),
+            ]
+        )
+        let state = TerminalViewState(
+            configuration: configuration,
+            connectionState: .connected(roomID: "1"),
+            room: nil,
+            events: [event],
+            questions: [],
+            featuredEvent: nil,
+            broadcasterNickname: nil,
+            broadcasterAuthorID: nil,
+            editor: TerminalEditorSnapshot(text: "", cursor: 0),
+            notice: nil,
+            totalEventCount: 1,
+            revision: 1
+        )
+
+        let output = TerminalRenderer().render(state, size: TerminalSize(columns: 50, rows: 16))
+
+        #expect(output.contains("[主播专属]"))
+    }
 }
 
 private func terminalContentLines(_ output: String) -> [String] {

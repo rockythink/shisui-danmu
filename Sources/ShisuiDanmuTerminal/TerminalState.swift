@@ -1029,7 +1029,8 @@ actor TerminalState {
             authorID: authorID,
             content: content,
             origin: event.origin,
-            platformEventID: event.platformEventID
+            platformEventID: event.platformEventID,
+            emotes: event.emotes
         )
     }
 
@@ -1089,7 +1090,8 @@ actor TerminalState {
             authorID: deliveryBroadcasterAuthorID ?? event.authorID,
             content: event.content,
             origin: event.origin,
-            platformEventID: event.platformEventID
+            platformEventID: event.platformEventID,
+            emotes: event.emotes
         )
     }
 

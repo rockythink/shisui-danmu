@@ -21,6 +21,28 @@ public enum DanmuEventOrigin: String, Codable, Sendable {
     case history
 }
 
+public struct DanmuEmote: Codable, Equatable, Hashable, Sendable {
+    public let text: String
+    public let imageURL: URL
+    public let width: Int?
+    public let height: Int?
+    public let isAnimated: Bool
+
+    public init(
+        text: String,
+        imageURL: URL,
+        width: Int? = nil,
+        height: Int? = nil,
+        isAnimated: Bool = false
+    ) {
+        self.text = text
+        self.imageURL = imageURL
+        self.width = width
+        self.height = height
+        self.isAnimated = isAnimated
+    }
+}
+
 public struct DanmuEvent: Identifiable, Codable, Equatable, Sendable {
     public let id: String
     public let kind: DanmuEventKind
@@ -30,6 +52,7 @@ public struct DanmuEvent: Identifiable, Codable, Equatable, Sendable {
     public let content: String
     public let origin: DanmuEventOrigin
     public let platformEventID: String?
+    public let emotes: [DanmuEmote]
 
     public init(
         id: String,
@@ -39,7 +62,8 @@ public struct DanmuEvent: Identifiable, Codable, Equatable, Sendable {
         authorID: String? = nil,
         content: String,
         origin: DanmuEventOrigin = .live,
-        platformEventID: String? = nil
+        platformEventID: String? = nil,
+        emotes: [DanmuEmote] = []
     ) {
         self.id = id
         self.kind = kind
@@ -49,6 +73,32 @@ public struct DanmuEvent: Identifiable, Codable, Equatable, Sendable {
         self.content = content
         self.origin = origin
         self.platformEventID = platformEventID
+        self.emotes = emotes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case kind
+        case timestamp
+        case username
+        case authorID
+        case content
+        case origin
+        case platformEventID
+        case emotes
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        kind = try container.decode(DanmuEventKind.self, forKey: .kind)
+        timestamp = try container.decode(Date.self, forKey: .timestamp)
+        username = try container.decodeIfPresent(String.self, forKey: .username)
+        authorID = try container.decodeIfPresent(String.self, forKey: .authorID)
+        content = try container.decode(String.self, forKey: .content)
+        origin = try container.decodeIfPresent(DanmuEventOrigin.self, forKey: .origin) ?? .live
+        platformEventID = try container.decodeIfPresent(String.self, forKey: .platformEventID)
+        emotes = try container.decodeIfPresent([DanmuEmote].self, forKey: .emotes) ?? []
     }
 }
 

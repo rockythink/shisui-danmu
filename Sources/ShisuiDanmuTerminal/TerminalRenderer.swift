@@ -458,8 +458,8 @@ struct TerminalRenderer {
         let messages = box(
             title: state.featuredEvent.map {
                 state.configuration.showUsername
-                    ? "NOW · \($0.username ?? "观众")：\($0.content)"
-                    : "NOW · \($0.content)"
+                    ? "NOW · \($0.username ?? "观众")：\($0.terminalFallbackContent.replacingKnownBilibiliEmotes())"
+                    : "NOW · \($0.terminalFallbackContent.replacingKnownBilibiliEmotes())"
             } ?? "Ghost Stage",
             width: messagesWidth,
             height: height,
@@ -471,7 +471,7 @@ struct TerminalRenderer {
             let priority = question.priority == .high ? "▲" : " "
             let answering = question.status == .answering ? "NOW" : ""
             let username = state.configuration.showUsername ? "\(question.event.username ?? "观众") " : ""
-            let text = "\(priority) \(username)\(answering) \(question.event.content)"
+            let text = "\(priority) \(username)\(answering) \(question.event.terminalFallbackContent.replacingKnownBilibiliEmotes())"
             let tint = question.status == .answering
                 ? state.configuration.palette.info
                 : (question.priority == .high ? state.configuration.palette.warning : state.configuration.palette.content)
@@ -624,13 +624,15 @@ struct TerminalRenderer {
     }
 
     private func visibleContent(_ event: DanmuEvent, state: TerminalViewState) -> String {
+        let source = event.terminalFallbackContent
         guard !state.configuration.showUsername,
               event.kind != .danmu,
               let username = event.username,
-              event.content.hasPrefix(username) else { return event.content }
-        let remainder = event.content.dropFirst(username.count)
+              source.hasPrefix(username) else { return source.replacingKnownBilibiliEmotes() }
+        let remainder = source.dropFirst(username.count)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return remainder.isEmpty ? kindName(event.kind) : remainder
+        let content = remainder.isEmpty ? kindName(event.kind) : remainder
+        return content.replacingKnownBilibiliEmotes()
     }
 
     private func kindName(_ kind: DanmuEventKind) -> String {
@@ -746,9 +748,72 @@ private struct RGB {
     }
 }
 
+private let bilibiliEmoteEmoji: [String: String] = [
+    "[dog]": "🐶",
+    "[doge]": "🐶",
+    "[笑哭]": "😂",
+    "[滑稽]": "😏",
+    "[吃瓜]": "🍉",
+    "[妙啊]": "👏",
+    "[藏狐]": "🦊",
+    "[辣眼睛]": "🙈",
+    "[呲牙]": "😁",
+    "[OK]": "👌",
+    "[ok]": "👌",
+    "[星星眼]": "🤩",
+    "[哦呼]": "😮",
+    "[捂脸]": "🤦",
+    "[支持]": "👍",
+    "[鼓掌]": "👏",
+    "[点赞]": "👍",
+    "[爱心]": "❤️",
+    "[大笑]": "😄",
+    "[惊讶]": "😮",
+    "[疑惑]": "🤔",
+    "[偷笑]": "🤭",
+    "[调皮]": "😜",
+    "[生气]": "😠",
+    "[尴尬]": "😅",
+    "[委屈]": "🥺",
+    "[哭泣]": "😭",
+    "[害羞]": "😊",
+    "[亲亲]": "😘",
+    "[打call]": "📣",
+    "[抱拳]": "🙏",
+    "[保佑]": "🙏",
+    "[牛哇牛哇]": "🐮",
+    "[给心心]": "🫶",
+    "[热词系列_知识增加]": "🧠",
+    "[热词系列_破防了]": "💔",
+    "[热词系列_好耶]": "🙌",
+    "[热词系列_三连]": "👍",
+    "[热词系列_爷青回]": "🥹",
+]
+
+private extension DanmuEvent {
+    var terminalFallbackContent: String {
+        content.isEmpty ? emotes.map(\.text).joined() : content
+    }
+}
 private extension String {
     var displayWidth: Int {
         unicodeScalars.reduce(0) { result, scalar in result + scalar.terminalColumnWidth }
+    }
+    func replacingKnownBilibiliEmotes() -> String {
+        guard contains("[") else { return self }
+
+        var result = ""
+        result.reserveCapacity(utf8.count)
+        var cursor = startIndex
+        while let opening = self[cursor...].firstIndex(of: "["),
+              let closing = self[opening...].firstIndex(of: "]") {
+            result += self[cursor..<opening]
+            let token = String(self[opening...closing])
+            result += bilibiliEmoteEmoji[token] ?? token
+            cursor = index(after: closing)
+        }
+        result += self[cursor...]
+        return result
     }
 
     func wrapped(to width: Int) -> [String] {
