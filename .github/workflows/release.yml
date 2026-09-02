@@ -174,19 +174,18 @@ jobs:
   publish-npm:
     needs: [publish-github, package-npm]
     runs-on: ubuntu-24.04
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - name: Install Trusted Publishing capable npm
+        run: npm install --global npm@latest
       - uses: actions/download-artifact@v4
         with:
           name: npm-package
           path: dist
-      - name: Publish npm package
-        if: env.NODE_AUTH_TOKEN != ''
+      - name: Publish npm package through OIDC
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           if npm view "danmu-tui@$VERSION" version >/dev/null 2>&1; then
@@ -194,9 +193,6 @@ jobs:
           else
             npm publish ./dist/*.tgz --access public --provenance
           fi
-      - name: Explain skipped npm publication
-        if: env.NODE_AUTH_TOKEN == ''
-        run: echo "NPM_TOKEN 未配置；npm/Bun 包仍附加在 GitHub Release，可稍后手动发布。"
 
   publish-homebrew:
     needs: [publish-github, package-homebrew]
