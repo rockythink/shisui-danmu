@@ -139,11 +139,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --generate-notes \
-            --title "DANMU $GITHUB_REF_NAME"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$GITHUB_REF_NAME" --title "DANMU $GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes \
+              --title "DANMU $GITHUB_REF_NAME"
+          fi
 
   publish-crates:
     needs: publish-github
@@ -155,7 +160,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Publish crates.io package
         if: env.CARGO_REGISTRY_TOKEN != ''
-        run: cargo publish --locked
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if curl -fsS "https://crates.io/api/v1/crates/shisui-danmu/$VERSION" >/dev/null 2>&1; then
+            echo "shisui-danmu $VERSION 已发布，跳过。"
+          else
+            cargo publish --locked
+          fi
       - name: Explain skipped crates.io publication
         if: env.CARGO_REGISTRY_TOKEN == ''
         run: echo "CARGO_REGISTRY_TOKEN 未配置；保留 GitHub Release，稍后可手动 cargo publish。"
@@ -176,7 +187,13 @@ jobs:
           path: dist
       - name: Publish npm package
         if: env.NODE_AUTH_TOKEN != ''
-        run: npm publish dist/*.tgz --access public --provenance
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if npm view "danmu-tui@$VERSION" version >/dev/null 2>&1; then
+            echo "danmu-tui $VERSION 已发布，跳过。"
+          else
+            npm publish ./dist/*.tgz --access public --provenance
+          fi
       - name: Explain skipped npm publication
         if: env.NODE_AUTH_TOKEN == ''
         run: echo "NPM_TOKEN 未配置；npm/Bun 包仍附加在 GitHub Release，可稍后手动发布。"
