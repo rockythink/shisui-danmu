@@ -4,27 +4,27 @@
 
 ## 决策
 
-新增独立 `OBSControl` Module，通过用户单独安装的 `pschmitt/obs-cli` 控制 OBS WebSocket v5。GUI 与 TUI 共用同一契约，只提供状态检查、读取并切换 OBS 现有场景、指定麦克风静音和 OBS 推流启停；弹幕台不定义场景体系。
+Rust `obs` Adapter 通过 `obws` 直接连接 OBS WebSocket v5。GUI 与 TUI 保持相同的用户可见控制契约，但不共享实现：状态检查、读取并切换 OBS 现有场景、指定麦克风静音和 OBS 推流启停。TUI 额外订阅所配置麦克风的音量事件，只在输入框顶栏显示单路电平；弹幕台不定义场景体系或音频混音体系。
 
-`DanmuCore` 与 `BilibiliDanmu` 不依赖 OBS。OBS 操作不改变弹幕连接、会话日志、录制、Replay Buffer、来源或画布。
+`domain` 与 `bilibili` 不依赖 OBS。OBS 操作不改变弹幕连接、会话日志、录制、Replay Buffer、来源或画布。
 
 ## 原因
 
-外部 CLI 可以用较小成本验证知识主播需要的直播遥控闭环，并保留以后替换为原生 OBS WebSocket Adapter 的边界。共享 Module 避免 GUI/TUI 分别拼接命令和维护不同状态。
+音量事件约每 50 毫秒到达，需要复用长连接并在进程内聚合；为每次读取启动外部进程会增加延迟、部署依赖和故障面。原生 Adapter 继续隔离平台协议，同时去除 Python 与额外 CLI 安装要求。
 
 ## 安全约束
 
-- 命令通过 `Foundation.Process` 参数数组执行，不经过 shell。
-- 密码保存在 Keychain 或由当前进程环境临时提供，不进入命令参数、命令历史、日志和 Journal；GUI 设置页和 TUI `danmu --configure-obs` 提供完整配置入口，运行中的 TUI 通过 `/obs config password` 安全更新密码。
-- 修改命令跨进程串行，并在执行后重新读取 OBS 真相确认。
-- 停止推流必须由前端二次确认；TUI 使用 `/obs stop` 后再输入 `/obs confirm`。
-- GUI/TUI 每次启动检测 CLI；只有用户明确同意后才通过 `uv tool install obs-cli` 安装，拒绝不影响核心弹幕功能。
+- 仅通过类型化 OBS WebSocket 请求通信，不启动 shell 或外部 OBS 控制进程。
+- 密码保存在操作系统凭据存储或由当前进程环境临时提供，不进入命令参数、命令历史、日志和 Journal；`danmu --configure-obs` 提供完整配置入口，运行中的 TUI 通过 `/obs config password` 不回显地更新密码。
+- 连接在进程内复用并串行创建；修改操作完成后重新读取 OBS 真相确认。
+- 高频音量事件聚合为 10 Hz；电平限制在 -60 至 0 dBFS，采用快速上升、平滑回落。
+- 停止推流必须二次确认；TUI 使用 `/obs stop` 后再输入 `/obs confirm`。
 - 开播不自动取消麦克风静音。
 
 ## 依赖与许可证
 
-`obs-cli` 是 GPL-3.0 的可选外部程序，由用户单独安装和运行；本项目不捆绑其源码、Python 运行时或依赖。若未来随 App 分发，必须重新评估许可证和发布方式。
+`obws` 0.15 以 MIT 许可证链接进本项目，用于 OBS WebSocket v5 请求和事件订阅。
 
 ## 后果
 
-第一版不提供完整 OBS 控制台、Studio Mode 编排、场景/来源编辑、音频电平、RTMP/编码设置、录制或 Replay Buffer 控制。需要事件订阅、准确推流时长或免 Python 安装时，可在保持 `OBSControlling` 契约的前提下替换实现。
+不提供完整 OBS 控制台、Studio Mode 编排、场景/来源编辑、音频混音、RTMP/编码设置、录制或 Replay Buffer 控制。麦克风电平只反映用户配置的单个 OBS 输入，并在静音、断连和窄终端条件下退化为静态状态或隐藏。

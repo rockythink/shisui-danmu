@@ -1,8 +1,8 @@
+/target/
+/dist/
 .DS_Store
-.build/
-.swiftpm/
-DerivedData/
-xcuserdata/
-*.xcuserstate
-.codex/
-dist/
+*.profraw
+*.log
+.idea/
+.vscode/
+.playwright-cli/

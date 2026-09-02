@@ -3,41 +3,30 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-}"
-ASSET_NAME="shisui-danmu-macos-universal.tar.gz"
-DIST_DIR="$ROOT_DIR/dist"
-
-if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-  echo "用法: ./script/package_release.sh v<major>.<minor>.<patch>" >&2
-  exit 2
-fi
-
-STAGE_DIR="$(mktemp -d)"
-trap 'rm -rf "$STAGE_DIR"' EXIT
-
 cd "$ROOT_DIR"
-swift build \
-  -c release \
-  --arch arm64 \
-  --arch x86_64 \
-  --product ShisuiDanmuTerminal
 
-BIN_DIR="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
-SOURCE="$BIN_DIR/ShisuiDanmuTerminal"
+VERSION="${1:-local}"
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+case "$OS" in
+  Darwin) PLATFORM="macos" ;;
+  Linux) PLATFORM="linux" ;;
+  *) echo "不支持的打包平台：$OS" >&2; exit 1 ;;
+esac
+case "$ARCH" in
+  arm64|aarch64) ARCHIVE_ARCH="aarch64" ;;
+  x86_64|amd64) ARCHIVE_ARCH="x86_64" ;;
+  *) echo "不支持的处理器架构：$ARCH" >&2; exit 1 ;;
+esac
 
-lipo "$SOURCE" -verify_arch arm64 x86_64
-install -m 0755 "$SOURCE" "$STAGE_DIR/danmu"
-install -m 0644 LICENSE THIRD_PARTY_NOTICES.md "$STAGE_DIR/"
-printf '%s\n' "$VERSION" > "$STAGE_DIR/VERSION"
-
-rm -rf "$DIST_DIR"
-mkdir -p "$DIST_DIR"
-COPYFILE_DISABLE=1 tar -C "$STAGE_DIR" -czf "$DIST_DIR/$ASSET_NAME" \
-  danmu LICENSE THIRD_PARTY_NOTICES.md VERSION
-(
-  cd "$DIST_DIR"
-  shasum -a 256 "$ASSET_NAME" > "$ASSET_NAME.sha256"
-)
-
-echo "已生成：$DIST_DIR/$ASSET_NAME"
-echo "已生成：$DIST_DIR/$ASSET_NAME.sha256"
+./script/verify.sh
+mkdir -p dist
+ASSET="shisui-danmu-${PLATFORM}-${ARCHIVE_ARCH}.tar.gz"
+tar -czf "dist/$ASSET" -C target/release danmu
+if command -v shasum >/dev/null 2>&1; then
+  (cd dist && shasum -a 256 "$ASSET" > "$ASSET.sha256")
+else
+  (cd dist && sha256sum "$ASSET" > "$ASSET.sha256")
+fi
+printf '%s\n' "$VERSION" > dist/VERSION
+echo "已生成：dist/$ASSET"

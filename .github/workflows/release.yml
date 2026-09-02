@@ -9,24 +9,82 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: macos-15
+  build-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            asset: shisui-danmu-macos-aarch64.tar.gz
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: shisui-danmu-macos-x86_64.tar.gz
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset: shisui-danmu-linux-x86_64.tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: shisui-danmu-linux-aarch64.tar.gz
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.asset }}" -C "target/${{ matrix.target }}/release" danmu
+          if command -v shasum >/dev/null 2>&1; then
+            (cd dist && shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
+          else
+            (cd dist && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
 
-      - name: Verify public TUI
-        run: ./script/verify.sh
+  build-windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/danmu.exe -DestinationPath dist/shisui-danmu-windows-x86_64.zip
+          $hash = (Get-FileHash dist/shisui-danmu-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  shisui-danmu-windows-x86_64.zip" | Set-Content -Encoding ascii dist/shisui-danmu-windows-x86_64.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-pc-windows-msvc
+          path: dist/*
 
-      - name: Build Universal release archive
-        run: ./script/package_release.sh "$GITHUB_REF_NAME"
-
+  publish:
+    needs: [build-unix, build-windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            dist/shisui-danmu-macos-universal.tar.gz \
-            dist/shisui-danmu-macos-universal.tar.gz.sha256 \
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --generate-notes \
             --title "拾穗弹幕台 TUI $GITHUB_REF_NAME"

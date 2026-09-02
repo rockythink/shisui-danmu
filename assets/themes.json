@@ -1,0 +1,65 @@
+{
+  "selected": "shisui",
+  "themes": {
+    "shisui": {
+      "label": "拾穗高对比",
+      "colors": {
+        "time": "#94A3B8",
+        "name": "#5EEAD4",
+        "content": "#F8FAFC",
+        "frame": "#334155",
+        "info": "#22D3EE",
+        "rank": "#FACC15",
+        "background": "#070A0F",
+        "success": "#4ADE80",
+        "host": "#F472B6",
+        "warning": "#FB7185"
+      }
+    },
+    "catppuccin-mocha": {
+      "label": "Catppuccin Mocha",
+      "colors": {
+        "time": "#A6ADC8",
+        "name": "#94E2D5",
+        "content": "#CDD6F4",
+        "frame": "#45475A",
+        "info": "#89B4FA",
+        "rank": "#F9E2AF",
+        "background": "#1E1E2E",
+        "success": "#A6E3A1",
+        "host": "#CBA6F7",
+        "warning": "#F38BA8"
+      }
+    },
+    "tokyo-night": {
+      "label": "Tokyo Night",
+      "colors": {
+        "time": "#A9B1D6",
+        "name": "#7DCFFF",
+        "content": "#C0CAF5",
+        "frame": "#3B4261",
+        "info": "#7AA2F7",
+        "rank": "#E0AF68",
+        "background": "#1A1B26",
+        "success": "#9ECE6A",
+        "host": "#BB9AF7",
+        "warning": "#F7768E"
+      }
+    },
+    "gruvbox-dark": {
+      "label": "Gruvbox Dark Hard",
+      "colors": {
+        "time": "#A89984",
+        "name": "#8EC07C",
+        "content": "#EBDBB2",
+        "frame": "#504945",
+        "info": "#83A598",
+        "rank": "#FABD2F",
+        "background": "#1D2021",
+        "success": "#B8BB26",
+        "host": "#D3869B",
+        "warning": "#FB4934"
+      }
+    }
+  }
+}
