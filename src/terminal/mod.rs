@@ -3128,7 +3128,7 @@ mod tests {
         assert!(surface.contains("╭──"));
         assert!(surface.contains("╰─"));
         assert!(surface.contains("─╯"));
-        assert!(!surface.contains("拾穗弹幕台"));
+        assert!(!surface.contains("DANMU"));
         assert!(!surface.contains("B站"));
 
         let technical_lines = technical_status_lines(&app, app.config.palette, 120);

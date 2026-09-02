@@ -1,30 +1,303 @@
-# 拾穗弹幕台 TUI
+<p align="center">
+  <img src="assets/hero.png" alt="DANMU — Live Interaction Console" width="100%">
+</p>
 
-[![Rust CI](https://github.com/rockythink/shisui-danmu/actions/workflows/ci.yml/badge.svg)](https://github.com/rockythink/shisui-danmu/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/rockythink/shisui-danmu)](https://github.com/rockythink/shisui-danmu/releases/latest)
-[![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](LICENSE)
+<p align="center">
+  <strong>为知识型主播收束弹幕、问题与现场控制。</strong><br>
+  一块安静、快速、可恢复的直播互动终端。
+</p>
 
-面向知识型主播的免费开源弹幕与直播监控工作台。它在终端里监看 B 站直播互动、发送弹幕、记录会话，并提供有限的 OBS 遥控。
+<p align="center">
+  <a href="https://github.com/rockythink/shisui-danmu/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/rockythink/shisui-danmu/ci.yml?style=flat-square&label=build&colorA=111827&colorB=4ADE80" alt="Build"></a>
+  <a href="https://github.com/rockythink/shisui-danmu/releases/latest"><img src="https://img.shields.io/github/v/release/rockythink/shisui-danmu?style=flat-square&colorA=111827&colorB=22D3EE" alt="Release"></a>
+  <a href="https://github.com/rockythink/shisui-danmu/blob/main/LICENSE"><img src="https://img.shields.io/github/license/rockythink/shisui-danmu?style=flat-square&colorA=111827&colorB=F472B6" alt="License"></a>
+  <img src="https://img.shields.io/badge/Rust-1.89%2B-F8FAFC?style=flat-square&colorA=111827&logo=rust&logoColor=white" alt="Rust 1.89+">
+  <img src="https://img.shields.io/badge/OBS_WebSocket-v5-FACC15?style=flat-square&colorA=111827" alt="OBS WebSocket v5">
+</p>
 
-本仓库是独立的 Rust TUI，只包含终端产品、领域 Module 和平台 Adapter；商业 macOS GUI 位于私有仓库，不是本项目的依赖。
+<p align="center">
+  macOS · Linux · Windows &nbsp;|&nbsp; Bilibili &nbsp;|&nbsp; Ratatui &nbsp;|&nbsp; MPL-2.0
+</p>
 
-## 系统要求
+---
 
-- macOS 14+：Apple Silicon、Intel
-- Linux：x86_64、aarch64
-- Windows 10/11：x86_64
-- 公开监看不需要登录；发送弹幕需要扫码登录 B 站账号
-- OBS 遥控与麦克风电平需要 OBS 28+ 内置的 WebSocket v5；无需安装额外 CLI
+**DANMU** 是面向知识型主播的免费开源弹幕与提问工作台。它把 B 站的历史弹幕、实时互动、重点问题、发送状态和有限 OBS 控制放进同一个终端界面，让主播少盯几个窗口，多留一点注意力给正在讲的内容。
 
-## 安装
+它不是播放器，也不是另一套 OBS。它只解决直播时最容易失控的那一段：**看见互动、辨认问题、快速回应、保留现场。**
 
-### 下载预编译 Release
+<p align="center">
+  <img src="assets/tui-preview.png" alt="DANMU TUI：实时弹幕、重点问题、直播状态、OBS 与麦克风电平" width="100%">
+</p>
 
-macOS、Linux 及 Windows Git Bash 可使用安装脚本。脚本按操作系统和处理器选择 Release、验证 SHA-256，然后安装到 `~/.local/bin/danmu`：
+> 截图使用实际 Ratatui 渲染缓冲区和演示数据生成，不包含真实观众信息。
+
+## 为什么做 DANMU
+
+知识型直播的难点通常不是“弹幕不够多”，而是信息密度太高：问题夹在闲聊里，历史接口与实时 WebSocket 偶尔漏包，主播还要同时确认推流、场景和麦克风状态。
+
+DANMU 把这些信号压缩成一块可扫读的终端界面：
+
+- **不漏重要互动**：历史窗口与实时流合并、去重，断线自动重连；
+- **问题留在眼前**：键盘选中弹幕、插入回复对象、设置重点消息；
+- **发送结果可确认**：长弹幕按 Unicode 字素安全分段，并等待主播身份回流；
+- **现场状态可感知**：直播状态、开播时长、看过、点赞、弹幕与在线人数分层显示；
+- **OBS 只做必要的事**：场景、推流、静音和单路麦克风电平，不复制完整控制台；
+- **结束后还有记录**：每场直播写入独立 Journal，可搜索并导出快照。
+
+## 快速开始
+
+### 1. 安装
+
+macOS、Linux，以及 Windows 的 Git Bash：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rockythink/shisui-danmu/main/script/install_release.sh | bash
 ```
+
+安装脚本会识别操作系统与 CPU 架构，下载对应 GitHub Release，验证 SHA-256，并把可执行文件安装到 `~/.local/bin/danmu`。
+
+Windows 也可以直接从 [Releases](https://github.com/rockythink/shisui-danmu/releases/latest) 下载 `shisui-danmu-windows-x86_64.zip`，校验同名 `.sha256` 后，将 `danmu.exe` 放入 `PATH`。
+
+### 2. 进入直播间
+
+```bash
+danmu <房间号>
+```
+
+也可以显式传参：
+
+```bash
+danmu --room <房间号>
+```
+
+公开监看不需要登录。启动后按 `/` 打开命令面板，`↑/↓` 选择，`Enter` 执行。
+
+### 3. 登录并发送弹幕（可选）
+
+```bash
+danmu --login
+```
+
+使用哔哩哔哩客户端扫码。登录成功后重新运行 `danmu <房间号>`，直接在底部输入框发送弹幕。
+
+```bash
+danmu --logout
+```
+
+`--logout` 只清除 DANMU 自己的 B 站登录态，不读取浏览器 Cookie，也不与其他应用共享凭据。
+
+## 界面读法
+
+| 区域 | 内容 |
+| --- | --- |
+| 顶部第一行 | `LIVE / OFFLINE / ROTATING`、直播标题、已开播时长 |
+| 顶部第二行 | 主播身份、OBS 连接、麦克风静音状态 |
+| Ghost Stage | 历史与实时事件合并后的主信息流；重点消息显示在标题上 |
+| 通知区 | 登录、发送、重连、OBS 操作的进度、错误与可执行提示 |
+| 输入框顶栏 | 发送状态、业务计数，以及空间允许时的麦克风电平 |
+| 输入框 | Unicode 字素级编辑；最多四行，光标始终保持可见 |
+
+底栏计数使用明确的数据口径：
+
+| 符号 | 含义 | 来源 |
+| --- | --- | --- |
+| `◉` | 累计看过 | `WATCHED_CHANGE.data.num` |
+| `♥` | 累计点赞 | `LIKE_INFO_V3_UPDATE.data.click_count` |
+| `▤` | 本次运行收到的实时弹幕数 | 本地会话计数 |
+| `●` | 当前在线人数 | 登录后读取 `getOnlineRank.data.onlineNum` |
+
+`MIC` 电平来自 OBS WebSocket v5 的 `InputVolumeMeters` 事件：约 50 ms 接收一次，在 Adapter 内聚合为 10 Hz；上升立即响应，回落平滑。界面空间不足时先缩短电平条，再隐藏数值，极窄或 OBS 断连时完全隐藏。
+
+## 键盘与命令
+
+### 高频操作
+
+| 操作 | 按键 |
+| --- | --- |
+| 打开命令面板 | `/` |
+| 切换信息流 / 聊天布局 | `Tab` |
+| 浏览历史 | 鼠标滚轮 |
+| 回到最新消息 | `End` |
+| 选择回复对象 | `Shift+↑/↓` |
+| 插入 `@用户名` | 选择后按 `Enter` |
+| 取消选择或退出 | `Esc` |
+| 安全退出 | `Ctrl+C` 或 `/quit` |
+| 行首 / 行尾 | `Home` / `End`，或 `Ctrl+A/E` |
+| 删除到行首 / 删除前一个词 | `Ctrl+U/W` |
+
+### TUI 命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `/help` | 显示命令面板操作提示 |
+| `/login` · `/logout` | 扫码登录或清除独立登录态 |
+| `/layout` | 切换信息流与聊天布局 |
+| `/theme` | 打开主题选择；`/theme reload` 热加载自定义主题 |
+| `/names show\|hide` | 显示或隐藏用户名 |
+| `/time show\|hide` | 显示或隐藏消息时间 |
+| `/feature` | 将当前选中消息设为重点 |
+| `/archive [关键词]` | 搜索历史会话 |
+| `/obs` · `/obs status` | 检查或查看 OBS 状态 |
+| `/obs mute\|unmute` | 静音或取消静音所配置的麦克风 |
+| `/obs scene [名称]` | 列出或切换场景 |
+| `/obs config mic [名称]` | 列出或选择单路麦克风输入 |
+| `/obs start` | 开始推流 |
+| `/obs stop` | 请求停止推流；必须再执行 `/obs confirm` |
+| `/obs cancel` | 取消待确认的停止推流操作 |
+| `/quit` | 安全退出并写入会话状态 |
+
+## OBS 接入
+
+DANMU 使用 OBS 28+ 内置的 WebSocket v5，**不依赖 `obs-cli`、Python 或额外桥接进程**。
+
+1. 在 OBS 中打开 **工具 → WebSocket 服务器设置**；
+2. 启用 WebSocket 服务器，记下端口与密码；
+3. 运行配置向导：
+
+   ```bash
+   danmu --configure-obs
+   ```
+
+4. 依次填写主机、端口、默认直播场景和麦克风输入名；
+5. 进入 TUI 后运行 `/obs status` 验证连接。
+
+密码保存到系统凭据存储；主机、端口、场景与输入名写入 DANMU 独立配置。停止推流始终需要二次确认。
+
+## 配置与主题
+
+### 启动参数
+
+```text
+danmu [房间号]
+      [--room <房间号>]
+      [--single-line <true|false>]
+      [--show-time <true|false>]
+      [--show-name <true|false> | --hide-name]
+      [--theme <主题名>]
+      [--config <路径>]
+```
+
+运行 `danmu --help` 查看完整参数。
+
+### TOML 配置
+
+```toml
+room_id = "123456"
+single_line = true
+chat_layout = false
+show_time = true
+show_name = true
+```
+
+CLI 参数优先于 TOML。可通过 `--config <路径>` 使用指定配置文件。
+
+### True Color 主题
+
+内置四套深色主题：
+
+- `shisui`
+- `catppuccin-mocha`
+- `tokyo-night`
+- `gruvbox-dark`
+
+```text
+/theme
+/theme tokyo-night
+/theme reload
+```
+
+首次运行会生成 `themes.json`。输入 `/theme` 可查看当前实际路径。复制现有主题对象并修改 ID、`label` 与十个 `#RRGGBB` 语义色，即可创建自定义主题；保存后执行 `/theme reload`，不必重启。
+
+## 数据、凭据与恢复
+
+DANMU 使用独立命名空间，不读取商业 GUI、浏览器或其他直播工具的数据：
+
+- B 站 Cookie / CSRF：独立 `BilibiliAccount/session.json`，Unix 权限 `0600`；
+- OBS 密码：系统凭据存储；
+- OBS 非敏感配置：独立 `obs-control.json`；
+- 主题与启动配置：平台配置目录中的 `shisui-danmu/`；
+- 会话记录：每场直播一个目录，持续追加 `journal.jsonl`；
+- 正常结束：额外生成 `snapshot.json` 与 `summary.md`；
+- 异常退出：下次进入同一房间时恢复未结束会话。
+
+Cookie、CSRF 和原始 B 站 payload 不进入领域事件或会话导出。
+
+## 架构
+
+```mermaid
+graph LR
+    B[Bilibili Adapter] --> D[Platform-neutral Domain]
+    O[OBS WebSocket Adapter] --> T[Ratatui Terminal]
+    D --> T
+    D --> J[JSONL Session Journal]
+    C[CLI / TOML / Theme Catalog] --> T
+```
+
+- `src/bilibili/`：房间解析、历史补偿、WebSocket、账号与发送；
+- `src/domain/`：标准事件、会话、指标、去重与问题分类；
+- `src/obs.rs`、`src/obs/`：有限 OBS 控制与电平聚合；
+- `src/terminal/`：Ratatui 渲染、输入、二维码与电平表；
+- `src/persistence.rs`：追加式 Journal、恢复、搜索和导出。
+
+平台协议只存在于 Adapter。领域 Module 不依赖 B 站原始字段。
+
+## 能力边界
+
+DANMU 有意保持克制：
+
+**包含**：公开房间监看、历史与实时事件去重、自动重连、登录后发送、重点互动、会话归档、True Color 主题、有限 OBS 控制、单路麦克风电平。
+
+**不包含**：播放器、完整直播画布、音频混音台、录制与 Replay Buffer、OBS 场景编辑器、商业 GUI。
+
+完整行为基线见 [终端舞台功能矩阵](docs/terminal-feature-matrix.md)。
+
+## 从源码构建
+
+需要 Rust 1.89 或更高版本：
+
+```bash
+git clone https://github.com/rockythink/shisui-danmu.git
+cd shisui-danmu
+cargo build --release --locked
+```
+
+安装到 `~/.local/bin/danmu`：
+
+```bash
+./script/install_cli.sh
+```
+
+或使用 Cargo：
+
+```bash
+cargo install --locked --path .
+```
+
+## 开发与验证
+
+```bash
+./script/verify.sh
+```
+
+完整门禁包含：
+
+- `cargo fmt --check`
+- 严格 `clippy`
+- 全目标测试
+- Release 构建
+- CLI 冒烟
+
+GitHub Actions 在 macOS、Linux、Windows 上执行对应 Rust 门禁。提交前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## Release 资产
+
+| 平台 | 文件 |
+| --- | --- |
+| macOS Apple Silicon | `shisui-danmu-macos-aarch64.tar.gz` |
+| macOS Intel | `shisui-danmu-macos-x86_64.tar.gz` |
+| Linux x86_64 | `shisui-danmu-linux-x86_64.tar.gz` |
+| Linux aarch64 | `shisui-danmu-linux-aarch64.tar.gz` |
+| Windows x86_64 | `shisui-danmu-windows-x86_64.zip` |
 
 指定版本或安装目录：
 
@@ -33,89 +306,16 @@ curl -fsSL https://raw.githubusercontent.com/rockythink/shisui-danmu/main/script
   DANMU_VERSION=v0.4.0 DANMU_INSTALL_DIR="$HOME/bin" bash
 ```
 
-Windows 也可以从 [Releases](https://github.com/rockythink/shisui-danmu/releases/latest) 下载 `shisui-danmu-windows-x86_64.zip`，校验同名 `.sha256` 后将 `danmu.exe` 放入 `PATH`。
-
-Release 资产：
-
-| 系统 | 资产 |
-| --- | --- |
-| macOS Apple Silicon | `shisui-danmu-macos-aarch64.tar.gz` |
-| macOS Intel | `shisui-danmu-macos-x86_64.tar.gz` |
-| Linux x86_64 | `shisui-danmu-linux-x86_64.tar.gz` |
-| Linux aarch64 | `shisui-danmu-linux-aarch64.tar.gz` |
-| Windows x86_64 | `shisui-danmu-windows-x86_64.zip` |
-
-### 从源码安装
-
-需要 Rust 1.89 或更高版本：
-
-```bash
-git clone https://github.com/rockythink/shisui-danmu.git
-cd shisui-danmu
-./script/install_cli.sh
-```
-
-也可以直接使用 Cargo：
-
-```bash
-cargo install --locked --path .
-```
-
-## 使用
-
-```bash
-danmu <房间号>
-danmu --room <房间号>
-danmu --login
-danmu --logout
-danmu --configure-obs
-```
-
-运行 `danmu --help` 查看房间、布局、显示和配置参数。TUI 内输入 `/` 打开命令面板，使用 `↑/↓` 选择，按 `Enter` 直接执行；只有需要继续填写参数时才使用 `Tab` 补全。输入 `/help` 查看账号、显示、主题和 OBS 命令。
-
-主题只改变界面配色，不改变布局或功能。内置 `shisui`、`catppuccin-mocha`、`tokyo-night`、`gruvbox-dark` 四套深色主题：
-输入 `/theme` 会直接显示主题列表；当前主题排在第一项，选择后按 `Enter` 即时切换。
-
-```text
-/theme
-/theme tokyo-night
-/theme reload
-```
-
-首次正常启动会生成平台配置目录下的 `shisui-danmu/themes.json`；macOS 路径为 `~/Library/Application Support/shisui-danmu/themes.json`，`/theme` 会显示当前实际路径。复制现有主题对象、修改主题 ID 和 `label`，再用 `#RRGGBB` 配置 `time`、`name`、`content`、`frame`、`info`、`rank`、`background`、`success`、`host`、`warning` 十个必填语义色，即可增加自定义主题。保存后输入 `/theme reload` 热加载；`/theme <主题名>` 会立即切换并将选择写回 JSON。临时试用可在启动时传入 `--theme <主题名>`，不会改写已选主题。
-
-长弹幕按 20 个 Unicode 字素分段，段间隔一秒；任一段失败会停止后续发送。输入框顶栏会通过 OBS WebSocket 事件显示所配置麦克风的电平：响度上升立即响应、回落平滑，静音时固定显示 `MIC MUTE`，OBS 未连接或终端空间不足时自动隐藏。账号、OBS 配置、系统凭据存储与会话日志使用 TUI 独立命名空间，不读取商业 GUI 的私有凭据。底栏以纯符号显示数据：◉ 为 `WATCHED_CHANGE.data.num` 累计看过，♥ 为 `LIKE_INFO_V3_UPDATE.data.click_count` 累计点赞，▤ 为本次运行收到的弹幕数，● 为登录后通过 `getOnlineRank.data.onlineNum` 读取的当前在线人数；未登录时显示 `--`，绝不使用 `getRoomBaseInfo.online` 人气值冒充人数。
-
-## 卸载
+卸载：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rockythink/shisui-danmu/main/script/install_release.sh | bash -s -- --uninstall
 ```
 
-卸载只删除可执行文件，不删除本地配置、系统凭据存储或会话日志。
+卸载只删除可执行文件，不删除配置、系统凭据或会话日志。
 
-## 能力边界
+## License、商标与安全
 
-免费 TUI 包含公开房间监看、历史与实时事件去重、登录后发送弹幕、分类型互动标记、重点互动、会话归档、可配置高对比 True Color 主题、有限 OBS 控制及单路麦克风电平监看。
+源代码按 [Mozilla Public License 2.0](LICENSE) 发布，第三方组件见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。MPL-2.0 不授予 **DANMU** 名称、Logo、App 图标或其他品牌资产的商标许可，详见 [TRADEMARKS.md](TRADEMARKS.md)。
 
-本项目不包含播放器、完整直播画布、音频混音台、OBS 场景编辑器，也不在领域 Module 中直接依赖 B 站协议字段。完整功能基线见 [终端舞台功能基线](docs/terminal-feature-matrix.md)。
-
-## 开发与验证
-
-```bash
-./script/verify.sh
-```
-
-门禁包含 `rustfmt`、严格 `clippy`、全目标测试、Release 构建和 CLI 冒烟。GitHub Actions 在 macOS、Linux、Windows 上执行同等 Rust 门禁。
-
-提交修改前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
-
-## License 与商标
-
-源代码按 [Mozilla Public License 2.0](LICENSE) 发布。第三方组件见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
-MPL-2.0 不授予“拾穗弹幕台”名称、Logo、App 图标或其他品牌资产的商标许可。详见 [TRADEMARKS.md](TRADEMARKS.md)。
-
-## 安全问题
-
-请按 [SECURITY.md](SECURITY.md) 私下报告可能泄露 Cookie、CSRF、系统凭据存储内容或本地会话数据的问题。
+安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。不要在公开 Issue 中提交 B 站 Cookie、CSRF token、OBS 密码、系统凭据存储内容或本机会话日志。

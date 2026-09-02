@@ -87,4 +87,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --generate-notes \
-            --title "拾穗弹幕台 TUI $GITHUB_REF_NAME"
+            --title "DANMU $GITHUB_REF_NAME"

@@ -29,7 +29,7 @@ pub(super) fn microphone_meter(
         });
     }
 
-    let target_width = available.min(30);
+    let target_width = available.min(24);
     let Some(level) = level else {
         return Some(MeterLine {
             spans: vec![Span::styled(
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn keeps_compact_and_full_meter_widths_exact() {
-        for available in [10, 17, 18, 30, 48] {
+        for available in [10, 17, 18, 24, 30, 48] {
             let meter = microphone_meter(
                 MicrophoneState::Unmuted,
                 Some(MicrophoneLevel { peak_db: -12.0 }),
@@ -126,7 +126,7 @@ mod tests {
                 Palette::default(),
             )
             .unwrap();
-            assert_eq!(meter.width, available.min(30));
+            assert_eq!(meter.width, available.min(24));
             assert_eq!(display_width(&meter), meter.width);
         }
     }

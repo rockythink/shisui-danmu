@@ -73,7 +73,7 @@ download() {
   else echo "需要 curl 或 wget" >&2; exit 1; fi
 }
 
-echo "正在下载拾穗弹幕台 TUI ${VERSION}（${PLATFORM}/${ARCHIVE_ARCH}）…"
+echo "正在下载 DANMU ${VERSION}（${PLATFORM}/${ARCHIVE_ARCH}）…"
 download "$BASE_URL/$ASSET_NAME" "$ARCHIVE"
 download "$BASE_URL/$ASSET_NAME.sha256" "$CHECKSUM"
 if command -v shasum >/dev/null 2>&1; then

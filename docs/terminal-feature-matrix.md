@@ -8,7 +8,7 @@
 
 ## 产品边界
 
-终端舞台是拾穗弹幕台的免费终端前端，不是第二套直播产品。平台协议由 Rust `bilibili` Adapter 负责；标准事件、会话投影和日志由 `domain` 与 `persistence` Module 负责。Cookie、CSRF 和原始平台 payload 不进入终端配置、领域事件或归档。
+DANMU 是独立的免费终端产品。平台协议由 Rust `bilibili` Adapter 负责；标准事件、会话投影和日志由 `domain` 与 `persistence` Module 负责。Cookie、CSRF 和原始平台 payload 不进入终端配置、领域事件或归档。
 
 ## Rust TUI 验收矩阵
 

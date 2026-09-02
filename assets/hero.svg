@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="480" viewBox="0 0 1600 480" role="img" aria-labelledby="title desc">
+  <title id="title">DANMU</title>
+  <desc id="desc">DANMU — knowledge streamers' live interaction console</desc>
+  <defs>
+    <pattern id="scanlines" width="4" height="4" patternUnits="userSpaceOnUse">
+      <rect width="4" height="1" fill="#F8FAFC" opacity="0.025"/>
+    </pattern>
+    <filter id="cyanGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feFlood flood-color="#22D3EE" flood-opacity="0.26"/>
+      <feComposite in2="blur" operator="in"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="480" fill="#070A0F"/>
+  <rect x="34" y="34" width="1532" height="412" rx="12" fill="#090D14" stroke="#334155" stroke-width="2"/>
+  <rect x="34" y="34" width="1532" height="48" rx="12" fill="#0E141E"/>
+  <rect x="34" y="70" width="1532" height="12" fill="#0E141E"/>
+  <circle cx="68" cy="58" r="6" fill="#FB7185"/>
+  <circle cx="92" cy="58" r="6" fill="#FACC15"/>
+  <circle cx="116" cy="58" r="6" fill="#4ADE80"/>
+  <text x="800" y="65" fill="#94A3B8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" text-anchor="middle" letter-spacing="3">DANMU / LIVE CONSOLE</text>
+  <text x="1480" y="65" fill="#4ADE80" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" text-anchor="end">● ONLINE</text>
+
+  <text x="92" y="132" fill="#94A3B8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">
+    <tspan fill="#4ADE80">host@live</tspan><tspan fill="#64748B">:</tspan><tspan fill="#22D3EE">~</tspan><tspan fill="#F8FAFC">$ ./danmu</tspan>
+  </text>
+
+  <text x="800" y="308" fill="#F8FAFC" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="178" font-weight="800" text-anchor="middle" letter-spacing="34" filter="url(#cyanGlow)">DANMU</text>
+  <rect x="1200" y="178" width="24" height="134" fill="#22D3EE" opacity="0.95"/>
+
+  <line x1="92" y1="350" x2="1508" y2="350" stroke="#334155" stroke-width="2" stroke-dasharray="2 10"/>
+  <text x="92" y="396" fill="#5EEAD4" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" letter-spacing="3">LIVE INTERACTION CONSOLE</text>
+  <text x="1508" y="396" fill="#E2E8F0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="22" font-weight="600" text-anchor="end">为知识型主播收束弹幕、问题与现场控制</text>
+
+  <rect width="1600" height="480" fill="url(#scanlines)" pointer-events="none"/>
+  <path d="M92 420 H116 L124 410 L136 430 L148 404 L160 420 H180 L190 414 L200 426 L212 420 H1508" fill="none" stroke="#F472B6" stroke-width="2" opacity="0.54"/>
+</svg>
