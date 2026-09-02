@@ -29,7 +29,7 @@
   <img src="assets/tui-preview.png" alt="DANMU TUI：实时弹幕、重点问题、直播状态、OBS 与麦克风电平" width="100%">
 </p>
 
-> 截图使用实际 Ratatui 渲染缓冲区和演示数据生成，不包含真实观众信息。
+> 界面由实际 DANMU TUI 在真实终端中渲染；内容为演示数据，不包含真实观众信息。
 
 ## 为什么做 DANMU
 
@@ -48,15 +48,33 @@ DANMU 把这些信号压缩成一块可扫读的终端界面：
 
 ### 1. 安装
 
-macOS、Linux，以及 Windows 的 Git Bash：
+任选一种渠道；安装后的命令都叫 `danmu`。
+
+| 渠道 | 命令 | 适用环境 |
+| --- | --- | --- |
+| npm | `npm install -g danmu-tui` | 已安装 Node.js 18+ |
+| Bun | `bun install -g danmu-tui` | 已安装 Bun |
+| Homebrew | `brew install rockythink/tap/danmu` | macOS、Linux |
+| Cargo | `cargo install shisui-danmu --locked` | 已安装 Rust 1.89+ |
+| 安装脚本 | 见下方 | macOS、Linux、Windows Git Bash |
+| 手动下载 | [GitHub Releases](https://github.com/rockythink/shisui-danmu/releases/latest) | 全平台 |
+
+产品名统一为 **DANMU**。为保持已有仓库链接和本地数据目录兼容，GitHub 仓库与 Cargo 包继续使用 `shisui-danmu`，npm 包使用 `danmu-tui`；所有渠道安装后的可执行命令均为 `danmu`。
+
+npm 与 Bun 安装的是同一份 Rust 原生程序，不是 JavaScript 重写；包内不运行 `postinstall` 下载脚本。无需全局安装也可以直接执行：
+
+```bash
+npx danmu-tui <房间号>
+bunx danmu-tui <房间号>
+```
+
+无 Node、Bun、Homebrew 或 Rust 环境时，使用安装脚本：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rockythink/shisui-danmu/main/script/install_release.sh | bash
 ```
 
-安装脚本会识别操作系统与 CPU 架构，下载对应 GitHub Release，验证 SHA-256，并把可执行文件安装到 `~/.local/bin/danmu`。
-
-Windows 也可以直接从 [Releases](https://github.com/rockythink/shisui-danmu/releases/latest) 下载 `shisui-danmu-windows-x86_64.zip`，校验同名 `.sha256` 后，将 `danmu.exe` 放入 `PATH`。
+脚本会识别操作系统与 CPU 架构，下载对应 GitHub Release，验证 SHA-256，并安装到 `~/.local/bin/danmu`。Windows 也可以下载 `shisui-danmu-windows-x86_64.zip`，校验同名 `.sha256` 后将 `danmu.exe` 放入 `PATH`。
 
 ### 2. 进入直播间
 

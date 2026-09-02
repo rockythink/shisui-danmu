@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -18,7 +19,7 @@ use std::{
 use tokio::sync::{OnceCell, mpsc, watch};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Message, client::IntoClientRequest},
+    tungstenite::{Error as WebSocketError, Message, client::IntoClientRequest},
 };
 use url::Url;
 use uuid::Uuid;
@@ -36,6 +37,33 @@ pub enum BilibiliClientEvent {
     Likes(u64),
     UnhandledCommand { command: String },
     Error(String),
+}
+
+fn realtime_connection_error_event(error: anyhow::Error) -> Option<BilibiliClientEvent> {
+    let recoverable = error.chain().any(|cause| {
+        if let Some(error) = cause.downcast_ref::<WebSocketError>() {
+            return match error {
+                WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed => true,
+                WebSocketError::Io(error) => is_recoverable_socket_close(error.kind()),
+                _ => false,
+            };
+        }
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| is_recoverable_socket_close(error.kind()))
+    });
+
+    (!recoverable).then(|| BilibiliClientEvent::Error(error.to_string()))
+}
+
+fn is_recoverable_socket_close(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,7 +341,9 @@ impl BilibiliClient {
                 Ok(()) if *stop.borrow() => return,
                 Ok(()) => {}
                 Err(error) => {
-                    let _ = tx.send(BilibiliClientEvent::Error(error.to_string())).await;
+                    if let Some(event) = realtime_connection_error_event(error) {
+                        let _ = tx.send(event).await;
+                    }
                 }
             }
             let delay = RECONNECT_DELAYS_SECONDS[attempt.min(RECONNECT_DELAYS_SECONDS.len() - 1)];
@@ -1136,6 +1166,28 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn treats_tls_unexpected_eof_as_a_recoverable_disconnect() {
+        let error = anyhow::Error::from(tokio_tungstenite::tungstenite::Error::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "peer closed connection without sending TLS close_notify",
+            ),
+        ));
+
+        assert!(realtime_connection_error_event(error).is_none());
+    }
+
+    #[test]
+    fn preserves_non_recoverable_realtime_errors() {
+        let event = realtime_connection_error_event(anyhow!("B 站未返回弹幕令牌"));
+
+        assert_eq!(
+            event,
+            Some(BilibiliClientEvent::Error("B 站未返回弹幕令牌".into()))
+        );
+    }
 
     #[test]
     fn accepts_binary_and_text_websocket_payloads() {
