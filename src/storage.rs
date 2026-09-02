@@ -71,7 +71,17 @@ mod tests {
     #[test]
     fn preserves_terminal_namespace() {
         let paths = StoragePaths::discover().unwrap();
+        #[cfg(target_os = "macos")]
         assert!(paths.support_dir.to_string_lossy().contains(NAMESPACE));
+        #[cfg(target_os = "linux")]
+        assert!(paths.support_dir.ends_with("shisuidanmuterminal"));
+        #[cfg(target_os = "windows")]
+        assert!(
+            paths
+                .support_dir
+                .to_string_lossy()
+                .contains("ShisuiDanmuTerminal")
+        );
         assert!(
             paths
                 .account_session
