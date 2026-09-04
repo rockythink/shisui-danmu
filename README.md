@@ -1,10 +1,20 @@
 <p align="center">
-  <img src="assets/hero.png" alt="DANMU — Live Interaction Console" width="100%">
+  <a href="https://danmu.elazer.wang">
+    <img src="website/public/logo-pixel.svg" alt="DANMU 官方 Logo" width="96" height="96">
+  </a>
 </p>
+
+<h1 align="center">DANMU</h1>
 
 <p align="center">
   <strong>为知识型主播收束弹幕、问题与现场控制。</strong><br>
   一块安静、快速、可恢复的直播互动终端。
+</p>
+
+<p align="center">
+  <a href="https://danmu.elazer.wang"><strong>官方网站 · danmu.elazer.wang</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/rockythink/shisui-danmu/releases/latest">下载最新版</a>
 </p>
 
 <p align="center">
