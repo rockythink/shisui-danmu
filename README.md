@@ -25,16 +25,20 @@
 
 它不是播放器，也不是另一套 OBS。它只解决直播时最容易失控的那一段：**看见互动、辨认问题、快速回应、保留现场。**
 
+## 真实运行录屏
+
 <p align="center">
-  <img src="assets/tui-preview.png" alt="DANMU TUI：实时弹幕、重点问题、直播状态、OBS 与麦克风电平" width="100%">
+  <a href="https://danmu.elazer.wang/danmu-product-demo.mp4">
+    <img src="assets/danmu-product-demo.gif" alt="DANMU 真实运行录屏：启动、实时弹幕与终端交互，完整 56 秒" width="100%">
+  </a>
 </p>
 
-> 界面由实际 DANMU TUI 在真实终端中渲染；内容为演示数据，不包含真实观众信息。
+录屏在 README 内自动循环播放；点击画面可观看清晰版 MP4。
 
 <p align="center">
   <a href="https://danmu.elazer.wang"><strong>访问 DANMU 官网</strong></a>
   &nbsp;·&nbsp;
-  <a href="website/public/danmu-product-demo.mp4"><strong>▶ 观看 DANMU 真实运行录屏（56 秒）</strong></a>
+  <a href="https://danmu.elazer.wang/danmu-product-demo.mp4"><strong>观看完整 MP4（56 秒）</strong></a>
 </p>
 
 ## 为什么做 DANMU
