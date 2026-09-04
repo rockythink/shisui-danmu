@@ -1,0 +1,10 @@
+{
+  "name": "DANMU — 直播互动终端",
+  "short_name": "DANMU",
+  "description": "为知识型主播收束弹幕、问题与现场控制。",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#070A0F",
+  "theme_color": "#070A0F",
+  "icons": []
+}

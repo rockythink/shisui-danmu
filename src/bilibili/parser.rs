@@ -1,6 +1,6 @@
 use crate::domain::{DanmuEmote, DanmuEvent, DanmuEventKind};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use url::Url;
 use uuid::Uuid;
@@ -8,19 +8,17 @@ use uuid::Uuid;
 pub(crate) fn command_name(value: &Value) -> Option<&str> {
     value.get("cmd")?.as_str()?.split(':').next()
 }
+#[cfg(test)]
+pub(crate) const SEND_GIFT_V2_FIXTURE: &str = "CJvR+gISBEVSMDAaSmh0dHBzOi8vaTAuaGRzbGIuY29tL2Jmcy9mYWNlL2FjZWI5YjhkZGE4OTc3YWYwOWM3ZWM2YzFiZmZiMmEzNWI1MjMzNDkuanBnQgBKIAiLARD7+wEaDOW/g+WKqOebsuebkioG54iG5Ye6MJh1Ut4ECP36ARIJ55S15b2x56WoGAEgAijQDzDQDziYdUIEZ29sZEoTNDgxMzI3MTUxNzYyODQ4NzY4MFCau+rUBlgBYiRjOTlhZmRhYy01OWJjLTRmNjItYjk5OC0yNmMwY2Q1ZWU5NDhoCnDQD3gFhQEAAIA/iAEBkgEG5oqV5ZaCwAGuoIkB6gETCgtMLeavlOWlh+WgoRCL7Yq/BPABAYoCygEIi+2KvwQSwQEKC0wt5q+U5aWH5aChEkpodHRwczovL2kwLmhkc2xiLmNvbS9iZnMvZmFjZS8xNTAxMjA0N2JlNjdhZjVkNDJhMDU4ZTY5YjhlNGFmYzVkN2YwODRmLmpwZzJZCgtMLeavlOWlh+WgoRJKaHR0cHM6Ly9pMC5oZHNsYi5jb20vYmZzL2ZhY2UvMTUwMTIwNDdiZTY3YWY1ZDQyYTA1OGU2OWI4ZTRhZmM1ZDdmMDg0Zi5qcGc6CyD///////////8BkgIAmgLlAQpKaHR0cHM6Ly9zMS5oZHNsYi5jb20vYmZzL2xpdmUvMjA4NjRhMTBiZWFlYTU0MWM3ZGNlMjY0ZDViYmM1NjY3NmQ2M2U0Zi5wbmcSS2h0dHBzOi8vaTAuaGRzbGIuY29tL2Jmcy9saXZlLzA4Nzk5NDMyMzQzMDMxNDFjM2EwY2E2ODBkZjIzOWEyNzhhYzFlMzcud2VicCpKaHR0cHM6Ly9pMC5oZHNsYi5jb20vYmZzL2xpdmUvZWY5YjYzMDkzMTA4MGEyN2Q0N2MzOWFlZTAzNzQ0ZjJmNmE2ZGYxOS5naWagAtAPqgIAWAFqAggqersBCJvR+gISswEKBEVSMDASSmh0dHBzOi8vaTAuaGRzbGIuY29tL2Jmcy9mYWNlL2FjZWI5YjhkZGE4OTc3YWYwOWM3ZWM2YzFiZmZiMmEzNWI1MjMzNDkuanBnMlIKBEVSMDASSmh0dHBzOi8vaTAuaGRzbGIuY29tL2Jmcy9mYWNlL2FjZWI5YjhkZGE4OTc3YWYwOWM3ZWM2YzFiZmZiMmEzNWI1MjMzNDkuanBnOgsg////////////AQ==";
 
 pub fn parse_command(value: &Value) -> Option<DanmuEvent> {
     let command = command_name(value)?;
     let data = value.get("data").unwrap_or(&Value::Null);
     match command {
         "DANMU_MSG" => parse_danmu(value),
-        "SEND_GIFT" | "COMBO_SEND" => event(
-            DanmuEventKind::Gift,
-            username(data),
-            author_id(data),
-            gift_content(data),
-            event_id(data),
-        ),
+        "SEND_GIFT" => parse_gift(data),
+        "COMBO_SEND" => parse_combo_gift(data),
+        "SEND_GIFT_V2" => None,
         "SUPER_CHAT_MESSAGE" | "SUPER_CHAT_MESSAGE_JPN" | "SUPER_CHAT_MESSAGE_JP" => event(
             DanmuEventKind::Superchat,
             username(data),
@@ -418,13 +416,257 @@ fn value_i64(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str()?.trim().parse().ok())
 }
 
-fn gift_content(data: &Value) -> Option<String> {
-    let gift = text(data, &["giftName", "gift_name"]).unwrap_or_else(|| "礼物".into());
-    let count = ["num", "gift_num", "total_num", "combo_num"]
+#[derive(Clone, Debug)]
+struct BlindGift {
+    name: String,
+    reveal_action: String,
+}
+
+#[derive(Debug)]
+struct GiftPayload {
+    username: Option<String>,
+    author_id: Option<String>,
+    gift_name: String,
+    quantity: u64,
+    action: String,
+    blind_gift: Option<BlindGift>,
+    platform_event_id: Option<String>,
+    timestamp: DateTime<Utc>,
+}
+
+impl GiftPayload {
+    fn into_event(self) -> DanmuEvent {
+        let content = if let Some(blind_gift) = &self.blind_gift {
+            format!(
+                "开启 {} ×{}，{} {} ×{}",
+                blind_gift.name,
+                self.quantity,
+                blind_gift.reveal_action,
+                self.gift_name,
+                self.quantity
+            )
+        } else {
+            format!("{} {} ×{}", self.action, self.gift_name, self.quantity)
+        };
+        let id = self
+            .platform_event_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        DanmuEvent {
+            id,
+            kind: DanmuEventKind::Gift,
+            timestamp: self.timestamp,
+            username: self.username,
+            author_id: self.author_id,
+            content,
+            origin: Default::default(),
+            platform_event_id: self.platform_event_id,
+            emotes: Vec::new(),
+        }
+    }
+}
+
+fn combo_event_id(data: &Value) -> Option<String> {
+    data.get("batch_combo_id")
+        .or_else(|| data.pointer("/batch_combo_send/batch_combo_id"))
+        .or_else(|| data.get("combo_id"))
+        .or_else(|| data.pointer("/combo_send/combo_id"))
+        .and_then(value_string)
+}
+
+fn parse_gift(data: &Value) -> Option<DanmuEvent> {
+    let blind_data = data
+        .get("blind_gift")
+        .filter(|value| value.is_object())
+        .or_else(|| data.pointer("/batch_combo_send/blind_gift"));
+    let blind_gift = match blind_data {
+        Some(value) => Some(BlindGift {
+            name: text(value, &["original_gift_name"])?,
+            reveal_action: text(value, &["gift_action"])?,
+        }),
+        None => None,
+    };
+    let quantity = data
+        .get("num")
+        .and_then(value_i64)
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)?;
+    let combo_count = data
+        .pointer("/batch_combo_send/batch_combo_num")
+        .or_else(|| data.pointer("/combo_send/combo_num"))
+        .and_then(value_i64)
+        .and_then(|value| u64::try_from(value).ok());
+    let quantity = combo_count
+        .filter(|count| *count >= quantity)
+        .unwrap_or(quantity);
+    let timestamp = data
+        .get("timestamp")
+        .and_then(value_i64)
+        .and_then(unix_timestamp)
+        .unwrap_or_else(Utc::now);
+    let platform_event_id = combo_event_id(data).or_else(|| {
+        ["tid", "rnd", "id_str", "id", "message_id"]
+            .iter()
+            .find_map(|key| data.get(*key).and_then(value_string))
+    });
+
+    Some(
+        GiftPayload {
+            username: username(data),
+            author_id: author_id(data),
+            gift_name: text(data, &["giftName", "gift_name"])?,
+            quantity,
+            action: text(data, &["action"])?,
+            blind_gift,
+            platform_event_id,
+            timestamp,
+        }
+        .into_event(),
+    )
+}
+
+fn parse_combo_gift(data: &Value) -> Option<DanmuEvent> {
+    let quantity = ["total_num", "batch_combo_num", "combo_num"]
         .iter()
         .find_map(|key| data.get(*key).and_then(value_i64))
-        .unwrap_or(1);
-    Some(format!("赠送 {gift} ×{count}"))
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)?;
+    let timestamp = data
+        .get("timestamp")
+        .and_then(value_i64)
+        .and_then(unix_timestamp)
+        .unwrap_or_else(Utc::now);
+
+    Some(
+        GiftPayload {
+            username: username(data),
+            author_id: author_id(data),
+            gift_name: text(data, &["giftName", "gift_name"])?,
+            quantity,
+            action: text(data, &["action"])?,
+            blind_gift: None,
+            platform_event_id: Some(combo_event_id(data)?),
+            timestamp,
+        }
+        .into_event(),
+    )
+}
+
+pub(crate) fn parse_gift_v2(data: &Value) -> Option<Vec<DanmuEvent>> {
+    let bytes = STANDARD.decode(data.get("pb")?.as_str()?).ok()?;
+    let mut cursor = 0usize;
+    let mut author_id = None;
+    let mut username = None;
+    let mut blind_gift = None;
+    let mut gift_items = Vec::new();
+    while cursor < bytes.len() {
+        let tag = read_protobuf_varint(&bytes, &mut cursor)?;
+        let field = tag >> 3;
+        let wire_type = (tag & 0x07) as u8;
+        match (field, wire_type) {
+            (1, 0) => author_id = Some(read_protobuf_varint(&bytes, &mut cursor)?.to_string()),
+            (2, 2) => username = Some(protobuf_string(&bytes, &mut cursor)?),
+            (9, 2) => {
+                blind_gift = Some(decode_blind_gift(read_protobuf_bytes(
+                    &bytes,
+                    &mut cursor,
+                )?)?)
+            }
+            (10, 2) => gift_items.push(read_protobuf_bytes(&bytes, &mut cursor)?),
+            _ => skip_protobuf_field(&bytes, &mut cursor, wire_type)?,
+        }
+    }
+
+    let mut events = Vec::with_capacity(gift_items.len());
+    for item in gift_items {
+        events.push(
+            decode_gift_item(
+                item,
+                username.clone(),
+                author_id.clone(),
+                blind_gift.clone(),
+            )?
+            .into_event(),
+        );
+    }
+    Some(events)
+}
+
+fn decode_blind_gift(bytes: &[u8]) -> Option<BlindGift> {
+    let mut cursor = 0usize;
+    let mut name = None;
+    let mut reveal_action = None;
+    while cursor < bytes.len() {
+        let tag = read_protobuf_varint(bytes, &mut cursor)?;
+        let field = tag >> 3;
+        let wire_type = (tag & 0x07) as u8;
+        match (field, wire_type) {
+            (3, 2) => name = Some(protobuf_string(bytes, &mut cursor)?),
+            (5, 2) => reveal_action = Some(protobuf_string(bytes, &mut cursor)?),
+            _ => skip_protobuf_field(bytes, &mut cursor, wire_type)?,
+        }
+    }
+    Some(BlindGift {
+        name: name?,
+        reveal_action: reveal_action?,
+    })
+}
+
+fn decode_gift_item(
+    bytes: &[u8],
+    username: Option<String>,
+    author_id: Option<String>,
+    blind_gift: Option<BlindGift>,
+) -> Option<GiftPayload> {
+    let mut cursor = 0usize;
+    let mut gift_name = None;
+    let mut quantity = None;
+    let mut action = None;
+    let mut platform_event_id = None;
+    let mut fallback_event_id = None;
+    let mut timestamp = None;
+    while cursor < bytes.len() {
+        let tag = read_protobuf_varint(bytes, &mut cursor)?;
+        let field = tag >> 3;
+        let wire_type = (tag & 0x07) as u8;
+        match (field, wire_type) {
+            (2, 2) => gift_name = Some(protobuf_string(bytes, &mut cursor)?),
+            (3, 0) => quantity = Some(read_protobuf_varint(bytes, &mut cursor)?),
+            (9, 2) => platform_event_id = Some(protobuf_string(bytes, &mut cursor)?),
+            (10, 0) => timestamp = Some(read_protobuf_varint(bytes, &mut cursor)?),
+            (12, 2) => fallback_event_id = Some(protobuf_string(bytes, &mut cursor)?),
+            (18, 2) => action = Some(protobuf_string(bytes, &mut cursor)?),
+            _ => skip_protobuf_field(bytes, &mut cursor, wire_type)?,
+        }
+    }
+
+    Some(GiftPayload {
+        username,
+        author_id,
+        gift_name: gift_name?,
+        quantity: quantity.filter(|value| *value > 0)?,
+        action: action?,
+        blind_gift,
+        platform_event_id: platform_event_id.or(fallback_event_id),
+        timestamp: timestamp
+            .and_then(|value| i64::try_from(value).ok())
+            .and_then(unix_timestamp)
+            .unwrap_or_else(Utc::now),
+    })
+}
+
+fn protobuf_string(bytes: &[u8], cursor: &mut usize) -> Option<String> {
+    std::str::from_utf8(read_protobuf_bytes(bytes, cursor)?)
+        .ok()
+        .map(str::to_owned)
+}
+
+fn unix_timestamp(value: i64) -> Option<DateTime<Utc>> {
+    if value >= 100_000_000_000 {
+        Utc.timestamp_millis_opt(value).single()
+    } else {
+        Utc.timestamp_opt(value, 0).single()
+    }
 }
 
 fn guard_content(data: &Value) -> Option<String> {
@@ -438,6 +680,7 @@ fn guard_content(data: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::DanmuSession;
     use serde_json::json;
 
     #[test]
@@ -521,7 +764,7 @@ mod tests {
     fn maps_supported_live_commands_to_domain_kinds() {
         let cases = [
             (
-                json!({"cmd":"SEND_GIFT","data":{"uname":"甲","giftName":"花","num":2}}),
+                json!({"cmd":"SEND_GIFT","data":{"uname":"甲","action":"赠送","giftName":"花","num":2}}),
                 DanmuEventKind::Gift,
             ),
             (
@@ -572,5 +815,140 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+    #[test]
+    fn describes_blind_box_source_and_result() {
+        let event = parse_command(&json!({
+            "cmd": "SEND_GIFT",
+            "data": {
+                "uname": "夏子忠",
+                "uid": 404294855,
+                "action": "投喂",
+                "giftName": "爱心抱枕",
+                "num": 1,
+                "blind_gift": {
+                    "gift_action": "爆出",
+                    "original_gift_name": "心动盲盒"
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(event.content, "开启 心动盲盒 ×1，爆出 爱心抱枕 ×1");
+    }
+
+    #[test]
+    fn rejects_gifts_missing_required_contract_fields() {
+        assert!(
+            parse_command(&json!({
+                "cmd": "SEND_GIFT",
+                "data": {"uname": "甲", "giftName": "花", "num": 1}
+            }))
+            .is_none()
+        );
+    }
+    #[test]
+    fn parses_current_send_gift_v2_payload() {
+        let events = parse_gift_v2(&json!({
+            "pb": SEND_GIFT_V2_FIXTURE
+        }))
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind, DanmuEventKind::Gift);
+        assert_eq!(event.username.as_deref(), Some("ER00"));
+        assert_eq!(event.author_id.as_deref(), Some("6203547"));
+        assert_eq!(event.timestamp.timestamp(), 1_788_517_786);
+        assert_eq!(
+            event.platform_event_id.as_deref(),
+            Some("4813271517628487680")
+        );
+        assert_eq!(event.content, "开启 心动盲盒 ×1，爆出 电影票 ×1");
+    }
+
+    #[test]
+    fn uses_the_latest_combo_total_as_the_display_quantity() {
+        let event = parse_command(&json!({
+            "cmd": "SEND_GIFT",
+            "data": {
+                "uname": "来把RPG吧",
+                "action": "投喂",
+                "giftName": "干杯",
+                "num": 1,
+                "batch_combo_id": "combo-1",
+                "batch_combo_send": {"batch_combo_num": 2}
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(event.id, "combo-1");
+        assert_eq!(event.content, "投喂 干杯 ×2");
+    }
+
+    #[test]
+    fn collapses_combo_updates_to_the_latest_total() {
+        let mut session = DanmuSession::new("1");
+        let source = parse_command(&json!({
+            "cmd": "SEND_GIFT",
+            "data": {
+                "uname": "甲",
+                "uid": 42,
+                "action": "投喂",
+                "giftName": "小心心",
+                "num": 1,
+                "tid": "gift-message-1",
+                "batch_combo_id": "combo-1",
+                "batch_combo_send": {
+                    "batch_combo_id": "combo-1",
+                    "batch_combo_num": 1
+                }
+            }
+        }))
+        .unwrap();
+        let update = parse_command(&json!({
+            "cmd": "COMBO_SEND",
+            "data": {
+                "uname": "甲",
+                "uid": 42,
+                "action": "投喂",
+                "gift_name": "小心心",
+                "batch_combo_id": "combo-1",
+                "batch_combo_num": 5,
+                "total_num": 5
+            }
+        }))
+        .unwrap();
+
+        let source_timestamp = source.timestamp;
+        assert!(session.ingest(source));
+        assert!(session.ingest(update));
+        assert_eq!(session.recent_events.len(), 1);
+        assert_eq!(session.recent_events[0].content, "投喂 小心心 ×5");
+        assert_eq!(session.recent_events[0].timestamp, source_timestamp);
+        assert_eq!(session.metrics.count(DanmuEventKind::Gift), 1);
+    }
+
+    #[test]
+    fn keeps_distinct_gift_batches_separate() {
+        let mut session = DanmuSession::new("1");
+        for combo_id in ["combo-1", "combo-2"] {
+            let event = parse_command(&json!({
+                "cmd": "COMBO_SEND",
+                "data": {
+                    "uname": "甲",
+                    "uid": 42,
+                    "action": "投喂",
+                    "gift_name": "小心心",
+                    "batch_combo_id": combo_id,
+                    "total_num": 2
+                }
+            }))
+            .unwrap();
+            assert!(session.ingest(event));
+        }
+
+        assert_eq!(session.recent_events.len(), 2);
+        assert_eq!(session.metrics.count(DanmuEventKind::Gift), 2);
     }
 }

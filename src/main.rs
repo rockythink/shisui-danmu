@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use shisui_danmu::{
-    bilibili::{AccountClient, BilibiliClient},
+    bilibili::AccountClient,
     config::{Cli, TerminalConfig},
     obs::{ObsConfiguration, ObsController},
     persistence::SessionJournal,
@@ -16,18 +16,16 @@ async fn main() {
         std::process::exit(1);
     }
 }
-
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = StoragePaths::discover()?;
     paths.ensure()?;
-    let account = AccountClient::new(paths.account_session.clone())?;
 
     if cli.login {
-        return interactive_login(account).await;
+        return interactive_login(AccountClient::new(paths.account_session.clone())?).await;
     }
     if cli.logout {
-        account.sign_out()?;
+        AccountClient::new(paths.account_session.clone())?.sign_out()?;
         println!("已清除 TUI 独立的 B 站登录态");
         return Ok(());
     }
@@ -39,12 +37,5 @@ async fn run() -> Result<()> {
     let obs_configuration = ObsConfiguration::load(&paths.obs_configuration)?;
     let obs = ObsController::new(obs_configuration, paths.obs_configuration.clone());
     let journal = SessionJournal::new(paths.sessions_dir.clone());
-    TerminalApp::run(
-        config,
-        BilibiliClient::new(paths.account_session)?,
-        account,
-        obs,
-        journal,
-    )
-    .await
+    TerminalApp::run(config, paths.account_session, obs, journal).await
 }

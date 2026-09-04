@@ -2,7 +2,6 @@ mod meter;
 
 pub use meter::MicrophoneLevel;
 
-use crate::storage::OBS_KEYRING_SERVICE;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use meter::{LevelSmoother, SILENCE_DB, peak_db};
@@ -53,6 +52,58 @@ impl ObsConfiguration {
         }
         std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
         Ok(())
+    }
+}
+
+const OBS_PASSWORD_FILENAME: &str = "obs-password";
+
+fn obs_password_path(configuration_path: &Path) -> PathBuf {
+    configuration_path.with_file_name(OBS_PASSWORD_FILENAME)
+}
+
+pub(crate) fn save_obs_password(configuration_path: &Path, password: &str) -> Result<()> {
+    let path = obs_password_path(configuration_path);
+    if password.is_empty() {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(password.as_bytes())?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, password)?;
+    Ok(())
+}
+
+fn load_obs_password(configuration_path: &Path) -> Result<Option<String>> {
+    if let Some(password) = std::env::var("OBS_API_PASSWORD")
+        .ok()
+        .filter(|password| !password.is_empty())
+    {
+        return Ok(Some(password));
+    }
+    match std::fs::read_to_string(obs_password_path(configuration_path)) {
+        Ok(password) if password.is_empty() => Ok(None),
+        Ok(password) => Ok(Some(password)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -112,6 +163,12 @@ impl ObsController {
         Ok(())
     }
 
+    pub async fn set_password(&self, password: &str) -> Result<()> {
+        save_obs_password(&self.configuration_path, password)?;
+        self.state.lock().await.client = None;
+        Ok(())
+    }
+
     pub async fn set_microphone_name(&self, name: String) -> Result<()> {
         let name = name.trim().to_string();
         if name.is_empty() {
@@ -127,16 +184,6 @@ impl ObsController {
         let mut configuration = self.configuration().await;
         configuration.microphone_input_name = name;
         self.update_configuration(configuration).await
-    }
-
-    pub fn set_password(password: &str) -> Result<()> {
-        let entry = keyring::Entry::new(OBS_KEYRING_SERVICE, "default")?;
-        if password.is_empty() {
-            let _ = entry.delete_credential();
-        } else {
-            entry.set_password(password)?;
-        }
-        Ok(())
     }
 
     pub async fn fetch_status(&self) -> Result<ObsStatus> {
@@ -356,10 +403,9 @@ impl ObsController {
                 }
                 state.configuration.clone()
             };
-            let password = keyring::Entry::new(OBS_KEYRING_SERVICE, "default")
-                .ok()
-                .and_then(|entry| entry.get_password().ok())
-                .or_else(|| std::env::var("OBS_API_PASSWORD").ok());
+            let password =
+                load_obs_password(&self.configuration_path).context("读取 OBS 本地密码失败")?;
+            let password_configured = password.is_some();
             let connect = Client::connect_with_config(ConnectConfig {
                 host: configuration.host.clone(),
                 port: configuration.port,
@@ -378,10 +424,15 @@ impl ObsController {
                 .await
                 .context("连接 OBS WebSocket 超时")?
                 .with_context(|| {
-                    format!(
+                    let target = format!(
                         "无法连接 OBS WebSocket {}:{}",
                         configuration.host, configuration.port
-                    )
+                    );
+                    if password_configured {
+                        target
+                    } else {
+                        format!("{target}；OBS 已启用认证时，请运行 /obs config password 保存密码")
+                    }
                 })?;
             let client = Arc::new(client);
             let mut state = self.state.lock().await;
@@ -474,5 +525,29 @@ mod tests {
         .unwrap();
         let configuration = ObsConfiguration::load(&path).unwrap();
         assert_eq!(configuration.default_live_scene, "直播");
+    }
+    #[test]
+    fn password_round_trips_in_private_app_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let configuration_path = temp.path().join("obs-control.json");
+
+        save_obs_password(&configuration_path, "secret-value").unwrap();
+
+        assert_eq!(
+            load_obs_password(&configuration_path).unwrap().as_deref(),
+            Some("secret-value"),
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(obs_password_path(&configuration_path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+            );
+        }
     }
 }

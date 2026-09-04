@@ -6,3 +6,7 @@
 .idea/
 .vscode/
 .playwright-cli/
+/website/node_modules/
+/website/dist/
+/website/.astro/
+/website/.wrangler/

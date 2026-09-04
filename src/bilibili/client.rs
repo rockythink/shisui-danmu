@@ -1,6 +1,6 @@
 use super::{
     CrossOriginDeduplicator, RECONNECT_DELAYS_SECONDS, encode_packet, parse_command, parse_packets,
-    parser::command_name,
+    parser::{command_name, parse_gift_v2},
 };
 use crate::domain::{DanmuEvent, DanmuEventKind, DanmuEventOrigin};
 use anyhow::{Context, Result, anyhow, bail};
@@ -41,6 +41,9 @@ pub enum BilibiliClientEvent {
 
 fn realtime_connection_error_event(error: anyhow::Error) -> Option<BilibiliClientEvent> {
     let recoverable = error.chain().any(|cause| {
+        if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
+            return error.is_connect() || error.is_timeout();
+        }
         if let Some(error) = cause.downcast_ref::<WebSocketError>() {
             return match error {
                 WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed => true,
@@ -522,6 +525,15 @@ impl BilibiliClient {
                                                 && tx.send(BilibiliClientEvent::Danmu(event)).await.is_err()
                                             {
                                                 return Ok(());
+                                            }
+                                        }
+                                        RealtimeMessage::DanmuBatch(events) => {
+                                            for event in events {
+                                                if deduplicator.should_emit(&event)
+                                                    && tx.send(BilibiliClientEvent::Danmu(event)).await.is_err()
+                                                {
+                                                    return Ok(());
+                                                }
                                             }
                                         }
                                         RealtimeMessage::Unhandled(command) => {
@@ -1129,6 +1141,7 @@ enum RealtimeMessage {
     Watched(u64),
     Likes(u64),
     Danmu(DanmuEvent),
+    DanmuBatch(Vec<DanmuEvent>),
     Unhandled(String),
     Ignored,
 }
@@ -1139,6 +1152,12 @@ fn classify_realtime_message(value: &Value) -> RealtimeMessage {
     }
     if let Some(count) = like_count(value) {
         return RealtimeMessage::Likes(count);
+    }
+    if command_name(value) == Some("SEND_GIFT_V2") {
+        let data = value.get("data").unwrap_or(&Value::Null);
+        if let Some(events) = parse_gift_v2(data).filter(|events| !events.is_empty()) {
+            return RealtimeMessage::DanmuBatch(events);
+        }
     }
     if let Some(event) = parse_command(value) {
         return RealtimeMessage::Danmu(event);
@@ -1166,6 +1185,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bilibili::parser::SEND_GIFT_V2_FIXTURE;
 
     #[test]
     fn treats_tls_unexpected_eof_as_a_recoverable_disconnect() {
@@ -1177,6 +1197,39 @@ mod tests {
         ));
 
         assert!(realtime_connection_error_event(error).is_none());
+    }
+
+    #[test]
+    fn classifies_current_send_gift_v2_as_a_gift_batch() {
+        let value = json!({
+            "cmd": "SEND_GIFT_V2",
+            "data": {"pb": SEND_GIFT_V2_FIXTURE}
+        });
+
+        let RealtimeMessage::DanmuBatch(events) = classify_realtime_message(&value) else {
+            panic!("SEND_GIFT_V2 should be delivered as a gift batch");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, DanmuEventKind::Gift);
+        assert_eq!(events[0].content, "开启 心动盲盒 ×1，爆出 电影票 ×1");
+    }
+
+    #[tokio::test]
+    async fn treats_http_connection_failures_as_recoverable() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(error.is_connect());
+        assert!(realtime_connection_error_event(error.into()).is_none());
     }
 
     #[test]

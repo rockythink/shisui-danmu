@@ -31,12 +31,19 @@
 
 > 界面由实际 DANMU TUI 在真实终端中渲染；内容为演示数据，不包含真实观众信息。
 
+<p align="center">
+  <a href="https://danmu.elazer.wang"><strong>访问 DANMU 官网</strong></a>
+  &nbsp;·&nbsp;
+  <a href="website/public/danmu-product-demo.mp4"><strong>▶ 观看 DANMU 真实运行录屏（56 秒）</strong></a>
+</p>
+
 ## 为什么做 DANMU
 
 知识型直播的难点通常不是“弹幕不够多”，而是信息密度太高：问题夹在闲聊里，历史接口与实时 WebSocket 偶尔漏包，主播还要同时确认推流、场景和麦克风状态。
 
 DANMU 把这些信号压缩成一块可扫读的终端界面：
 
+- **启动过程有反馈**：终端首帧出现后立即播放 DANMU Logo 动效，B 站客户端初始化、本地会话恢复与各项网络检查在动画期间并发执行；动画至少展示两秒，并展示作者 Elazer 与 `elazer.wang`；任一检查失败都会阻断启动，可选择重试、直接配置 OBS 密码或按 `S` 明确跳过；可随时按 `Ctrl+C` 退出；
 - **不漏重要互动**：历史窗口与实时流合并、去重，断线自动重连；
 - **问题留在眼前**：键盘选中弹幕、插入回复对象、设置重点消息；
 - **发送结果可确认**：长弹幕按 Unicode 字素安全分段，并等待主播身份回流；
@@ -160,6 +167,7 @@ danmu --logout
 | `/obs scene [名称]` | 列出或切换场景 |
 | `/obs config mic [名称]` | 列出或选择单路麦克风输入 |
 | `/obs start` | 开始推流 |
+| `/obs config password` | 隐藏输入并更新 TUI 私有 OBS 密码文件 |
 | `/obs stop` | 请求停止推流；必须再执行 `/obs confirm` |
 | `/obs cancel` | 取消待确认的停止推流操作 |
 | `/quit` | 安全退出并写入会话状态 |
@@ -169,17 +177,21 @@ danmu --logout
 DANMU 使用 OBS 28+ 内置的 WebSocket v5，**不依赖 `obs-cli`、Python 或额外桥接进程**。
 
 1. 在 OBS 中打开 **工具 → WebSocket 服务器设置**；
-2. 启用 WebSocket 服务器，记下端口与密码；
+2. 启用 WebSocket 服务器，记下端口；如启用了身份验证，同时准备密码；
 3. 运行配置向导：
 
    ```bash
    danmu --configure-obs
    ```
 
-4. 依次填写主机、端口、默认直播场景和麦克风输入名；
+4. 依次填写主机、端口、默认直播场景、麦克风输入名和密码；
 5. 进入 TUI 后运行 `/obs status` 验证连接。
 
-密码保存到系统凭据存储；主机、端口、场景与输入名写入 DANMU 独立配置。停止推流始终需要二次确认。
+启动自检发现 OBS 缺少密码时会停留在检查界面：按 `Enter` 直接隐藏输入密码并重新检查，或按 `S` 跳过本次故障继续进入弹幕台。其他网络检查失败时，`Enter` 表示重试。
+
+OBS 密码不会写入系统“密码”/钥匙串或 `obs-control.json`。配置向导或 TUI 中的 `/obs config password` 会把密码写入 DANMU 私有的 `obs-password` 文件；macOS/Linux 权限固定为 `0600`。
+
+一次性运行仍可使用 `OBS_API_PASSWORD` 环境变量覆盖本地密码。不使用 OBS 身份验证则无需设置。主机、端口、场景与输入名写入 DANMU 独立配置；停止推流始终需要二次确认。
 
 ## 配置与主题
 
@@ -231,7 +243,7 @@ CLI 参数优先于 TOML。可通过 `--config <路径>` 使用指定配置文�
 DANMU 使用独立命名空间，不读取商业 GUI、浏览器或其他直播工具的数据：
 
 - B 站 Cookie / CSRF：独立 `BilibiliAccount/session.json`，Unix 权限 `0600`；
-- OBS 密码：系统凭据存储；
+- OBS 密码：独立 `obs-password` 文件，Unix 权限 `0600`；可由 `OBS_API_PASSWORD` 临时覆盖；不使用系统钥匙串；
 - OBS 非敏感配置：独立 `obs-control.json`；
 - 主题与启动配置：平台配置目录中的 `shisui-danmu/`；
 - 会话记录：每场直播一个目录，持续追加 `journal.jsonl`；

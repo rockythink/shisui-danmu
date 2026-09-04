@@ -1,6 +1,6 @@
 [package]
 name = "shisui-danmu"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.89"
 description = "面向知识型主播的跨平台弹幕与直播监控 TUI 工作台"
@@ -30,7 +30,6 @@ flate2 = "1"
 fs2 = "0.4"
 futures-util = "0.3"
 hex = "0.4"
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 obws = { version = "0.15.0", features = ["events"] }
 qrcode = { version = "0.14", default-features = false }
 ratatui = "0.30.2"

@@ -42,6 +42,7 @@ use ratatui::{
 use std::{
     collections::VecDeque,
     io::{self, Stdout},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -50,6 +51,273 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 const SEND_QUEUE_INTERVAL: Duration = Duration::from_secs(2);
 const DELIVERY_NOTICE_LIFETIME: Duration = Duration::from_secs(15);
+const STARTUP_MIN_DURATION: Duration = Duration::from_secs(2);
+
+fn startup_can_finish(elapsed: Duration, data_ready: bool) -> bool {
+    data_ready && elapsed >= STARTUP_MIN_DURATION
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupCheck {
+    Waiting,
+    Running,
+    Passed(&'static str),
+    Skipped(&'static str),
+    Warning(&'static str),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StartupView {
+    local: StartupCheck,
+    account: StartupCheck,
+    room: StartupCheck,
+    metrics: StartupCheck,
+    obs: StartupCheck,
+}
+
+impl StartupView {
+    fn new() -> Self {
+        Self {
+            local: StartupCheck::Running,
+            account: StartupCheck::Running,
+            room: StartupCheck::Waiting,
+            metrics: StartupCheck::Waiting,
+            obs: StartupCheck::Running,
+        }
+    }
+
+    fn apply(&mut self, update: StartupUpdate) {
+        match update {
+            StartupUpdate::Local(status) => self.local = status,
+            StartupUpdate::Account(status) => self.account = status,
+            StartupUpdate::Room(status) => self.room = status,
+            StartupUpdate::Metrics(status) => self.metrics = status,
+        }
+    }
+
+    fn active_label(self) -> &'static str {
+        if self.local == StartupCheck::Running {
+            "恢复本地会话"
+        } else if self.account == StartupCheck::Running {
+            "检查登录状态"
+        } else if self.room == StartupCheck::Running {
+            "检查直播间　"
+        } else if self.metrics == StartupCheck::Running {
+            "同步直播指标"
+        } else if self.obs == StartupCheck::Running {
+            "检查OBS连接 "
+        } else {
+            "启动自检完成"
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StartupUpdate {
+    Local(StartupCheck),
+    Account(StartupCheck),
+    Room(StartupCheck),
+    Metrics(StartupCheck),
+}
+
+#[derive(Debug)]
+struct StartupData {
+    room: Option<RoomSnapshot>,
+    initial_room_error: Option<String>,
+    account_status: AccountStatus,
+    online_viewers: Option<u64>,
+    likes: Option<u64>,
+    initial_online_error: Option<String>,
+    initial_likes_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct StartupSession {
+    session: DanmuSession,
+    initial_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+enum StartupGate {
+    #[default]
+    Checking,
+    Ready,
+    Blocked,
+    EnteringObsPassword(EditorInput),
+    Skipped,
+}
+
+impl StartupGate {
+    fn can_finish(&self) -> bool {
+        matches!(self, Self::Ready | Self::Skipped)
+    }
+}
+
+impl StartupView {
+    fn has_warning(self) -> bool {
+        [self.local, self.account, self.room, self.metrics, self.obs]
+            .into_iter()
+            .any(|status| matches!(status, StartupCheck::Warning(_)))
+    }
+
+    fn obs_requires_password(self) -> bool {
+        matches!(self.obs, StartupCheck::Warning(message) if message.contains("/obs config password"))
+    }
+}
+
+async fn load_startup_clients(account_session: PathBuf) -> Result<(BilibiliClient, AccountClient)> {
+    tokio::task::spawn_blocking(move || {
+        let client = BilibiliClient::new(account_session.clone())?;
+        let account = AccountClient::new(account_session)?;
+        Ok::<_, anyhow::Error>((client, account))
+    })
+    .await
+    .map_err(|error| anyhow!("B 站客户端初始化任务失败：{error}"))?
+}
+
+async fn load_startup_session(
+    journal: SessionJournal,
+    room_id: String,
+    updates: mpsc::UnboundedSender<StartupUpdate>,
+) -> StartupSession {
+    let recovery = tokio::task::spawn_blocking(move || journal.recover_latest_interrupted()).await;
+    let recovered = match recovery {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(error) => Err(format!("会话恢复任务失败：{error}")),
+    };
+    match recovered {
+        Ok(recovered) => {
+            let did_recover = recovered
+                .as_ref()
+                .is_some_and(|session| session.room_id == room_id);
+            let mut session = recovered
+                .filter(|session| session.room_id == room_id)
+                .unwrap_or_else(|| DanmuSession::new(&room_id));
+            if session.status != crate::domain::DanmuSessionStatus::Active {
+                session.resume();
+            }
+            let status = if did_recover {
+                "已恢复"
+            } else {
+                "已读取"
+            };
+            let _ = updates.send(StartupUpdate::Local(StartupCheck::Passed(status)));
+            StartupSession {
+                session,
+                initial_error: None,
+            }
+        }
+        Err(error) => {
+            let _ = updates.send(StartupUpdate::Local(StartupCheck::Warning(
+                "读取失败 · 可重试",
+            )));
+            StartupSession {
+                session: DanmuSession::new(&room_id),
+                initial_error: Some(error),
+            }
+        }
+    }
+}
+
+async fn check_startup_obs(obs: ObsController) -> StartupCheck {
+    match tokio::time::timeout(Duration::from_secs(3), obs.fetch_status()).await {
+        Ok(Ok(_)) => StartupCheck::Passed("已连接"),
+        Ok(Err(error)) if error.to_string().contains("/obs config password") => {
+            StartupCheck::Warning("需要密码 · /obs config password")
+        }
+        Ok(Err(_)) => StartupCheck::Warning("连接失败 · 进入后重试"),
+        Err(_) => StartupCheck::Warning("连接超时 · 进入后重试"),
+    }
+}
+
+async fn load_startup_data(
+    client: BilibiliClient,
+    account: AccountClient,
+    room_id: String,
+    updates: mpsc::UnboundedSender<StartupUpdate>,
+) -> StartupData {
+    let account_status = match account.status().await {
+        Ok(status @ AccountStatus::SignedIn { .. }) => {
+            let _ = updates.send(StartupUpdate::Account(StartupCheck::Passed("已登录")));
+            status
+        }
+        Ok(AccountStatus::SignedOut) => {
+            let _ = updates.send(StartupUpdate::Account(StartupCheck::Passed(
+                "未登录 · 监看模式",
+            )));
+            AccountStatus::SignedOut
+        }
+        Err(_) => {
+            let _ = updates.send(StartupUpdate::Account(StartupCheck::Warning(
+                "检查失败 · 可重试",
+            )));
+            AccountStatus::SignedOut
+        }
+    };
+
+    let _ = updates.send(StartupUpdate::Room(StartupCheck::Running));
+    let (room, initial_room_error) = match client.room_snapshot(&room_id).await {
+        Ok(room) => {
+            let _ = updates.send(StartupUpdate::Room(StartupCheck::Passed("房间可访问")));
+            (Some(room), None)
+        }
+        Err(error) => {
+            let _ = updates.send(StartupUpdate::Room(StartupCheck::Warning(
+                "读取失败 · 可重试",
+            )));
+            (None, Some(error.to_string()))
+        }
+    };
+
+    let (online_viewers, likes, initial_online_error, initial_likes_error) =
+        if matches!(account_status, AccountStatus::SignedIn { .. }) {
+            match room.as_ref() {
+                Some(room) => {
+                    let _ = updates.send(StartupUpdate::Metrics(StartupCheck::Running));
+                    let (online_result, likes_result) = tokio::join!(
+                        account.current_online_viewers(&room.room_id, &room.broadcaster_id,),
+                        account.current_likes(&room.room_id),
+                    );
+                    let (online_viewers, online_error) = match online_result {
+                        Ok(viewers) => (viewers, None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
+                    let (likes, likes_error) = match likes_result {
+                        Ok(likes) => (likes, None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
+                    let metrics_status = if online_error.is_none() && likes_error.is_none() {
+                        StartupCheck::Passed("已同步")
+                    } else {
+                        StartupCheck::Warning("部分指标失败 · 可重试")
+                    };
+                    let _ = updates.send(StartupUpdate::Metrics(metrics_status));
+                    (online_viewers, likes, online_error, likes_error)
+                }
+                None => {
+                    let _ = updates.send(StartupUpdate::Metrics(StartupCheck::Skipped(
+                        "等待房间数据",
+                    )));
+                    (None, None, None, None)
+                }
+            }
+        } else {
+            let _ = updates.send(StartupUpdate::Metrics(StartupCheck::Skipped(
+                "未登录 · 已跳过",
+            )));
+            (None, None, None, None)
+        };
+
+    StartupData {
+        room,
+        initial_room_error,
+        account_status,
+        online_viewers,
+        likes,
+        initial_online_error,
+        initial_likes_error,
+    }
+}
 
 #[derive(Debug)]
 enum UiEvent {
@@ -349,7 +617,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         completion: "/obs config password",
         usage: "/obs config password",
-        description: "安全更新 OBS 密码",
+        description: "更新本地 OBS 密码",
     },
     CommandSpec {
         completion: "/obs start",
@@ -463,48 +731,223 @@ pub struct TerminalApp {
 impl TerminalApp {
     pub async fn run(
         config: TerminalConfig,
-        client: BilibiliClient,
-        account: AccountClient,
+        account_session: PathBuf,
         obs: ObsController,
         journal: SessionJournal,
     ) -> Result<()> {
         let room_id = config.room_id.clone();
-        let mut session = journal
-            .recover_latest_interrupted()?
-            .filter(|session| session.room_id == room_id)
-            .unwrap_or_else(|| DanmuSession::new(&room_id));
-        if session.status != crate::domain::DanmuSessionStatus::Active {
-            session.resume();
-        }
-        journal.start(&session)?;
-        let (room, initial_room_error) = match client.room_snapshot(&room_id).await {
-            Ok(room) => (Some(room), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-        let account_status = account.status().await.unwrap_or(AccountStatus::SignedOut);
-        let (online_viewers, likes, initial_online_error, initial_likes_error) =
-            if matches!(account_status, AccountStatus::SignedIn { .. }) {
-                match room.as_ref() {
-                    Some(room) => {
-                        let (online_result, likes_result) = tokio::join!(
-                            account.current_online_viewers(&room.room_id, &room.broadcaster_id),
-                            account.current_likes(&room.room_id),
-                        );
-                        let (online_viewers, online_error) = match online_result {
-                            Ok(viewers) => (viewers, None),
-                            Err(error) => (None, Some(error.to_string())),
-                        };
-                        let (likes, likes_error) = match likes_result {
-                            Ok(likes) => (likes, None),
-                            Err(error) => (None, Some(error.to_string())),
-                        };
-                        (online_viewers, likes, online_error, likes_error)
-                    }
-                    None => (None, None, None, None),
+        let palette = config.palette;
+        let mut terminal = TerminalGuard::enter()?;
+        let mut events = EventStream::new();
+        let mut startup_tick = tokio::time::interval(Duration::from_millis(90));
+        startup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut startup_frame = 0_u64;
+        let startup_started_at = Instant::now();
+        let mut startup_view = StartupView::new();
+        terminal.terminal.draw(|frame| {
+            draw_startup(
+                frame,
+                palette,
+                startup_frame,
+                &startup_view,
+                &StartupGate::Checking,
+                startup_started_at.elapsed(),
+                false,
+            )
+        })?;
+
+        let (startup_update_tx, mut startup_update_rx) = mpsc::unbounded_channel();
+        let mut startup_clients = Box::pin(load_startup_clients(account_session));
+        let mut clients = None;
+        let mut startup_session = Box::pin(load_startup_session(
+            journal.clone(),
+            room_id.clone(),
+            startup_update_tx.clone(),
+        ));
+        let mut startup_data = None;
+        let mut startup_obs_check = Box::pin(check_startup_obs(obs.clone()));
+        let mut startup_result = None;
+        let mut startup_session_result = None;
+        let mut startup_obs_done = false;
+        let mut startup_gate = StartupGate::default();
+        let (
+            StartupData {
+                room,
+                initial_room_error,
+                account_status,
+                online_viewers,
+                likes,
+                initial_online_error,
+                initial_likes_error,
+            },
+            StartupSession {
+                session,
+                initial_error: initial_session_error,
+            },
+        ) = loop {
+            let checks_ready =
+                startup_result.is_some() && startup_session_result.is_some() && startup_obs_done;
+            if checks_ready && matches!(startup_gate, StartupGate::Checking) {
+                startup_gate = if startup_view.has_warning() {
+                    StartupGate::Blocked
+                } else {
+                    StartupGate::Ready
+                };
+            }
+            if startup_can_finish(
+                startup_started_at.elapsed(),
+                checks_ready && startup_gate.can_finish(),
+            ) {
+                break (
+                    startup_result.take().expect("startup result checked above"),
+                    startup_session_result
+                        .take()
+                        .expect("startup session checked above"),
+                );
+            }
+            tokio::select! {
+                result = &mut startup_clients, if clients.is_none() => {
+                    let (client, account) = result?;
+                    startup_data = Some(Box::pin(load_startup_data(
+                        client.clone(),
+                        account.clone(),
+                        room_id.clone(),
+                        startup_update_tx.clone(),
+                    )));
+                    clients = Some((client, account));
                 }
-            } else {
-                (None, None, None, None)
-            };
+                result = &mut startup_session, if startup_session_result.is_none() => {
+                    startup_session_result = Some(result);
+                }
+                result = async {
+                    startup_data
+                        .as_mut()
+                        .expect("startup data is guarded above")
+                        .await
+                }, if startup_data.is_some() && startup_result.is_none() => {
+                    startup_result = Some(result);
+                }
+                status = &mut startup_obs_check, if !startup_obs_done => {
+                    startup_obs_done = true;
+                    startup_view.obs = status;
+                }
+                Some(update) = startup_update_rx.recv() => {
+                    startup_view.apply(update);
+                }
+                _ = startup_tick.tick() => {
+                    startup_frame = startup_frame.wrapping_add(1);
+                    terminal.terminal.draw(|frame| {
+                        draw_startup(
+                            frame,
+                            palette,
+                            startup_frame,
+                            &startup_view,
+                            &startup_gate,
+                            startup_started_at.elapsed(),
+                            checks_ready,
+                        )
+                    })?;
+                }
+                event = events.next() => {
+                    let Some(Ok(event)) = event else {
+                        continue;
+                    };
+                    match event {
+                        Event::Key(key) => {
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                return Ok(());
+                            }
+
+                            let mut retry_all = false;
+                            let mut password_to_save = None;
+                            match &mut startup_gate {
+                                StartupGate::Blocked => match key.code {
+                                    KeyCode::Char('s' | 'S') => {
+                                        startup_gate = StartupGate::Skipped;
+                                    }
+                                    KeyCode::Enter if startup_view.obs_requires_password() => {
+                                        startup_gate = StartupGate::EnteringObsPassword(
+                                            EditorInput::default(),
+                                        );
+                                    }
+                                    KeyCode::Enter => retry_all = true,
+                                    _ => {}
+                                },
+                                StartupGate::EnteringObsPassword(input) => match key.code {
+                                    KeyCode::Esc => startup_gate = StartupGate::Blocked,
+                                    KeyCode::Enter if !input.is_empty() => {
+                                        password_to_save = Some(input.take());
+                                    }
+                                    KeyCode::Backspace => input.delete_before_cursor(),
+                                    KeyCode::Char('u')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        input.clear();
+                                    }
+                                    KeyCode::Char(character)
+                                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        input.insert_text(&character.to_string());
+                                    }
+                                    _ => {}
+                                },
+                                _ => {}
+                            }
+
+                            if retry_all {
+                                startup_view = StartupView::new();
+                                startup_result = None;
+                                startup_session_result = None;
+                                startup_obs_done = false;
+                                let (client, account) =
+                                    clients.as_ref().expect("startup clients initialized");
+                                startup_data = Some(Box::pin(load_startup_data(
+                                    client.clone(),
+                                    account.clone(),
+                                    room_id.clone(),
+                                    startup_update_tx.clone(),
+                                )));
+                                startup_session = Box::pin(load_startup_session(
+                                    journal.clone(),
+                                    room_id.clone(),
+                                    startup_update_tx.clone(),
+                                ));
+                                startup_obs_check =
+                                    Box::pin(check_startup_obs(obs.clone()));
+                                startup_gate = StartupGate::Checking;
+                            }
+                            if let Some(password) = password_to_save {
+                                match obs.set_password(&password).await {
+                                    Ok(()) => {
+                                        startup_view.obs = StartupCheck::Running;
+                                        startup_obs_done = false;
+                                        startup_obs_check =
+                                            Box::pin(check_startup_obs(obs.clone()));
+                                        startup_gate = StartupGate::Checking;
+                                    }
+                                    Err(_) => {
+                                        startup_view.obs = StartupCheck::Warning(
+                                            "密码保存失败 · 检查文件权限",
+                                        );
+                                        startup_gate = StartupGate::Blocked;
+                                    }
+                                }
+                            }
+                        }
+                        Event::Paste(text) => {
+                            if let StartupGate::EnteringObsPassword(input) = &mut startup_gate {
+                                input.insert_text(&text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        };
+        let (client, account) = clients.expect("startup clients checked above");
+        journal.start(&session)?;
         let room_updated_at = room.as_ref().map(|_| Local::now());
         let mut app = Self {
             layout_chat: config.chat_layout,
@@ -550,7 +993,9 @@ impl TerminalApp {
             last_live_danmu_at: None,
             animation_tick: 0,
         };
-        if let Some(error) = initial_room_error {
+        if let Some(error) = initial_session_error {
+            app.set_notice(format!("本地会话恢复失败：{error}"), NoticeLevel::Error);
+        } else if let Some(error) = initial_room_error {
             app.set_notice(format!("房间数据读取失败：{error}"), NoticeLevel::Error);
         } else if let Some(error) = initial_online_error {
             app.set_notice(format!("在线人数读取失败：{error}"), NoticeLevel::Error);
@@ -632,8 +1077,6 @@ impl TerminalApp {
                 }
             }
         });
-        let mut events = EventStream::new();
-        let mut terminal = TerminalGuard::enter()?;
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut should_quit = false;
 
@@ -871,6 +1314,11 @@ impl TerminalApp {
         if reconcile_cross_origin_event(&mut self.session.recent_events, &event) {
             return;
         }
+        let is_new_logical_event = !self
+            .session
+            .recent_events
+            .iter()
+            .any(|existing| existing.id == event.id);
         let selected_anchor = self
             .selection_active
             .then(|| self.session.recent_events.get(self.selected))
@@ -900,7 +1348,10 @@ impl TerminalApp {
                         .position(|event| event.id == id)
                 })
                 .unwrap_or(0);
-            if live_arrival && (self.selection_active || self.scroll_offset > 0) {
+            if is_new_logical_event
+                && live_arrival
+                && (self.selection_active || self.scroll_offset > 0)
+            {
                 self.unread_live_count = self.unread_live_count.saturating_add(1);
             } else if !self.selection_active && self.scroll_offset == 0 {
                 self.unread_live_count = 0;
@@ -1201,8 +1652,8 @@ impl TerminalApp {
     async fn submit(&mut self, input: String, tx: mpsc::Sender<UiEvent>) -> Result<()> {
         if self.secret_mode {
             self.secret_mode = false;
-            ObsController::set_password(&input)?;
-            self.set_notice("OBS WebSocket 密码已安全更新", NoticeLevel::Success);
+            self.obs.set_password(&input).await?;
+            self.set_notice("OBS 密码已保存到 TUI 私有文件", NoticeLevel::Success);
             return Ok(());
         }
         if input.starts_with('/') {
@@ -1465,6 +1916,14 @@ impl TerminalApp {
                     let _ = tx.send(operation_notice(result)).await;
                 });
             }
+            ["/obs", "config", "password"] => {
+                self.secret_mode = true;
+                self.input.clear();
+                self.set_notice(
+                    "请输入 OBS WebSocket 密码并按 Enter；输入不会显示或进入历史",
+                    NoticeLevel::Progress,
+                );
+            }
             ["/obs", "start"] => {
                 self.set_notice("正在启动 OBS 推流…", NoticeLevel::Progress);
                 let obs = self.obs.clone();
@@ -1501,14 +1960,6 @@ impl TerminalApp {
             ["/obs", "cancel"] => {
                 self.awaiting_stop_confirmation = false;
                 self.set_notice("已取消停止推流", NoticeLevel::Success);
-            }
-            ["/obs", "config", "password"] => {
-                self.secret_mode = true;
-                self.input.clear();
-                self.set_notice(
-                    "请输入 OBS WebSocket 密码并按 Enter；输入不会显示或进入历史",
-                    NoticeLevel::Progress,
-                );
             }
             _ => self.set_notice(
                 format!("未知命令：{raw}；输入 /help 查看命令"),
@@ -1738,6 +2189,196 @@ fn display_events(events: &[DanmuEvent]) -> impl Iterator<Item = &DanmuEvent> {
         DanmuEventKind::Like => event.timestamp > like_cutoff,
         _ => true,
     })
+}
+
+fn startup_check_line(
+    label: &'static str,
+    status: StartupCheck,
+    palette: Palette,
+) -> Line<'static> {
+    let (marker, detail, color) = match status {
+        StartupCheck::Waiting => ("·", "等待", palette.frame),
+        StartupCheck::Running => ("›", "检查中", palette.info),
+        StartupCheck::Passed(detail) => ("✓", detail, palette.success),
+        StartupCheck::Skipped(detail) => ("–", detail, palette.time),
+        StartupCheck::Warning(detail) => ("!", detail, palette.warning),
+    };
+    Line::from(vec![
+        Span::styled(format!("{marker} "), Style::default().fg(color)),
+        Span::styled(format!("{label}  "), Style::default().fg(palette.content)),
+        Span::styled(detail, Style::default().fg(color)),
+    ])
+}
+
+fn startup_progress_line(
+    elapsed: Duration,
+    data_ready: bool,
+    width: usize,
+    palette: Palette,
+) -> Line<'static> {
+    let budget = STARTUP_MIN_DURATION.as_millis().max(1);
+    let mut filled = ((elapsed.as_millis() * width as u128) / budget).min(width as u128) as usize;
+    if !data_ready {
+        filled = filled.min(width.saturating_sub(1));
+    }
+    Line::from(vec![
+        Span::styled("━".repeat(filled), Style::default().fg(palette.info)),
+        Span::styled(
+            "─".repeat(width.saturating_sub(filled)),
+            Style::default().fg(palette.frame),
+        ),
+    ])
+}
+
+fn draw_startup(
+    frame: &mut ratatui::Frame,
+    palette: Palette,
+    tick: u64,
+    startup: &StartupView,
+    gate: &StartupGate,
+    elapsed: Duration,
+    data_ready: bool,
+) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.background)),
+        area,
+    );
+
+    let cursor = if (tick / 3).is_multiple_of(2) {
+        "▮"
+    } else {
+        " "
+    };
+    let masked_password = match gate {
+        StartupGate::EnteringObsPassword(input) => {
+            let visible = input.graphemes(true).count().min(16);
+            format!("OBS 密码 {}{cursor}", "●".repeat(visible))
+        }
+        _ => String::new(),
+    };
+    let (active_label, active_color) = match gate {
+        StartupGate::Blocked if startup.obs_requires_password() => {
+            ("启动已阻断 · OBS 需要配置".to_owned(), palette.warning)
+        }
+        StartupGate::Blocked => ("启动已阻断 · 检查未通过".to_owned(), palette.warning),
+        StartupGate::EnteringObsPassword(_) => (masked_password, palette.info),
+        StartupGate::Skipped => ("已跳过未通过检查".to_owned(), palette.warning),
+        _ => (startup.active_label().to_owned(), palette.time),
+    };
+    let (footer, footer_color) = match gate {
+        StartupGate::Blocked if startup.obs_requires_password() => {
+            ("Enter 配置 OBS · S 跳过 · Ctrl+C 退出", palette.warning)
+        }
+        StartupGate::Blocked => ("Enter 重试 · S 跳过 · Ctrl+C 退出", palette.warning),
+        StartupGate::EnteringObsPassword(_) => {
+            ("Enter 保存 · Esc 返回 · Ctrl+C 退出", palette.info)
+        }
+        _ => ("Ctrl+C 取消", palette.frame),
+    };
+    if area.width < 42 || area.height < 16 {
+        let height = area.height.min(3);
+        let top = area.height.saturating_sub(height) / 2;
+        let compact_area = Rect::new(area.x, area.y + top, area.width, height);
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    "DANMU",
+                    Style::default()
+                        .fg(palette.content)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" · Elazer · ", Style::default().fg(palette.rank)),
+                Span::styled("elazer.wang", Style::default().fg(palette.info)),
+            ])
+            .alignment(Alignment::Center),
+            startup_progress_line(elapsed, data_ready, 12, palette).alignment(Alignment::Center),
+            Line::from(Span::styled(
+                active_label.clone(),
+                Style::default().fg(active_color),
+            ))
+            .alignment(Alignment::Center),
+        ];
+        frame.render_widget(Paragraph::new(Text::from(lines)), compact_area);
+        return;
+    }
+
+    let border = Style::default().fg(palette.info);
+    let logo_lines = vec![
+        Line::from(Span::styled("╭────────────────╮", border)),
+        Line::from(vec![
+            Span::styled("│ ", border),
+            Span::styled("●", Style::default().fg(palette.warning)),
+            Span::raw("  "),
+            Span::styled("●", Style::default().fg(palette.rank)),
+            Span::raw("  "),
+            Span::styled("●", Style::default().fg(palette.success)),
+            Span::styled("        │", border),
+        ]),
+        Line::from(vec![
+            Span::styled("│  ", border),
+            Span::styled(
+                "DANMU",
+                Style::default()
+                    .fg(palette.content)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ▸ ", border),
+            Span::styled(cursor, Style::default().fg(palette.host)),
+            Span::styled("     │", border),
+        ]),
+        Line::from(Span::styled("╰──────────╮     │", border)),
+        Line::from(Span::styled("           ╰─────╯", border)),
+    ];
+    let total_height = 16_u16;
+    let top = area.height.saturating_sub(total_height) / 2;
+    let logo_area = Rect::new(area.x, area.y + top, area.width, 5);
+    let identity_area = Rect::new(area.x, logo_area.y + 5, area.width, 1);
+    let status_width = area.width.min(46);
+    let status_area = Rect::new(
+        area.x + area.width.saturating_sub(status_width) / 2,
+        logo_area.y + 7,
+        status_width,
+        9,
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(logo_lines)).alignment(Alignment::Center),
+        logo_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("by Elazer", Style::default().fg(palette.rank)),
+            Span::styled("  ·  ", Style::default().fg(palette.frame)),
+            Span::styled("elazer.wang", Style::default().fg(palette.info)),
+        ]))
+        .alignment(Alignment::Center),
+        identity_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from(Span::styled(
+                "启动自检",
+                Style::default()
+                    .fg(palette.content)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Center),
+            startup_progress_line(elapsed, data_ready, 24, palette).alignment(Alignment::Center),
+            Line::from(vec![
+                Span::styled("› ", Style::default().fg(palette.info)),
+                Span::styled(active_label, Style::default().fg(active_color)),
+            ]),
+            startup_check_line("本地数据", startup.local, palette),
+            startup_check_line("登录状态", startup.account, palette),
+            startup_check_line("B 站房间", startup.room, palette),
+            startup_check_line("直播指标", startup.metrics, palette),
+            startup_check_line("OBS 连接", startup.obs, palette),
+            Line::from(Span::styled(footer, Style::default().fg(footer_color)))
+                .alignment(Alignment::Center),
+        ])),
+        status_area,
+    );
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
@@ -2360,7 +3001,7 @@ fn visible_event_content(event: &DanmuEvent) -> String {
 
 fn visible_input(app: &TerminalApp) -> String {
     if app.secret_mode {
-        "•".repeat(grapheme_count(&app.input))
+        "•".repeat(app.input.to_string().graphemes(true).count())
     } else {
         app.input.to_string()
     }
@@ -2593,7 +3234,7 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette
     let (left, right) = if app.secret_mode {
         (
             powerline_title(vec![(
-                "OBS WebSocket 新密码 · Esc 取消".into(),
+                "OBS WebSocket 密码 · Esc 取消".into(),
                 palette.warning,
             )]),
             Line::default(),
@@ -2738,9 +3379,6 @@ fn event_color(kind: DanmuEventKind, palette: Palette) -> Color {
         DanmuEventKind::System => palette.time,
     }
 }
-fn grapheme_count(value: &str) -> usize {
-    value.graphemes(true).count()
-}
 fn sanitize_input(value: String) -> String {
     value
         .chars()
@@ -2807,12 +3445,13 @@ pub async fn configure_obs(path: &std::path::Path) -> Result<()> {
     if !input.trim().is_empty() {
         configuration.microphone_input_name = input.trim().into();
     }
-    let password = rpassword::prompt_password("OBS WebSocket 密码（留空保持不变）：")?;
+    let password = rpassword::prompt_password("OBS WebSocket 密码（留空保持当前值）：")?;
     if !password.is_empty() {
-        ObsController::set_password(&password)?;
+        crate::obs::save_obs_password(path, &password)?;
     }
     configuration.save(path)?;
     println!("OBS 配置已保存：{}", path.display());
+    println!("OBS 密码保存在 TUI 私有文件中，不使用系统钥匙串。");
     Ok(())
 }
 
@@ -2880,6 +3519,196 @@ mod tests {
         }
     }
 
+    #[test]
+    fn startup_animation_respects_two_second_minimum() {
+        assert!(!startup_can_finish(
+            STARTUP_MIN_DURATION - Duration::from_millis(1),
+            true,
+        ));
+        assert!(startup_can_finish(STARTUP_MIN_DURATION, true));
+        assert!(!startup_can_finish(STARTUP_MIN_DURATION, false));
+    }
+
+    #[test]
+    fn startup_animation_shows_checklist_and_completed_state() {
+        let palette = Palette::default();
+        let mut startup = StartupView::new();
+        let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_startup(
+                    frame,
+                    palette,
+                    0,
+                    &startup,
+                    &StartupGate::Checking,
+                    Duration::ZERO,
+                    false,
+                )
+            })
+            .unwrap();
+        let first_frame = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let first_compact = first_frame.replace(' ', "");
+
+        assert!(first_frame.contains("DANMU"));
+        assert!(first_frame.contains("╭────────────────╮"));
+        assert!(first_frame.contains("Elazer"), "{first_frame}");
+        assert!(first_frame.contains("elazer.wang"), "{first_frame}");
+        assert!(first_compact.contains("启动自检"), "{first_frame}");
+        assert!(first_compact.contains("登录状态"), "{first_frame}");
+        assert!(first_compact.contains("OBS连接"), "{first_frame}");
+        assert!(first_compact.contains("检查中"), "{first_frame}");
+
+        startup.apply(StartupUpdate::Account(StartupCheck::Passed(
+            "未登录 · 监看模式",
+        )));
+        startup.apply(StartupUpdate::Local(StartupCheck::Passed("已读取")));
+        startup.apply(StartupUpdate::Room(StartupCheck::Passed("房间可访问")));
+        startup.apply(StartupUpdate::Metrics(StartupCheck::Skipped(
+            "未登录 · 已跳过",
+        )));
+        startup.obs = StartupCheck::Passed("已连接");
+        terminal
+            .draw(|frame| {
+                draw_startup(
+                    frame,
+                    palette,
+                    9,
+                    &startup,
+                    &StartupGate::Ready,
+                    STARTUP_MIN_DURATION,
+                    true,
+                )
+            })
+            .unwrap();
+        let final_frame = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let final_compact = final_frame.replace(' ', "");
+
+        assert!(final_compact.contains("启动自检完成"), "{final_frame}");
+        assert!(final_compact.contains("未登录·监看模式"), "{final_frame}");
+        assert!(final_compact.contains("房间可访问"), "{final_frame}");
+        assert!(final_compact.contains("OBS连接已连接"), "{final_frame}");
+        assert_ne!(first_frame, final_frame);
+    }
+
+    #[test]
+    fn startup_warning_blocks_and_masks_obs_password() {
+        let palette = Palette::default();
+        let mut startup = StartupView::new();
+        startup.account = StartupCheck::Passed("未登录 · 监看模式");
+        startup.room = StartupCheck::Passed("房间可访问");
+        startup.metrics = StartupCheck::Skipped("未登录 · 已跳过");
+        startup.obs = StartupCheck::Warning("需要密码 · /obs config password");
+        startup.local = StartupCheck::Passed("已读取");
+        let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_startup(
+                    frame,
+                    palette,
+                    0,
+                    &startup,
+                    &StartupGate::Blocked,
+                    STARTUP_MIN_DURATION,
+                    true,
+                )
+            })
+            .unwrap();
+        let blocked = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let blocked_compact = blocked.replace(' ', "");
+
+        assert!(startup.has_warning());
+        assert!(!StartupGate::Blocked.can_finish());
+        assert!(
+            blocked_compact.contains("启动已阻断·OBS需要配置"),
+            "{blocked}"
+        );
+        assert!(blocked_compact.contains("Enter配置OBS·S跳过"), "{blocked}");
+
+        let password_gate = StartupGate::EnteringObsPassword(EditorInput::from("secret"));
+        terminal
+            .draw(|frame| {
+                draw_startup(
+                    frame,
+                    palette,
+                    0,
+                    &startup,
+                    &password_gate,
+                    STARTUP_MIN_DURATION,
+                    true,
+                )
+            })
+            .unwrap();
+        let password_frame = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(password_frame.contains("●●●●●●"), "{password_frame}");
+        assert!(!password_frame.contains("secret"), "{password_frame}");
+        assert!(StartupGate::Skipped.can_finish());
+    }
+
+    #[test]
+    fn startup_animation_degrades_to_the_active_compact_check() {
+        let startup = StartupView::new();
+        let mut terminal = Terminal::new(TestBackend::new(30, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_startup(
+                    frame,
+                    Palette::default(),
+                    2,
+                    &startup,
+                    &StartupGate::Checking,
+                    Duration::from_secs(1),
+                    false,
+                )
+            })
+            .unwrap();
+        let rendered = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("DANMU"));
+        assert!(rendered.contains("Elazer"), "{rendered}");
+        assert!(rendered.contains("elazer.wang"), "{rendered}");
+        assert!(
+            rendered.replace(' ', "").contains("恢复本地会话"),
+            "{rendered}"
+        );
+    }
     #[test]
     fn input_header_renders_live_meter_and_hides_it_when_obs_disconnects() {
         let temp = tempfile::tempdir().unwrap();

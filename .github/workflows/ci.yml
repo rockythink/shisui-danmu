@@ -1,4 +1,4 @@
-name: Rust CI
+name: CI
 
 on:
   push:
@@ -31,3 +31,20 @@ jobs:
         run: cargo test --locked --all-targets --all-features
       - name: Build release
         run: cargo build --locked --release
+
+  website:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Install website dependencies
+        run: npm ci
+      - name: Check and build website
+        run: npm run build

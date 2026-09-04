@@ -151,11 +151,35 @@ impl DanmuSession {
     }
 
     pub fn ingest(&mut self, event: DanmuEvent) -> bool {
-        if self.status != DanmuSessionStatus::Active
-            || !self.seen_event_ids.insert(event.id.clone())
-        {
+        if self.status != DanmuSessionStatus::Active {
             return false;
         }
+        if self.seen_event_ids.contains(&event.id) {
+            let Some(position) = self
+                .recent_events
+                .iter()
+                .position(|existing| existing.id == event.id)
+            else {
+                return false;
+            };
+            if event.kind != DanmuEventKind::Gift
+                || self.recent_events[position].kind != DanmuEventKind::Gift
+            {
+                return false;
+            }
+            let mut event = event;
+            event.timestamp = self.recent_events[position].timestamp;
+            self.recent_events[position] = event.clone();
+            if self
+                .featured_event
+                .as_ref()
+                .is_some_and(|featured| featured.id == event.id)
+            {
+                self.featured_event = Some(event);
+            }
+            return true;
+        }
+        self.seen_event_ids.insert(event.id.clone());
         let position = self
             .recent_events
             .partition_point(|existing| existing.timestamp >= event.timestamp);

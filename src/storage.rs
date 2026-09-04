@@ -5,7 +5,6 @@ use directories::ProjectDirs;
 use std::path::PathBuf;
 
 pub const NAMESPACE: &str = "cc.ss-data.ShisuiDanmuTerminal";
-pub const OBS_KEYRING_SERVICE: &str = "cc.ss-data.ShisuiDanmuTerminal.obs-websocket";
 
 #[derive(Debug, Clone)]
 pub struct StoragePaths {

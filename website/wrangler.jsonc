@@ -1,0 +1,7 @@
+{
+  "name": "danmu-website",
+  "account_id": "d8c100809bbb7677043b1391a51b7220",
+  "compatibility_date": "2026-09-04",
+  "assets": { "directory": "./dist" },
+  "routes": [{ "pattern": "danmu.elazer.wang", "custom_domain": true }]
+}

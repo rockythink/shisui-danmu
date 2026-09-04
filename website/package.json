@@ -1,0 +1,24 @@
+{
+  "name": "danmu-website",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "check": "astro check",
+    "build": "astro check && astro build",
+    "preview": "astro preview"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.10",
+    "astro": "7.3.1",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@fontsource/fusion-pixel-12px-proportional-sc": "^5.3.0",
+    "@fontsource/silkscreen": "^5.3.0"
+  }
+}
