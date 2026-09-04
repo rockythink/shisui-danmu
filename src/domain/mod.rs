@@ -45,6 +45,58 @@ pub struct DanmuEmote {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BlindGift {
+    pub name: String,
+    pub reveal_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiftDetails {
+    pub name: String,
+    pub action: String,
+    pub blind_gift: Option<BlindGift>,
+    pub receipts: HashMap<String, u64>,
+    pub reported_quantity: u64,
+}
+
+impl GiftDetails {
+    fn merge(&mut self, update: Self) -> bool {
+        let mut changed = false;
+        for (id, quantity) in update.receipts {
+            let current = self.receipts.entry(id).or_default();
+            if quantity > *current {
+                *current = quantity;
+                changed = true;
+            }
+        }
+        if update.reported_quantity > self.reported_quantity {
+            self.reported_quantity = update.reported_quantity;
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn content(&self) -> String {
+        // Individual receipts and batch totals describe the same gifts, not two additions.
+        let quantity = self
+            .receipts
+            .values()
+            .fold(0_u64, |sum, count| sum.saturating_add(*count))
+            .max(self.reported_quantity);
+        if let Some(blind) = &self.blind_gift {
+            format!(
+                "开启 {} ×{}，{} {} ×{}",
+                blind.name, quantity, blind.reveal_action, self.name, quantity
+            )
+        } else {
+            format!("{} {} ×{}", self.action, self.name, quantity)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DanmuEvent {
     pub id: String,
     pub kind: DanmuEventKind,
@@ -57,6 +109,8 @@ pub struct DanmuEvent {
     pub platform_event_id: Option<String>,
     #[serde(default)]
     pub emotes: Vec<DanmuEmote>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gift: Option<Box<GiftDetails>>,
 }
 
 impl DanmuEvent {
@@ -71,6 +125,7 @@ impl DanmuEvent {
             origin: DanmuEventOrigin::Live,
             platform_event_id: None,
             emotes: Vec::new(),
+            gift: None,
         }
     }
 }
@@ -167,15 +222,26 @@ impl DanmuSession {
             {
                 return false;
             }
-            let mut event = event;
-            event.timestamp = self.recent_events[position].timestamp;
-            self.recent_events[position] = event.clone();
+            let existing = &mut self.recent_events[position];
+            match (&mut existing.gift, event.gift) {
+                (Some(current), Some(update)) => {
+                    if !current.merge(*update) {
+                        return false;
+                    }
+                    existing.content = current.content();
+                }
+                (None, Some(update)) => {
+                    existing.content = update.content();
+                    existing.gift = Some(update);
+                }
+                _ => return false,
+            }
             if self
                 .featured_event
                 .as_ref()
                 .is_some_and(|featured| featured.id == event.id)
             {
-                self.featured_event = Some(event);
+                self.featured_event = Some(existing.clone());
             }
             return true;
         }
@@ -417,6 +483,7 @@ mod tests {
             origin: DanmuEventOrigin::Live,
             platform_event_id: None,
             emotes: Vec::new(),
+            gift: None,
         }
     }
 

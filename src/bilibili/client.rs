@@ -296,6 +296,7 @@ impl BilibiliClient {
                     origin: DanmuEventOrigin::History,
                     platform_event_id: platform_id,
                     emotes: Vec::new(),
+                    gift: None,
                 })
             })
             .collect();

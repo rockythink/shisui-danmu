@@ -1,4 +1,4 @@
-use crate::domain::{DanmuEmote, DanmuEvent, DanmuEventKind};
+use crate::domain::{BlindGift, DanmuEmote, DanmuEvent, DanmuEventKind, GiftDetails};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
@@ -174,6 +174,7 @@ fn parse_danmu(value: &Value) -> Option<DanmuEvent> {
         origin: Default::default(),
         platform_event_id: platform_id,
         emotes,
+        gift: None,
     })
 }
 
@@ -371,6 +372,7 @@ fn event(
         origin: Default::default(),
         platform_event_id,
         emotes: Vec::new(),
+        gift: None,
     })
 }
 
@@ -416,69 +418,89 @@ fn value_i64(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str()?.trim().parse().ok())
 }
 
-#[derive(Clone, Debug)]
-struct BlindGift {
-    name: String,
-    reveal_action: String,
-}
-
 #[derive(Debug)]
 struct GiftPayload {
     username: Option<String>,
     author_id: Option<String>,
     gift_name: String,
     quantity: u64,
+    cumulative: bool,
     action: String,
     blind_gift: Option<BlindGift>,
+    batch_id: Option<String>,
     platform_event_id: Option<String>,
     timestamp: DateTime<Utc>,
 }
 
 impl GiftPayload {
     fn into_event(self) -> DanmuEvent {
-        let content = if let Some(blind_gift) = &self.blind_gift {
-            format!(
-                "开启 {} ×{}，{} {} ×{}",
-                blind_gift.name,
-                self.quantity,
-                blind_gift.reveal_action,
-                self.gift_name,
-                self.quantity
-            )
-        } else {
-            format!("{} {} ×{}", self.action, self.gift_name, self.quantity)
+        let receipt_id = (!self.cumulative).then(|| {
+            self.platform_event_id
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string())
+        });
+        let id = self.batch_id.as_ref().map_or_else(
+            || {
+                receipt_id
+                    .clone()
+                    .or_else(|| self.platform_event_id.clone())
+                    .unwrap_or_else(|| Uuid::new_v4().to_string())
+            },
+            |batch| {
+                // A blind-box batch may reveal different gifts; never collapse those outcomes.
+                serde_json::to_string(&(
+                    batch,
+                    &self.author_id,
+                    &self.gift_name,
+                    self.blind_gift.as_ref().map(|blind| &blind.name),
+                ))
+                .expect("gift identity is serializable")
+            },
+        );
+        let gift = GiftDetails {
+            name: self.gift_name,
+            action: self.action,
+            blind_gift: self.blind_gift,
+            receipts: receipt_id
+                .into_iter()
+                .map(|id| (id, self.quantity))
+                .collect(),
+            reported_quantity: if self.cumulative { self.quantity } else { 0 },
         };
-        let id = self
-            .platform_event_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
         DanmuEvent {
             id,
             kind: DanmuEventKind::Gift,
             timestamp: self.timestamp,
             username: self.username,
             author_id: self.author_id,
-            content,
+            content: gift.content(),
             origin: Default::default(),
             platform_event_id: self.platform_event_id,
             emotes: Vec::new(),
+            gift: Some(Box::new(gift)),
         }
     }
 }
 
 fn combo_event_id(data: &Value) -> Option<String> {
-    data.get("batch_combo_id")
-        .or_else(|| data.pointer("/batch_combo_send/batch_combo_id"))
-        .or_else(|| data.get("combo_id"))
-        .or_else(|| data.pointer("/combo_send/combo_id"))
-        .and_then(value_string)
+    [
+        "/batch_combo_id",
+        "/batch_combo_send/batch_combo_id",
+        "/combo_id",
+        "/combo_send/combo_id",
+    ]
+    .iter()
+    .find_map(|path| data.pointer(path).and_then(value_string))
 }
 
 fn parse_gift(data: &Value) -> Option<DanmuEvent> {
     let blind_data = data
         .get("blind_gift")
         .filter(|value| value.is_object())
-        .or_else(|| data.pointer("/batch_combo_send/blind_gift"));
+        .or_else(|| {
+            data.pointer("/batch_combo_send/blind_gift")
+                .filter(|value| value.is_object())
+        });
     let blind_gift = match blind_data {
         Some(value) => Some(BlindGift {
             name: text(value, &["original_gift_name"])?,
@@ -491,35 +513,30 @@ fn parse_gift(data: &Value) -> Option<DanmuEvent> {
         .and_then(value_i64)
         .and_then(|value| u64::try_from(value).ok())
         .filter(|value| *value > 0)?;
-    let combo_count = data
-        .pointer("/batch_combo_send/batch_combo_num")
-        .or_else(|| data.pointer("/combo_send/combo_num"))
-        .and_then(value_i64)
-        .and_then(|value| u64::try_from(value).ok());
-    let quantity = combo_count
-        .filter(|count| *count >= quantity)
-        .unwrap_or(quantity);
-    let timestamp = data
-        .get("timestamp")
-        .and_then(value_i64)
-        .and_then(unix_timestamp)
-        .unwrap_or_else(Utc::now);
-    let platform_event_id = combo_event_id(data).or_else(|| {
-        ["tid", "rnd", "id_str", "id", "message_id"]
-            .iter()
-            .find_map(|key| data.get(*key).and_then(value_string))
-    });
-
+    let combo_count = ["/batch_combo_send/batch_combo_num", "/combo_send/combo_num"]
+        .iter()
+        .find_map(|path| {
+            data.pointer(path)
+                .and_then(value_i64)
+                .and_then(|value| u64::try_from(value).ok())
+                .filter(|count| *count >= quantity)
+        });
     Some(
         GiftPayload {
             username: username(data),
             author_id: author_id(data),
             gift_name: text(data, &["giftName", "gift_name"])?,
-            quantity,
+            quantity: combo_count.unwrap_or(quantity),
+            cumulative: combo_count.is_some(),
             action: text(data, &["action"])?,
             blind_gift,
-            platform_event_id,
-            timestamp,
+            batch_id: combo_event_id(data),
+            platform_event_id: text(data, &["tid", "rnd", "id_str", "id", "message_id"]),
+            timestamp: data
+                .get("timestamp")
+                .and_then(value_i64)
+                .and_then(unix_timestamp)
+                .unwrap_or_else(Utc::now),
         }
         .into_event(),
     )
@@ -528,25 +545,28 @@ fn parse_gift(data: &Value) -> Option<DanmuEvent> {
 fn parse_combo_gift(data: &Value) -> Option<DanmuEvent> {
     let quantity = ["total_num", "batch_combo_num", "combo_num"]
         .iter()
-        .find_map(|key| data.get(*key).and_then(value_i64))
-        .and_then(|value| u64::try_from(value).ok())
-        .filter(|value| *value > 0)?;
-    let timestamp = data
-        .get("timestamp")
-        .and_then(value_i64)
-        .and_then(unix_timestamp)
-        .unwrap_or_else(Utc::now);
-
+        .find_map(|key| {
+            data.get(*key)
+                .and_then(value_i64)
+                .and_then(|value| u64::try_from(value).ok())
+                .filter(|value| *value > 0)
+        })?;
     Some(
         GiftPayload {
             username: username(data),
             author_id: author_id(data),
             gift_name: text(data, &["giftName", "gift_name"])?,
             quantity,
+            cumulative: true,
             action: text(data, &["action"])?,
             blind_gift: None,
-            platform_event_id: Some(combo_event_id(data)?),
-            timestamp,
+            batch_id: Some(combo_event_id(data)?),
+            platform_event_id: None,
+            timestamp: data
+                .get("timestamp")
+                .and_then(value_i64)
+                .and_then(unix_timestamp)
+                .unwrap_or_else(Utc::now),
         }
         .into_event(),
     )
@@ -623,7 +643,7 @@ fn decode_gift_item(
     let mut quantity = None;
     let mut action = None;
     let mut platform_event_id = None;
-    let mut fallback_event_id = None;
+    let mut batch_id = None;
     let mut timestamp = None;
     while cursor < bytes.len() {
         let tag = read_protobuf_varint(bytes, &mut cursor)?;
@@ -634,7 +654,8 @@ fn decode_gift_item(
             (3, 0) => quantity = Some(read_protobuf_varint(bytes, &mut cursor)?),
             (9, 2) => platform_event_id = Some(protobuf_string(bytes, &mut cursor)?),
             (10, 0) => timestamp = Some(read_protobuf_varint(bytes, &mut cursor)?),
-            (12, 2) => fallback_event_id = Some(protobuf_string(bytes, &mut cursor)?),
+            // GiftItem field 12 is batch_combo_id, not a fallback transaction ID.
+            (12, 2) => batch_id = Some(protobuf_string(bytes, &mut cursor)?),
             (18, 2) => action = Some(protobuf_string(bytes, &mut cursor)?),
             _ => skip_protobuf_field(bytes, &mut cursor, wire_type)?,
         }
@@ -645,9 +666,11 @@ fn decode_gift_item(
         author_id,
         gift_name: gift_name?,
         quantity: quantity.filter(|value| *value > 0)?,
+        cumulative: false,
         action: action?,
         blind_gift,
-        platform_event_id: platform_event_id.or(fallback_event_id),
+        batch_id: batch_id.filter(|id| !id.trim().is_empty()),
+        platform_event_id: platform_event_id.filter(|id| !id.trim().is_empty()),
         timestamp: timestamp
             .and_then(|value| i64::try_from(value).ok())
             .and_then(unix_timestamp)
@@ -868,6 +891,60 @@ mod tests {
     }
 
     #[test]
+    fn v2_receipts_and_combo_totals_update_one_gift_in_place() {
+        let mut session = DanmuSession::new("1");
+        let receipts = [
+            "CCoSBuinguS8l1I0CMSJAhIJ5Lq65rCU56WoGAFKCXJlY2VpcHQtMVCA4s+qBmIHYmF0Y2gtMZIBBuaKleWWgg==",
+            "CCoSBuinguS8l1I0CMSJAhIJ5Lq65rCU56WoGAFKCXJlY2VpcHQtMlCA4s+qBmIHYmF0Y2gtMZIBBuaKleWWgg==",
+        ].map(|pb| parse_gift_v2(&json!({"pb": pb})).unwrap().remove(0));
+        for (index, receipt) in receipts.iter().enumerate() {
+            assert!(session.ingest(receipt.clone()));
+            assert_eq!(session.recent_events.len(), 1);
+            assert_eq!(
+                session.recent_events[0].content,
+                format!("投喂 人气票 ×{}", index + 1)
+            );
+        }
+        for receipt in &receipts {
+            session.ingest(receipt.clone());
+        }
+        assert_eq!(session.recent_events[0].content, "投喂 人气票 ×2");
+        let id = session.recent_events[0].id.clone();
+        session.feature(Some(&id));
+        let total = |quantity| {
+            parse_command(&json!({
+                "cmd": "COMBO_SEND", "data": {
+                    "uid": 42, "uname": "观众", "action": "投喂",
+                    "gift_name": "人气票", "batch_combo_id": "batch-1", "total_num": quantity
+                }
+            }))
+            .unwrap()
+        };
+        let mut report_first = DanmuSession::new("1");
+        report_first.ingest(total(6));
+        for receipt in &receipts {
+            report_first.ingest(receipt.clone());
+        }
+        assert_eq!(report_first.recent_events.len(), 1);
+        assert_eq!(report_first.recent_events[0].content, "投喂 人气票 ×6");
+        session.ingest(total(6));
+        session.ingest(total(2));
+        let snapshot = serde_json::to_string(&session).unwrap();
+        let mut session: DanmuSession = serde_json::from_str(&snapshot).unwrap();
+        session.restore_runtime_state();
+        for receipt in receipts {
+            session.ingest(receipt);
+        }
+        assert_eq!(session.recent_events.len(), 1);
+        assert_eq!(session.recent_events[0].content, "投喂 人气票 ×6");
+        assert_eq!(
+            session.featured_event.as_ref().unwrap().content,
+            "投喂 人气票 ×6"
+        );
+        assert_eq!(session.metrics.count(DanmuEventKind::Gift), 1);
+    }
+
+    #[test]
     fn uses_the_latest_combo_total_as_the_display_quantity() {
         let event = parse_command(&json!({
             "cmd": "SEND_GIFT",
@@ -882,7 +959,6 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(event.id, "combo-1");
         assert_eq!(event.content, "投喂 干杯 ×2");
     }
 

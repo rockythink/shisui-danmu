@@ -2560,7 +2560,6 @@ fn room_live_label(room: &RoomSnapshot) -> &'static str {
 }
 
 const STATUS_RED: Color = Color::Rgb(225, 29, 72);
-const STATUS_RED_DIM: Color = Color::Rgb(159, 18, 57);
 const STATUS_ORANGE: Color = Color::Rgb(194, 65, 12);
 const STATUS_GREEN: Color = Color::Rgb(21, 128, 61);
 const STATUS_BLUE: Color = Color::Rgb(29, 78, 216);
@@ -2615,16 +2614,14 @@ fn primary_status_line(
     palette: Palette,
     width: u16,
 ) -> Line<'static> {
-    let live_color = if room.is_live() {
-        if (app.animation_tick / 2).is_multiple_of(2) {
-            STATUS_RED
-        } else {
-            STATUS_RED_DIM
-        }
+    let indicator_on = (app.animation_tick / 2).is_multiple_of(2);
+    // Keep the same six columns when both the red dot and LIVE text turn off.
+    let live_label = if room.is_live() && !indicator_on {
+        "      "
     } else {
-        STATUS_BLUE
+        room_live_label(room)
     };
-    let live = format!(" {} ", room_live_label(room));
+    let live = format!(" {live_label} ");
     let elapsed = format!(" ◷ {} ", live_elapsed(room, Utc::now()));
     let live_width = UnicodeWidthStr::width(live.as_str());
     let elapsed_width = UnicodeWidthStr::width(elapsed.as_str());
@@ -2636,7 +2633,17 @@ fn primary_status_line(
     let right_gap =
         usize::from(width).saturating_sub(live_width + left_gap + title_width + elapsed_width);
     Line::from(vec![
-        status_span(live, live_color, palette),
+        if room.is_live() {
+            Span::styled(
+                live,
+                Style::default()
+                    .fg(Color::LightRed)
+                    .bg(palette.background)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            status_span(live, STATUS_BLUE, palette)
+        },
         Span::raw(" ".repeat(left_gap)),
         Span::styled(
             title,
@@ -2645,7 +2652,13 @@ fn primary_status_line(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" ".repeat(right_gap)),
-        status_span(elapsed, STATUS_BLUE, palette),
+        Span::styled(
+            elapsed,
+            Style::default()
+                .fg(palette.content)
+                .bg(palette.background)
+                .add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 
@@ -3520,6 +3533,45 @@ mod tests {
     }
 
     #[test]
+    fn gift_combo_renders_one_row_without_moving_past_newer_chat() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        for index in 0..2 {
+            let gift = crate::domain::GiftDetails {
+                name: "人气票".into(),
+                action: "投喂".into(),
+                blind_gift: None,
+                receipts: [(format!("receipt-{index}"), 1)].into(),
+                reported_quantity: 0,
+            };
+            let mut event = DanmuEvent::new(DanmuEventKind::Gift, gift.content());
+            event.id = "one-gift-batch".into();
+            event.gift = Some(Box::new(gift));
+            app.ingest_event(event);
+            if index == 0 {
+                app.ingest_event(DanmuEvent::new(DanmuEventKind::Danmu, "后来的聊天"));
+            }
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = (0..20)
+            .map(|y| {
+                (0..100)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace(' ', "");
+        assert_eq!(rendered.matches("人气票").count(), 1, "{rendered}");
+        assert!(rendered.contains("人气票×2"), "{rendered}");
+        assert!(
+            rendered.find("人气票").unwrap() < rendered.find("后来的聊天").unwrap(),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn startup_animation_respects_two_second_minimum() {
         assert!(!startup_can_finish(
             STARTUP_MIN_DURATION - Duration::from_millis(1),
@@ -3856,6 +3908,81 @@ mod tests {
     }
 
     #[test]
+    fn live_label_and_red_dot_blink_together_without_a_badge() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        app.room = Some(RoomSnapshot {
+            room_id: "1".into(),
+            broadcaster_id: "42".into(),
+            broadcaster_name: "host".into(),
+            title: "stream".into(),
+            area: "".into(),
+            live_started_at: None,
+            live_status: RoomLiveStatus::Live,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        for status in [
+            RoomLiveStatus::Live,
+            RoomLiveStatus::Offline,
+            RoomLiveStatus::Rotating,
+        ] {
+            app.room.as_mut().unwrap().live_status = status;
+            let frames = (0..=4)
+                .map(|tick| {
+                    app.animation_tick = tick;
+                    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                    (0..100)
+                        .map(|x| terminal.backend().buffer()[(x, 0)].clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(frames[0], frames[1]);
+            assert_eq!(frames[2], frames[3]);
+            assert_eq!(frames[0], frames[4]);
+            for row in &frames {
+                let clock = row.iter().position(|cell| cell.symbol() == "◷").unwrap();
+                assert_eq!(row[clock].fg, app.config.palette.content);
+                assert!(
+                    row[clock..]
+                        .iter()
+                        .all(|cell| cell.bg == app.config.palette.background)
+                );
+                assert!(
+                    row[clock..]
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                        .contains("--:--:--")
+                );
+            }
+            if status == RoomLiveStatus::Live {
+                let on = &frames[0];
+                let off = &frames[2];
+                let dot = on.iter().position(|cell| cell.symbol() == "●").unwrap();
+                assert_eq!(on[dot].fg, Color::LightRed);
+                assert_eq!(
+                    on[dot..dot + 6]
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>(),
+                    "● LIVE"
+                );
+                assert!(off[dot..dot + 6].iter().all(|cell| cell.symbol() == " "));
+                assert!(
+                    on[..dot + 7]
+                        .iter()
+                        .chain(&off[..dot + 7])
+                        .all(|cell| cell.bg == app.config.palette.background)
+                );
+                assert_eq!(&on[..dot], &off[..dot]);
+                assert_eq!(&on[dot + 6..], &off[dot + 6..]);
+            } else {
+                assert_eq!(frames[0], frames[2], "non-live statuses must not blink");
+            }
+        }
+    }
+
+    #[test]
     fn layout_separates_realtime_technical_and_business_status() {
         let temp = tempfile::tempdir().unwrap();
         let mut session = DanmuSession::new("1");
@@ -4028,15 +4155,17 @@ mod tests {
         let colored_spans = technical_lines
             .iter()
             .flat_map(|line| line.spans.iter())
-            .filter(|span| span.style.bg.is_some())
+            .filter(|span| {
+                span.style
+                    .bg
+                    .is_some_and(|bg| bg != app.config.palette.background)
+            })
             .collect::<Vec<_>>();
         let segment_backgrounds = colored_spans
             .iter()
             .map(|span| span.style.bg.unwrap())
             .collect::<std::collections::HashSet<_>>();
-        assert!(segment_backgrounds.contains(&STATUS_RED));
         assert!(segment_backgrounds.contains(&STATUS_GREEN));
-        assert!(segment_backgrounds.contains(&STATUS_BLUE));
         for span in colored_spans {
             let background = span.style.bg.unwrap();
             assert_eq!(
@@ -4044,12 +4173,6 @@ mod tests {
                 Some(contrast_foreground(background, app.config.palette))
             );
         }
-        assert_eq!(technical_lines[0].spans[0].style.bg, Some(STATUS_RED));
-        app.animation_tick = 2;
-        let dim_live_background = technical_status_lines(&app, app.config.palette, 120)[0].spans[0]
-            .style
-            .bg;
-        assert_eq!(dim_live_background, Some(STATUS_RED_DIM));
 
         let narrow_lines = technical_status_lines(&app, app.config.palette, 32);
         assert_eq!(narrow_lines.len(), 2);

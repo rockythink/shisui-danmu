@@ -16,7 +16,7 @@ DANMU 是独立的免费终端产品。平台协议由 Rust `bilibili` Adapter �
 | --- | --- |
 | 房间连接 | 位置参数、`--room` 或 TOML 配置均可进入；短号解析为真实房间号 |
 | 历史弹幕 | 连接前拉取最近弹幕，连接期间每 5 秒用历史窗口补偿 WebSocket 漏包；history/live 按平台事件 ID 及作者、内容、类型去重，补偿消息按服务端时间进入实时视图；主动发送以主播身份回流确认，并抑制延迟到达的遮罩昵称副本 |
-| 实时事件 | 覆盖弹幕、礼物、大航海、SC、进场、点赞、关注、分享、PK、抽奖、房管、开停播和系统事件；礼物同时兼容 JSON `SEND_GIFT` 与 protobuf `SEND_GIFT_V2`，盲盒显示“原盲盒 → 开出礼物”；同一 `batch_combo_id` 的 `SEND_GIFT` / `COMBO_SEND` 就地更新为累计数量，不重复展示或记账，不同批次保持独立 |
+| 实时事件 | 覆盖弹幕、礼物、大航海、SC、进场、点赞、关注、分享、PK、抽奖、房管、开停播和系统事件；礼物兼容 JSON `SEND_GIFT`、protobuf `SEND_GIFT_V2` 与 `COMBO_SEND`；V2 的 GiftItem 字段 9 是交易 ID、字段 12 是批次 ID。同一作者、批次和礼物就地累计，不同批次或盲盒结果保持独立；逐笔数量按交易 ID 去重，与批次累计值取较大值而非相加，重复明细、较旧汇总和恢复后重放不重复计数。保留原消息位置并同步重点消息；旧版本已归档的重复行不追溯改写 |
 | 自动重连 | 使用 1、2、4、8、15、30 秒有界退避；不递归、不 panic；状态栏显示下次延迟 |
 | 房间信息 | `getRoomBaseInfo` 首次加载并每 30 秒刷新：请求失败自动重试一次，字段级合并新响应，缺失或解析失败字段沿用上次成功值；`room_id` 是真实房间号，`uid`/`uname` 是主播身份，`title` 是直播间标题，`parent_area_name`/`area_name` 是父子分区，`live_time` 是中国标准时间的本次开播时刻；`live_status` 严格映射 0=未开播、1=直播、2=轮播，未知值直接报契约变化；刷新失败不终止弹幕连接 |
 | 实时计数 | ◉ 只采用 `WATCHED_CHANGE.data.num`，♥ 只采用 `LIKE_INFO_V3_UPDATE.data.click_count`，▤ 是本次运行收到的实时弹幕数，● 采用登录态 `getOnlineRank.data.onlineNum`；在线人数请求失败自动重试一次并沿用上次成功值，首次无值或未登录时显示 `--`。`getRoomBaseInfo.online` 与心跳 op=3 均视为人气值，不作为在线人数 |
@@ -32,7 +32,7 @@ DANMU 是独立的免费终端产品。平台协议由 Rust `bilibili` Adapter �
 | 消息布局 | `Tab` 在信息流与聊天布局间即时切换；聊天布局将元信息、正文分行并保留消息间距 |
 | 主播身份 | 依据直播间主播 UID 使用独立用户名颜色；正文保持事件语义色 |
 | CJK 与 Emoji | 按 Unicode 字素编辑和分段，按终端显示宽度定位光标；过滤常见 IME 格式字符；已知 B 站短码映射语义 Emoji，平台图片表情使用通用 Unicode Emoji 降级显示 |
-| 实时状态分层 | 顶部固定两行：第一行左侧为 LIVE/OFFLINE/ROTATING 操作状态，直播间标题使用主题 `rank` 语义色绝对居中，右侧为已开播时长；第二行左侧显示主播名称，右侧整体右对齐显示 OBS 与 MIC 状态。OMP Box 上边框左侧发送状态使用主题 `success`、`info`、`warning` 语义色；右侧仅显示 ◉、♥、▤、● 及数值。主播弹幕名称前的 `♚` 使用 `rank`，主播名使用 `host` |
+| 实时状态分层 | 顶部固定两行：第一行左侧为 LIVE/OFFLINE/ROTATING 操作状态，直播间标题使用主题 `rank` 语义色绝对居中，右侧为已开播时长；第二行左侧显示主播名称，右侧整体右对齐显示 OBS 与 MIC 状态。OMP Box 上边框左侧发送状态使用主题 `success`、`info`、`warning` 语义色；右侧仅显示 ◉、♥、▤、● 及数值。主播弹幕名称前的 `♚` 使用 `rank`，主播名使用 `host`。LIVE 红色圆点与文字每 500 ms 同步显隐，移除红底、保持占位宽度不变；右侧计时为白字深色底，不再使用蓝色底块，位置和计时逻辑不变。不依赖 ANSI Blink 或 RGB 色差，离线与轮播状态不闪烁。 |
 | 会话归档 | 每个会话写独立 `journal.jsonl`；结束时生成 `summary.md` 与 `snapshot.json`；`/archive [关键词]` 搜索历史 |
 | OBS 配置 | `danmu --configure-obs` 配置主机、端口、场景、麦克风和密码；`/obs config password` 可在 TUI 内隐藏输入并更新密码；密码写入独立 `obs-password` 文件，Unix 权限 `0600`，不使用系统钥匙串；`OBS_API_PASSWORD` 可临时覆盖；`/obs config mic` 持久化输入名 |
 | OBS 控制 | `/obs`、`/obs status|connect|mute|unmute|scene|start|stop`；每次异步操作立即显示进度，认证、密码和连接失败给出可执行提示；场景和输入候选读取 OBS 真相；停播需 `/obs confirm`，可 `/obs cancel` |
