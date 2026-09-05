@@ -1,6 +1,6 @@
 [package]
 name = "shisui-danmu"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 rust-version = "1.89"
 description = "面向知识型主播的跨平台弹幕与直播监控 TUI 工作台"

@@ -35,6 +35,14 @@
 
 它不是播放器，也不是另一套 OBS。它只解决直播时最容易失控的那一段：**看见互动、辨认问题、快速回应、保留现场。**
 
+## v0.4.3 更新：互动可读，正文不动
+
+- **进场、点赞不再挤动正文**：临时提示移到弹幕框底边，并与普通消息分开计算缓存限额；通知隐藏后不会留下被挤掉的历史弹幕缺口。
+- **名字留得住**：提示至少稳定展示 2 秒，同批合并姓名，进场优先；空间足够时附加点赞姓名摘要，重复互动只按可靠用户 ID 合并，不把同名观众混为一人。
+- **不积压点名队列**：只保留当前批次与下一批摘要，过期和已替换提示不补播；支持窄屏姓名适配与关闭姓名显示，历史浏览和回复选择保持稳定。
+
+完整说明与安装包见 [v0.4.3 Release](https://github.com/rockythink/shisui-danmu/releases/tag/v0.4.3)。更新后重新启动 TUI。
+
 ## 真实运行录屏
 
 <p align="center">
@@ -132,6 +140,7 @@ danmu --logout
 | 顶部第一行 | `LIVE / OFFLINE / ROTATING`、直播标题、已开播时长 |
 | 顶部第二行 | 主播身份、OBS 连接、麦克风静音状态 |
 | Ghost Stage | 历史与实时事件合并后的主信息流；重点消息显示在标题上 |
+| 临时互动提示 | 进场、点赞显示在 Ghost Stage 底边，姓名至少稳定展示 2 秒；同批最多展示 3 个完整名字，进场优先，空间足够时附加点赞摘要。进场批次最长展示 5 秒、点赞 3 秒；只保留当前批次和下一批摘要，不积压播报，也不挤动正文或占用弹幕历史缓存；关闭姓名显示同时隐藏提示中的名字 |
 | 通知区 | 登录、发送、重连、OBS 操作的进度、错误与可执行提示 |
 | 输入框顶栏 | 发送状态、业务计数，以及空间允许时的麦克风电平 |
 | 输入框 | Unicode 字素级编辑；最多四行，光标始终保持可见 |
@@ -347,7 +356,7 @@ GitHub Actions 在 macOS、Linux、Windows 上执行对应 Rust 门禁。提交�
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rockythink/shisui-danmu/main/script/install_release.sh | \
-  DANMU_VERSION=v0.4.0 DANMU_INSTALL_DIR="$HOME/bin" bash
+  DANMU_VERSION=v0.4.3 DANMU_INSTALL_DIR="$HOME/bin" bash
 ```
 
 卸载：

@@ -1,3 +1,4 @@
+mod activity;
 mod input;
 mod meter;
 mod qr;
@@ -701,6 +702,7 @@ pub struct TerminalApp {
     slash_selection: usize,
     selected: usize,
     scroll_offset: usize,
+    activity: activity::ActivityNotices,
     notice: String,
     notice_deadline: Option<Instant>,
     delivery_status: DeliveryStatus,
@@ -970,6 +972,7 @@ impl TerminalApp {
             slash_selection: 0,
             selected: 0,
             scroll_offset: 0,
+            activity: activity::ActivityNotices::default(),
             notice: "Tab 切换布局；输入 /help 查看命令".into(),
             notice_deadline: Some(Instant::now() + Duration::from_secs(6)),
             delivery_status: DeliveryStatus::Idle,
@@ -1330,6 +1333,7 @@ impl TerminalApp {
             .map(|event| event.id.clone());
         if self.session.ingest(event.clone()) {
             let _ = self.journal.event(&self.session, &event);
+            self.activity.push(&event, Instant::now(), Utc::now());
             self.selected = selected_anchor
                 .as_deref()
                 .and_then(|id| {
@@ -1400,6 +1404,7 @@ impl TerminalApp {
     }
 
     fn expire_notice_at(&mut self, now: Instant) {
+        self.activity.advance(now);
         if self.notice_deadline.is_some_and(|deadline| now >= deadline) {
             self.notice.clear();
             self.notice_deadline = None;
@@ -1429,20 +1434,34 @@ impl TerminalApp {
     }
 
     fn scroll_page(&mut self, older: bool) {
-        if self.session.recent_events.is_empty() {
+        let candidates = self
+            .session
+            .recent_events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.kind.activity_lifetime().is_none())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            self.return_to_live();
             return;
         }
         self.selection_active = false;
         self.selected = 0;
+        let position = candidates
+            .iter()
+            .position(|index| *index == self.scroll_offset)
+            .unwrap_or(0);
         let page = self.page_event_count.max(1);
-        if older {
-            self.scroll_offset =
-                (self.scroll_offset + page).min(self.session.recent_events.len().saturating_sub(1));
+        let next = if older {
+            (position + page).min(candidates.len() - 1)
         } else {
-            self.scroll_offset = self.scroll_offset.saturating_sub(page);
-            if self.scroll_offset == 0 {
-                self.unread_live_count = 0;
-            }
+            position.saturating_sub(page)
+        };
+        if next == 0 {
+            self.return_to_live();
+        } else {
+            self.scroll_offset = candidates[next];
         }
     }
 
@@ -2181,14 +2200,10 @@ fn reconcile_cross_origin_event(events: &mut [DanmuEvent], incoming: &DanmuEvent
 }
 
 fn display_events(events: &[DanmuEvent]) -> impl Iterator<Item = &DanmuEvent> {
-    let now = Utc::now();
-    let enter_cutoff = now - chrono::Duration::seconds(5);
-    let like_cutoff = now - chrono::Duration::seconds(3);
-    events.iter().rev().filter(move |event| match event.kind {
-        DanmuEventKind::Enter => event.timestamp > enter_cutoff,
-        DanmuEventKind::Like => event.timestamp > like_cutoff,
-        _ => true,
-    })
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.kind.activity_lifetime().is_none())
 }
 
 fn startup_check_line(
@@ -2782,7 +2797,17 @@ fn draw_events(
     } else {
         title.to_owned()
     };
-    let block = rounded_block(&title, palette);
+    let mut block = rounded_block(&title, palette);
+    if let Some((kind, content)) = app.activity.render(
+        usize::from(area.width.saturating_sub(4)),
+        app.show_name,
+        Instant::now(),
+    ) {
+        block = block.title_bottom(Line::styled(
+            format!(" {content} "),
+            Style::default().fg(event_color(kind, palette)),
+        ));
+    }
     let inner = block.inner(area);
     let event_texts = displayed_events
         .into_iter()
@@ -3504,6 +3529,7 @@ mod tests {
             slash_selection: 0,
             selected: 0,
             scroll_offset: 0,
+            activity: activity::ActivityNotices::default(),
             notice: String::new(),
             notice_deadline: None,
             delivery_status: DeliveryStatus::Idle,
@@ -4234,32 +4260,104 @@ mod tests {
     }
 
     #[test]
-    fn hides_enter_messages_after_five_seconds() {
-        let mut expired = DanmuEvent::new(DanmuEventKind::Enter, "旧进场消息");
-        expired.timestamp = Utc::now() - chrono::Duration::seconds(6);
-        let current = DanmuEvent::new(DanmuEventKind::Danmu, "真实弹幕");
-        let events = vec![current, expired];
-
-        let displayed = display_events(&events).collect::<Vec<_>>();
-        assert_eq!(displayed.len(), 1);
-        assert_eq!(displayed[0].content, "真实弹幕");
+    fn activity_bursts_and_expiry_leave_chat_rows_unchanged() {
+        for chat_layout in [false, true] {
+            for (browsing, selecting) in [(false, false), (true, false), (false, true)] {
+                let temp = tempfile::tempdir().unwrap();
+                let now = Utc::now();
+                let mut session = DanmuSession::with_options("1", 12, now);
+                for index in 0..12 {
+                    let mut event = DanmuEvent::new(
+                        DanmuEventKind::Danmu,
+                        format!("历史弹幕-{index:02}，这是一条需要保留的消息"),
+                    );
+                    event.timestamp = now - chrono::Duration::seconds(60 - index);
+                    session.ingest(event);
+                }
+                let mut app = test_app(&temp, session);
+                app.layout_chat = chat_layout;
+                if browsing {
+                    app.scroll_offset = 4;
+                }
+                if selecting {
+                    app.selection_active = true;
+                    app.selected = 4;
+                }
+                let palette = app.config.palette;
+                let mut terminal = Terminal::new(TestBackend::new(42, 10)).unwrap();
+                terminal
+                    .draw(|frame| draw_events(frame, frame.area(), &mut app, palette, "Events"))
+                    .unwrap();
+                let before = terminal.backend().buffer().clone();
+                for index in 0..30 {
+                    let kind = if index % 2 == 0 {
+                        DanmuEventKind::Enter
+                    } else {
+                        DanmuEventKind::Like
+                    };
+                    let mut event = DanmuEvent::new(kind, "临时互动提示");
+                    event.timestamp = now + chrono::Duration::minutes(1);
+                    app.ingest_event(event);
+                    terminal
+                        .draw(|frame| draw_events(frame, frame.area(), &mut app, palette, "Events"))
+                        .unwrap();
+                    let during = terminal.backend().buffer();
+                    for y in 0..9 {
+                        for x in 0..42 {
+                            assert_eq!(
+                                during[(x, y)],
+                                before[(x, y)],
+                                "chat={chat_layout}, browsing={browsing}, selecting={selecting}, cell=({x},{y})"
+                            );
+                        }
+                    }
+                    let mut footer = String::new();
+                    let mut x = 0;
+                    while x < 42 {
+                        let symbol = during[(x, 9)].symbol();
+                        footer.push_str(symbol);
+                        x += UnicodeWidthStr::width(symbol).max(1) as u16;
+                    }
+                    assert!(footer.contains("观众"), "{footer}");
+                }
+                app.expire_notice_at(Instant::now() + Duration::from_secs(10));
+                terminal
+                    .draw(|frame| draw_events(frame, frame.area(), &mut app, palette, "Events"))
+                    .unwrap();
+                assert_eq!(terminal.backend().buffer(), &before);
+            }
+        }
     }
 
     #[test]
-    fn hides_like_messages_after_three_seconds() {
-        let mut expired = DanmuEvent::new(DanmuEventKind::Like, "旧点赞消息");
-        expired.timestamp = Utc::now() - chrono::Duration::seconds(4);
-        let mut current = DanmuEvent::new(DanmuEventKind::Like, "新点赞消息");
-        current.timestamp = Utc::now() - chrono::Duration::seconds(2);
-        let danmu = DanmuEvent::new(DanmuEventKind::Danmu, "真实弹幕");
-        let events = vec![danmu, current, expired];
-
-        let displayed = display_events(&events)
-            .map(|event| event.content.as_str())
-            .collect::<Vec<_>>();
-        assert!(!displayed.contains(&"旧点赞消息"));
-        assert!(displayed.contains(&"新点赞消息"));
-        assert!(displayed.contains(&"真实弹幕"));
+    fn history_paging_skips_activity_even_after_it_expires() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        let now = Utc::now();
+        for index in 0..10 {
+            let mut message = DanmuEvent::new(DanmuEventKind::Danmu, format!("message-{index}"));
+            message.timestamp = now - chrono::Duration::seconds(30 - index * 2);
+            app.ingest_event(message);
+            let mut activity = DanmuEvent::new(DanmuEventKind::Like, "过期的点赞");
+            activity.timestamp = now - chrono::Duration::seconds(29 - index * 2);
+            app.ingest_event(activity);
+        }
+        app.page_event_count = 3;
+        for (older, expected) in [
+            (true, "message-6"),
+            (true, "message-3"),
+            (false, "message-6"),
+        ] {
+            app.scroll_page(older);
+            assert_eq!(
+                app.session.recent_events[app.scroll_offset].content,
+                expected
+            );
+        }
+        app.unread_live_count = 2;
+        app.scroll_page(false);
+        assert_eq!(app.scroll_offset, 0);
+        assert_eq!(app.unread_live_count, 0);
     }
 
     #[test]

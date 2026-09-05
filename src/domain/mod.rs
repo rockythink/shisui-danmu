@@ -22,6 +22,16 @@ pub enum DanmuEventKind {
     System,
 }
 
+impl DanmuEventKind {
+    pub fn activity_lifetime(self) -> Option<Duration> {
+        match self {
+            Self::Enter => Some(Duration::seconds(5)),
+            Self::Like => Some(Duration::seconds(3)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum DanmuEventOrigin {
@@ -250,7 +260,20 @@ impl DanmuSession {
             .recent_events
             .partition_point(|existing| existing.timestamp >= event.timestamp);
         self.recent_events.insert(position, event.clone());
-        self.recent_events.truncate(self.event_limit);
+        // Short-lived activity must not consume the retained chat history quota.
+        if self.recent_events.len() > self.event_limit {
+            let mut message_count = 0;
+            let mut activity_count = 0;
+            self.recent_events.retain(|event| {
+                let count = if event.kind.activity_lifetime().is_some() {
+                    &mut activity_count
+                } else {
+                    &mut message_count
+                };
+                *count += 1;
+                *count <= self.event_limit
+            });
+        }
         self.metrics.record(&event);
         true
     }
@@ -501,6 +524,43 @@ mod tests {
         assert!(snapshot.get("questionClassifier").is_none());
     }
 
+    #[test]
+    fn transient_activity_does_not_evict_chat_history() {
+        let mut session = DanmuSession::with_options("1", 2, Utc::now());
+        session.ingest(event("older", DanmuEventKind::Danmu, "早些时候的弹幕"));
+        session.ingest(event("newer", DanmuEventKind::Danmu, "最新弹幕"));
+        for index in 0..6 {
+            let kind = if index % 2 == 0 {
+                DanmuEventKind::Enter
+            } else {
+                DanmuEventKind::Like
+            };
+            session.ingest(event(&format!("activity-{index}"), kind, "临时通知"));
+        }
+        let chats = session
+            .recent_events
+            .iter()
+            .filter(|event| event.kind == DanmuEventKind::Danmu)
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(chats, ["newer", "older"]);
+        assert!(session.recent_events.len() <= 4);
+        assert_eq!(session.metrics.total_event_count, 8);
+        assert!(!session.ingest(event("activity-5", DanmuEventKind::Like, "重复通知")));
+        session.ingest(event("latest", DanmuEventKind::Danmu, "后来弹幕"));
+        assert!(
+            !session
+                .recent_events
+                .iter()
+                .any(|event| event.id == "older")
+        );
+        assert!(
+            session
+                .recent_events
+                .iter()
+                .any(|event| event.id == "newer")
+        );
+    }
     #[test]
     fn legacy_event_defaults_origin_and_emotes() {
         let value = serde_json::json!({
