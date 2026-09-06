@@ -23,6 +23,9 @@ pub struct Cli {
     pub show_name: Option<bool>,
     #[arg(long)]
     pub hide_name: bool,
+    /// 浏览历史空闲多少秒后返回实时；0 表示仅手动返回
+    #[arg(long, value_name = "秒数")]
+    pub history_idle_seconds: Option<u32>,
     #[arg(short, long, value_name = "路径")]
     pub config: Option<PathBuf>,
     #[arg(long, value_name = "主题名")]
@@ -37,6 +40,7 @@ pub struct Cli {
 
 #[derive(Debug, Clone)]
 pub struct TerminalConfig {
+    pub history_idle_seconds: u32,
     pub room_id: String,
     pub single_line: bool,
     pub chat_layout: bool,
@@ -49,6 +53,7 @@ pub struct TerminalConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
+    history_idle_seconds: Option<u32>,
     #[serde(alias = "roomID", alias = "roomid")]
     room_id: Option<String>,
     #[serde(alias = "singleLine", alias = "singleline")]
@@ -89,6 +94,10 @@ impl TerminalConfig {
         let requested_theme = cli.theme.as_deref().unwrap_or(themes.selected());
         let (theme_name, palette) = themes.resolve(requested_theme)?;
         Ok(Self {
+            history_idle_seconds: cli
+                .history_idle_seconds
+                .or(file.history_idle_seconds)
+                .unwrap_or(0),
             room_id,
             single_line: cli.single_line.or(file.single_line).unwrap_or(true),
             chat_layout: file.chat_layout.unwrap_or(false),

@@ -547,6 +547,11 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         description: "切换聊天与信息流布局",
     },
     CommandSpec {
+        completion: "/history ",
+        usage: "/history [秒数|off]",
+        description: "历史空闲自动返回；off 仅手动，秒数启用",
+    },
+    CommandSpec {
         completion: "/theme",
         usage: "/theme",
         description: "打开主题选择列表",
@@ -700,6 +705,7 @@ pub struct TerminalApp {
     slash_selection: usize,
     selected: usize,
     scroll_offset: usize,
+    last_user_activity: Instant,
     activity: activity::ActivityNotices,
     notice: String,
     notice_deadline: Option<Instant>,
@@ -969,6 +975,7 @@ impl TerminalApp {
             slash_selection: 0,
             selected: 0,
             scroll_offset: 0,
+            last_user_activity: Instant::now(),
             activity: activity::ActivityNotices::default(),
             notice: "Tab 切换布局；输入 /help 查看命令".into(),
             notice_deadline: Some(Instant::now() + Duration::from_secs(6)),
@@ -1086,6 +1093,7 @@ impl TerminalApp {
                     app.animation_tick = app.animation_tick.wrapping_add(1);
                     app.expire_notice_at(Instant::now());
                     app.advance_stop_at(Instant::now(), &ui_tx);
+                    app.advance_history_at(Instant::now());
                 },
                 event = events.next() => if let Some(Ok(event)) = event {
                     match event {
@@ -1423,6 +1431,26 @@ impl TerminalApp {
         }
     }
 
+    fn is_browsing_history(&self) -> bool {
+        self.selection_active || self.scroll_offset > 0
+    }
+
+    fn advance_history_at(&mut self, now: Instant) {
+        // Modal operations must not silently discard a reply target underneath them.
+        if self.stop_flow.is_some() || self.login_qr.is_some() || self.secret_mode {
+            self.last_user_activity = now;
+            return;
+        }
+        if self.is_browsing_history()
+            && self.config.history_idle_seconds > 0
+            && now.saturating_duration_since(self.last_user_activity)
+                >= Duration::from_secs(u64::from(self.config.history_idle_seconds))
+        {
+            self.return_to_live();
+            self.set_notice("历史浏览空闲超时，已恢复实时跟随", NoticeLevel::Info);
+        }
+    }
+
     fn return_to_live(&mut self) {
         self.selection_active = false;
         self.selected = 0;
@@ -1431,6 +1459,9 @@ impl TerminalApp {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) {
+        if !matches!(event.kind, MouseEventKind::Moved) {
+            self.last_user_activity = Instant::now();
+        }
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll_history(true),
             MouseEventKind::ScrollDown => self.scroll_history(false),
@@ -1571,6 +1602,9 @@ impl TerminalApp {
     }
 
     async fn handle_key(&mut self, key: KeyEvent, tx: mpsc::Sender<UiEvent>) -> Result<bool> {
+        if key.kind != crossterm::event::KeyEventKind::Release {
+            self.last_user_activity = Instant::now();
+        }
         if key.kind != crossterm::event::KeyEventKind::Press {
             return Ok(false);
         }
@@ -1643,7 +1677,7 @@ impl TerminalApp {
                     self.return_to_live();
                     return Ok(false);
                 }
-                return Ok(true);
+                return Ok(false);
             }
             KeyCode::Tab => {
                 self.layout_chat = !self.layout_chat;
@@ -1835,6 +1869,41 @@ impl TerminalApp {
                     "输入 / 打开命令面板；↑/↓ 选择；Enter 执行；Tab 仅补全",
                     NoticeLevel::Info,
                 );
+            }
+            ["/history"] => {
+                let seconds = self.config.history_idle_seconds;
+                self.set_notice(
+                    if seconds == 0 {
+                        "历史返回：仅手动；Esc 返回实时；/history 60 启用空闲自动返回".into()
+                    } else {
+                        format!("历史返回：空闲 {seconds} 秒自动返回，Esc 也可立即返回；/history off 关闭自动返回")
+                    },
+                    NoticeLevel::Info,
+                );
+            }
+            ["/history", value] => {
+                let seconds = if *value == "off" {
+                    Some(0)
+                } else {
+                    value.parse::<u32>().ok()
+                };
+                if let Some(seconds) = seconds {
+                    self.config.history_idle_seconds = seconds;
+                    self.last_user_activity = Instant::now();
+                    self.set_notice(
+                        if seconds == 0 {
+                            "本次会话已关闭自动返回；Esc 手动返回实时".into()
+                        } else {
+                            format!("本次会话空闲 {seconds} 秒自动返回实时；Esc 仍可手动返回")
+                        },
+                        NoticeLevel::Success,
+                    );
+                } else {
+                    self.set_notice(
+                        "用法：/history [秒数|off]；0 或 off 关闭自动返回",
+                        NoticeLevel::Error,
+                    );
+                }
             }
             ["/layout"] => {
                 self.layout_chat = !self.layout_chat;
@@ -2626,6 +2695,10 @@ fn draw_command_palette(
 }
 
 fn draw_compact(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, palette: Palette) {
+    if app.is_browsing_history() && area.height < 3 {
+        draw_history_status(frame, area, app, palette);
+        return;
+    }
     if area.height < 3 {
         frame.render_widget(
             Paragraph::new(format!(
@@ -2643,6 +2716,11 @@ fn draw_compact(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, p
         .min(area.height.saturating_sub(1))
         .max(2);
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(input_height)]).split(area);
+    if app.is_browsing_history() {
+        draw_events(frame, rows[0], app, palette, "历史");
+        draw_input(frame, rows[1], app, palette);
+        return;
+    }
     let latest = display_events(&app.session.recent_events)
         .map(|event| Line::from(map_event_emotes(event)))
         .collect::<Vec<_>>();
@@ -2882,6 +2960,42 @@ fn application_notice_lines(app: &TerminalApp, palette: Palette, width: u16) -> 
     )
 }
 
+fn draw_history_status(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &TerminalApp,
+    palette: Palette,
+) {
+    let first = if area.width >= 44 {
+        " 浏览历史 · 已暂停跟随 · Esc 返回实时"
+    } else if area.width >= 24 {
+        " 历史浏览 · Esc 返回实时"
+    } else {
+        " 历史 · Esc 返回"
+    };
+    let mut second = format!(" 新增 {} 条", app.unread_live_count);
+    if app.config.history_idle_seconds > 0 {
+        if app.stop_flow.is_some() || app.login_qr.is_some() || app.secret_mode {
+            second.push_str(" · 弹窗期间暂停计时");
+        } else {
+            let remaining = u64::from(app.config.history_idle_seconds)
+                .saturating_sub(app.last_user_activity.elapsed().as_secs());
+            second.push_str(&format!(" · {remaining}s 后自动返回"));
+        }
+    } else {
+        second.push_str(" · 仅手动返回");
+    }
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(first), Line::from(second)]).style(
+            Style::default()
+                .fg(contrast_foreground(palette.warning, palette))
+                .bg(palette.warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        area,
+    );
+}
+
 fn draw_events(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -2889,6 +3003,10 @@ fn draw_events(
     palette: Palette,
     title: &str,
 ) {
+    if app.is_browsing_history() && area.height < 4 {
+        draw_history_status(frame, area, app, palette);
+        return;
+    }
     let displayed_events = display_events(&app.session.recent_events).collect::<Vec<_>>();
     let selection_anchor = app
         .selection_active
@@ -2910,14 +3028,14 @@ fn draw_events(
             .position(|event| event.id == selected.id)
     });
     let title = if browse_target.is_some() {
-        format!(
-            "{title} · 浏览历史 · {} 条新 · End 返回实时",
-            app.unread_live_count
-        )
+        format!("{title} · 浏览历史")
     } else {
-        title.to_owned()
+        format!("{title} · 实时跟随")
     };
     let mut block = rounded_block(&title, palette);
+    if browse_target.is_some() {
+        block = block.border_style(Style::default().fg(palette.warning));
+    }
     if let Some((kind, content)) = app.activity.render(
         usize::from(area.width.saturating_sub(4)),
         app.show_name,
@@ -2928,7 +3046,7 @@ fn draw_events(
             Style::default().fg(event_color(kind, palette)),
         ));
     }
-    let inner = block.inner(area);
+    let mut inner = block.inner(area);
     let items = displayed_events
         .into_iter()
         .map(|event| ListItem::new(event_lines(event, app, palette, inner.width)))
@@ -2939,6 +3057,16 @@ fn draw_events(
         height.saturating_add(item.height() as u16)
     });
     frame.render_widget(block, area);
+    if browse_target.is_some() {
+        let height = inner.height.min(2);
+        let banner = Rect {
+            y: inner.bottom().saturating_sub(height),
+            height,
+            ..inner
+        };
+        draw_history_status(frame, banner, app, palette);
+        inner.height = inner.height.saturating_sub(height);
+    }
     let visible_height = used_height.min(inner.height);
     let list_area = Rect {
         y: inner.y + inner.height.saturating_sub(visible_height),
@@ -3606,6 +3734,7 @@ mod tests {
         let themes = crate::theme::ThemeCatalog::load(temp.path().join("themes.json")).unwrap();
         let theme_name = themes.selected().to_owned();
         let config = TerminalConfig {
+            history_idle_seconds: 0,
             room_id: "1".into(),
             single_line: true,
             chat_layout: false,
@@ -3634,6 +3763,7 @@ mod tests {
             selected: 0,
             scroll_offset: 0,
             activity: activity::ActivityNotices::default(),
+            last_user_activity: Instant::now(),
             notice: String::new(),
             notice_deadline: None,
             delivery_status: DeliveryStatus::Idle,
@@ -4731,11 +4861,18 @@ mod tests {
             .unwrap();
         assert!(!quit_selection);
         assert!(!app.selection_active);
-        let quit_app = app
-            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx)
-            .await
-            .unwrap();
-        assert!(quit_app);
+        for _ in 0..3 {
+            let quit_app = app
+                .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx.clone())
+                .await
+                .unwrap();
+            assert!(!quit_app);
+        }
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), tx)
+                .await
+                .unwrap()
+        );
     }
     #[test]
     fn sent_message_accepts_masked_live_echo_and_restores_broadcaster_identity() {
@@ -5068,43 +5205,85 @@ mod tests {
         assert_eq!(app.session.recent_events[app.selected].id, selected_id);
     }
 
-    #[test]
-    fn browsing_mode_reports_unread_live_events_and_return_key() {
+    #[tokio::test]
+    async fn history_idle_timeout_tracks_input_not_incoming_messages() {
         let temp = tempfile::tempdir().unwrap();
         let mut session = DanmuSession::new("1");
-        for index in 0..20 {
-            let mut event = DanmuEvent::new(DanmuEventKind::Danmu, format!("历史-{index}"));
-            event.username = Some(format!("观众-{index}"));
-            session.ingest(event);
+        for index in 0..8 {
+            session.ingest(DanmuEvent::new(
+                DanmuEventKind::Danmu,
+                format!("历史-{index}"),
+            ));
         }
         let mut app = test_app(&temp, session);
-        app.selection_active = true;
-        app.selected = 10;
-        let mut latest = DanmuEvent::new(DanmuEventKind::Danmu, "最新实时弹幕");
+        let (tx, _rx) = mpsc::channel(1);
+        app.command("/history 60", tx.clone()).await.unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        // A fresh input must restart a previously expired idle period.
+        app.last_user_activity = Instant::now() - Duration::from_secs(120);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        let input_at = app.last_user_activity;
+        let anchor = app.session.recent_events[app.scroll_offset].id.clone();
+        app.advance_history_at(input_at + Duration::from_secs(59));
+        assert_eq!(app.session.recent_events[app.scroll_offset].id, anchor);
+        assert!(app.is_browsing_history());
+        let mut latest = DanmuEvent::new(DanmuEventKind::Danmu, "超时后应该看到的最新弹幕");
         latest.origin = DanmuEventOrigin::Live;
-        latest.username = Some("新观众".into());
         app.handle_client_event(BilibiliClientEvent::Danmu(latest));
+        assert_eq!(app.unread_live_count, 1);
+        assert_eq!(app.session.recent_events[app.scroll_offset].id, anchor);
+        app.advance_history_at(input_at + Duration::from_secs(60));
+        assert!(!app.is_browsing_history());
+        assert_eq!(app.unread_live_count, 0);
+        assert_eq!(&*app.input, "x");
 
-        let mut terminal = Terminal::new(TestBackend::new(72, 8)).unwrap();
-        let palette = app.config.palette;
-        terminal
-            .draw(|frame| draw_events(frame, frame.area(), &mut app, palette, "Events"))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let rendered = (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .replace(' ', "");
-
+        app.command("/history off", tx.clone()).await.unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.advance_history_at(app.last_user_activity + Duration::from_secs(3600));
+        assert!(app.is_browsing_history());
         assert!(
-            rendered.contains("浏览历史·1条新·End返回实时"),
-            "{rendered}"
+            !app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx)
+                .await
+                .unwrap()
         );
+        assert!(!app.is_browsing_history());
+        assert_eq!(&*app.input, "x");
+    }
+
+    #[test]
+    fn history_idle_timeout_waits_for_modal_operation_to_finish() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = DanmuSession::new("1");
+        session.ingest(DanmuEvent::new(DanmuEventKind::Danmu, "正在准备回复的问题"));
+        let mut app = test_app(&temp, session);
+        app.selection_active = true;
+        app.config.history_idle_seconds = 60;
+        app.stop_flow = Some(StopFlow::Confirm {
+            stop_selected: false,
+        });
+        let now = app.last_user_activity + Duration::from_secs(120);
+        app.advance_history_at(now);
+        assert!(app.selection_active);
+        app.cancel_stop();
+        app.advance_history_at(now + Duration::from_secs(59));
+        assert!(app.selection_active);
+        app.advance_history_at(now + Duration::from_secs(60));
+        assert!(!app.is_browsing_history());
     }
 
     #[tokio::test]

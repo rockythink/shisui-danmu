@@ -35,13 +35,21 @@
 
 它不是播放器，也不是另一套 OBS。它只解决直播时最容易失控的那一段：**看见互动、辨认问题、快速回应、保留现场。**
 
-## v0.4.4 更新：历史逐条滚动，停播连续确认
+## v0.4.5 更新：历史浏览状态与返回方式
+
+- 历史模式使用高对比底色提示和醒目边框，持续显示返回按键、新消息数量与可选倒计时。
+- 默认仅手动返回；输入 `/history 60` 后，空闲 60 秒自动恢复实时跟随，也可随时按 Esc 返回。
+- Esc 只取消当前操作或返回实时，连续按键不会退出；退出统一使用 Ctrl+C 或 `/quit`。
+
+完整说明与安装包见 [v0.4.5 Release](https://github.com/rockythink/shisui-danmu/releases/tag/v0.4.5)。更新后重新启动 TUI。
+
+### v0.4.4：历史逐条滚动，停播连续确认
 
 - **历史不再整页跳动**：每个滚轮事件移动一条消息；从回复选择接续当前位置，新消息到达时保留阅读锚点，`End` 返回实时。
 - **OBS 状态更明确**：连接状态统一为单个 `●`，绿色表示已连接，红色表示未连接。
 - **停播连续确认**：`/obs stop` 打开弹窗，默认选中“返回”；方向键确认后显示 3 秒倒计时，Esc 可取消，不再输入 `/obs confirm` 或 `/obs cancel`。
 
-完整说明与安装包见 [v0.4.4 Release](https://github.com/rockythink/shisui-danmu/releases/tag/v0.4.4)。更新后重新启动 TUI。
+历史说明见 [v0.4.4 Release](https://github.com/rockythink/shisui-danmu/releases/tag/v0.4.4)。
 
 ### v0.4.3：互动可读，正文不动
 
@@ -173,10 +181,10 @@ danmu --logout
 | 打开命令面板 | `/` |
 | 切换信息流 / 聊天布局 | `Tab` |
 | 浏览历史 | 鼠标滚轮，每次移动一条消息，不整页跳动 |
-| 回到最新消息 | `End` |
+| 回到最新消息并恢复跟随 | `Esc` / `End`，或向下滚回最新一条 |
 | 选择回复对象 | `Shift+↑/↓` |
 | 插入 `@用户名` | 选择后按 `Enter` |
-| 取消选择或退出 | `Esc` |
+| 取消选择或当前操作（不退出程序） | `Esc` |
 | 安全退出 | `Ctrl+C` 或 `/quit` |
 | 行首 / 行尾 | `Home` / `End`，或 `Ctrl+A/E` |
 | 删除到行首 / 删除前一个词 | `Ctrl+U/W` |
@@ -188,6 +196,7 @@ danmu --logout
 | `/help` | 显示命令面板操作提示 |
 | `/login` · `/logout` | 扫码登录或清除独立登录态 |
 | `/layout` | 切换信息流与聊天布局 |
+| `/history [秒数\|off]` | 查看或设置本次会话的空闲自动返回；`off` 或 `0` 仅手动返回 |
 | `/theme` | 打开主题选择；`/theme reload` 热加载自定义主题 |
 | `/names show\|hide` | 显示或隐藏用户名 |
 | `/time show\|hide` | 显示或隐藏消息时间 |
@@ -247,9 +256,21 @@ single_line = true
 chat_layout = false
 show_time = true
 show_name = true
+history_idle_seconds = 0 # 0：仅手动返回；例如 60：空闲 60 秒后自动返回
 ```
 
 CLI 参数优先于 TOML。可通过 `--config <路径>` 使用指定配置文件。
+
+### 历史浏览与实时跟随
+
+上滚或选择回复对象后，消息区底部固定显示高对比提示：**浏览历史 · 已暂停跟随 · Esc 返回实时**。新消息仍然接收，并显示新增数量；启用自动返回时显示剩余秒数。窄屏保留状态与返回按键。
+
+- **仅手动（默认）**：`/history off`；按 Esc、End 或向下滚回最新一条恢复跟随。
+- **手动与自动并用**：`/history 60`；按键、滚轮等操作重新计时，消息到达不重置计时。空闲达到 60 秒后返回最新，不清除输入草稿。
+- 登录二维码、密码输入或停播弹窗期间暂停自动返回，关闭后重新计算空闲时间；Esc 优先取消当前操作，再返回实时。
+- `/history` 查看当前设置；命令修改仅对本次会话生效。要持久生效，在 TOML 中设置 `history_idle_seconds = 60`；启动时可用 `--history-idle-seconds 60` 覆盖，传 `0` 关闭。
+
+Esc 不再退出整个 TUI；使用 **Ctrl+C** 或 **/quit** 安全退出。
 
 ### True Color 主题
 
@@ -363,7 +384,7 @@ GitHub Actions 在 macOS、Linux、Windows 上执行对应 Rust 门禁。提交�
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rockythink/shisui-danmu/main/script/install_release.sh | \
-  DANMU_VERSION=v0.4.4 DANMU_INSTALL_DIR="$HOME/bin" bash
+  DANMU_VERSION=v0.4.5 DANMU_INSTALL_DIR="$HOME/bin" bash
 ```
 
 卸载：
