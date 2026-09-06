@@ -38,7 +38,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols::border,
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
     collections::VecDeque,
@@ -329,6 +329,7 @@ enum UiEvent {
     LoginQr(Vec<String>),
     LoginDone(AccountStatus),
     ObsStatus(std::result::Result<ObsStatus, String>),
+    ObsStopDone(std::result::Result<(), String>),
     RoomSnapshot(RoomSnapshot),
     OnlineViewers(std::result::Result<Option<u64>, String>),
     Likes(std::result::Result<Option<u64>, String>),
@@ -628,17 +629,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         completion: "/obs stop",
         usage: "/obs stop",
-        description: "请求停止推流",
-    },
-    CommandSpec {
-        completion: "/obs confirm",
-        usage: "/obs confirm",
-        description: "确认停止推流",
-    },
-    CommandSpec {
-        completion: "/obs cancel",
-        usage: "/obs cancel",
-        description: "取消停止推流",
+        description: "交互确认后倒计时 3 秒停止推流",
     },
     CommandSpec {
         completion: "/quit",
@@ -684,6 +675,13 @@ fn slash_suggestions<'a>(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy)]
+enum StopFlow {
+    Confirm { stop_selected: bool },
+    Countdown { deadline: Instant },
+    Stopping,
+}
+
 pub struct TerminalApp {
     config: TerminalConfig,
     client: BilibiliClient,
@@ -711,11 +709,10 @@ pub struct TerminalApp {
     show_name: bool,
     show_time: bool,
     account_status: AccountStatus,
-    awaiting_stop_confirmation: bool,
+    stop_flow: Option<StopFlow>,
     login_qr: Option<Vec<String>>,
     secret_mode: bool,
     selection_active: bool,
-    page_event_count: usize,
     quit_requested: bool,
     unread_live_count: u64,
     obs_status: Option<ObsStatus>,
@@ -978,11 +975,10 @@ impl TerminalApp {
             delivery_status: DeliveryStatus::Idle,
             delivery_status_deadline: None,
             account_status,
-            awaiting_stop_confirmation: false,
+            stop_flow: None,
             login_qr: None,
             secret_mode: false,
             selection_active: false,
-            page_event_count: 1,
             quit_requested: false,
             unread_live_count: 0,
             obs_status: None,
@@ -1089,6 +1085,7 @@ impl TerminalApp {
                 _ = tick.tick() => {
                     app.animation_tick = app.animation_tick.wrapping_add(1);
                     app.expire_notice_at(Instant::now());
+                    app.advance_stop_at(Instant::now(), &ui_tx);
                 },
                 event = events.next() => if let Some(Ok(event)) = event {
                     match event {
@@ -1156,6 +1153,14 @@ impl TerminalApp {
 
     fn handle_ui_event(&mut self, event: UiEvent) {
         match event {
+            UiEvent::ObsStopDone(result) => {
+                self.stop_flow = None;
+                self.handle_ui_event(operation_notice(
+                    result
+                        .map(|()| "OBS 已停止推流".to_owned())
+                        .map_err(anyhow::Error::msg),
+                ));
+            }
             UiEvent::Notice { message, level } => {
                 self.set_notice(message, level);
                 self.login_qr = None;
@@ -1427,41 +1432,44 @@ impl TerminalApp {
 
     fn handle_mouse(&mut self, event: MouseEvent) {
         match event.kind {
-            MouseEventKind::ScrollUp => self.scroll_page(true),
-            MouseEventKind::ScrollDown => self.scroll_page(false),
+            MouseEventKind::ScrollUp => self.scroll_history(true),
+            MouseEventKind::ScrollDown => self.scroll_history(false),
             _ => {}
         }
     }
 
-    fn scroll_page(&mut self, older: bool) {
-        let candidates = self
+    fn scroll_history(&mut self, older: bool) {
+        let mut candidates = self
             .session
             .recent_events
             .iter()
             .enumerate()
             .filter(|(_, event)| event.kind.activity_lifetime().is_none())
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
+            .map(|(index, _)| index);
+        let Some(newest) = candidates.next() else {
             self.return_to_live();
             return;
-        }
-        self.selection_active = false;
-        self.selected = 0;
-        let position = candidates
-            .iter()
-            .position(|index| *index == self.scroll_offset)
-            .unwrap_or(0);
-        let page = self.page_event_count.max(1);
-        let next = if older {
-            (position + page).min(candidates.len() - 1)
-        } else {
-            position.saturating_sub(page)
         };
-        if next == 0 {
+        let anchor = if self.selection_active {
+            self.selected
+        } else {
+            self.scroll_offset
+        }
+        .max(newest);
+        let next = if older {
+            candidates.find(|index| *index > anchor).unwrap_or(anchor)
+        } else {
+            candidates
+                .rev()
+                .find(|index| *index < anchor)
+                .unwrap_or(newest)
+        };
+        if next == newest {
             self.return_to_live();
         } else {
-            self.scroll_offset = candidates[next];
+            self.selection_active = false;
+            self.selected = 0;
+            self.scroll_offset = next;
         }
     }
 
@@ -1517,12 +1525,61 @@ impl TerminalApp {
         SlashKeyAction::Ignored
     }
 
+    fn handle_stop_key(&mut self, key: KeyCode, now: Instant) {
+        match self.stop_flow {
+            Some(StopFlow::Confirm { stop_selected }) => match key {
+                KeyCode::Up | KeyCode::Left => {
+                    self.stop_flow = Some(StopFlow::Confirm {
+                        stop_selected: true,
+                    });
+                }
+                KeyCode::Down | KeyCode::Right => {
+                    self.stop_flow = Some(StopFlow::Confirm {
+                        stop_selected: false,
+                    });
+                }
+                KeyCode::Enter if stop_selected => {
+                    self.stop_flow = Some(StopFlow::Countdown {
+                        deadline: now + Duration::from_secs(3),
+                    });
+                }
+                KeyCode::Enter | KeyCode::Esc => self.cancel_stop(),
+                _ => {}
+            },
+            Some(StopFlow::Countdown { .. }) if key == KeyCode::Esc => self.cancel_stop(),
+            _ => {}
+        }
+    }
+
+    fn cancel_stop(&mut self) {
+        self.stop_flow = None;
+        self.set_notice("已取消停止推流", NoticeLevel::Info);
+    }
+
+    fn advance_stop_at(&mut self, now: Instant, tx: &mpsc::Sender<UiEvent>) {
+        if !matches!(self.stop_flow, Some(StopFlow::Countdown { deadline }) if now >= deadline) {
+            return;
+        }
+        // Leave Countdown before spawning: later ticks must never send a second stop.
+        self.stop_flow = Some(StopFlow::Stopping);
+        let obs = self.obs.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let result = obs.stop_stream().await.map_err(|error| error.to_string());
+            let _ = tx.send(UiEvent::ObsStopDone(result)).await;
+        });
+    }
+
     async fn handle_key(&mut self, key: KeyEvent, tx: mpsc::Sender<UiEvent>) -> Result<bool> {
         if key.kind != crossterm::event::KeyEventKind::Press {
             return Ok(false);
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(true);
+        }
+        if self.stop_flow.is_some() {
+            self.handle_stop_key(key.code, Instant::now());
+            return Ok(false);
         }
         match self.handle_slash_key(&key) {
             SlashKeyAction::Ignored => {}
@@ -1955,30 +2012,11 @@ impl TerminalApp {
                 });
             }
             ["/obs", "stop"] => {
-                self.awaiting_stop_confirmation = true;
-                self.set_notice(
-                    "停止推流有中断直播风险；再次输入 /obs confirm",
-                    NoticeLevel::Warning,
-                );
-            }
-            ["/obs", "confirm"] if self.awaiting_stop_confirmation => {
-                self.awaiting_stop_confirmation = false;
-                self.set_notice("正在停止 OBS 推流…", NoticeLevel::Progress);
-                let obs = self.obs.clone();
-                tokio::spawn(async move {
-                    let result = obs
-                        .stop_stream()
-                        .await
-                        .map(|_| "OBS 已停止推流".to_string());
-                    let _ = tx.send(operation_notice(result)).await;
-                });
-            }
-            ["/obs", "confirm"] => {
-                self.set_notice("当前没有待确认的停止推流操作", NoticeLevel::Info);
-            }
-            ["/obs", "cancel"] => {
-                self.awaiting_stop_confirmation = false;
-                self.set_notice("已取消停止推流", NoticeLevel::Success);
+                if self.stop_flow.is_none() {
+                    self.stop_flow = Some(StopFlow::Confirm {
+                        stop_selected: false,
+                    });
+                }
             }
             _ => self.set_notice(
                 format!("未知命令：{raw}；输入 /help 查看命令"),
@@ -2408,6 +2446,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
         if let Some(lines) = &app.login_qr {
             draw_qr(frame, area, lines, palette);
         }
+        draw_stop_flow(frame, area, app, palette);
         return;
     }
     let status_lines = technical_status_lines(app, palette, area.width);
@@ -2442,6 +2481,87 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
     if let Some(lines) = &app.login_qr {
         draw_qr(frame, area, lines, palette);
     }
+    draw_stop_flow(frame, area, app, palette);
+}
+
+fn draw_stop_flow(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette: Palette) {
+    let Some(flow) = app.stop_flow else { return };
+    let width = area.width.min(58);
+    let height = area.height.min(8);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let base = Style::default().bg(palette.background).fg(palette.content);
+    let selected = Style::default()
+        .bg(palette.frame)
+        .fg(palette.content)
+        .add_modifier(Modifier::BOLD);
+    let mut lines = match flow {
+        StopFlow::Confirm { stop_selected } => vec![
+            Line::from("停止 OBS 推流将中断直播。"),
+            Line::from("确认后倒计时 3 秒，期间可按 Esc 返回。"),
+            Line::from(""),
+            Line::styled(
+                if stop_selected {
+                    "› 确认"
+                } else {
+                    "  确认"
+                },
+                if stop_selected { selected } else { base },
+            ),
+            Line::styled(
+                if stop_selected {
+                    "  返回"
+                } else {
+                    "› 返回"
+                },
+                if stop_selected { base } else { selected },
+            ),
+            Line::styled(
+                "↑/↓ 选择 · Enter 继续 · Esc 返回",
+                Style::default().fg(palette.time),
+            ),
+        ],
+        StopFlow::Countdown { deadline } => {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs_f64()
+                .ceil() as u64;
+            vec![
+                Line::styled(
+                    format!("{} 秒后停止推流", remaining.max(1)),
+                    Style::default()
+                        .fg(palette.warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Line::from("Esc 返回，取消本次停播"),
+            ]
+        }
+        StopFlow::Stopping => vec![
+            Line::from("正在停止 OBS 推流…"),
+            Line::from("正在等待 OBS 响应"),
+        ],
+    };
+    // Keep both choices visible when the terminal cannot fit the full explanation.
+    if (width < 58 || height < 8) && matches!(flow, StopFlow::Confirm { .. }) {
+        lines.drain(..3);
+    }
+    let block = if height < 6 {
+        Block::default()
+    } else {
+        rounded_block(" 停止推流 ", palette)
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(base)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 fn draw_command_palette(
@@ -2684,7 +2804,7 @@ fn secondary_status_line(
     width: u16,
 ) -> Line<'static> {
     let obs_connected = app.obs_error.is_none() && app.obs_status.is_some();
-    let obs_indicator = if obs_connected { "<->" } else { "> <" };
+    let obs_indicator = "●";
     let obs_color = if obs_connected {
         STATUS_GREEN
     } else {
@@ -2809,27 +2929,9 @@ fn draw_events(
         ));
     }
     let inner = block.inner(area);
-    let event_texts = displayed_events
+    let items = displayed_events
         .into_iter()
-        .map(|event| event_lines(event, app, palette, inner.width))
-        .collect::<Vec<_>>();
-    let mut remaining_height = usize::from(inner.height);
-    let mut visible_events = 0;
-    for text in event_texts.iter().rev() {
-        let height = text.height();
-        if visible_events > 0 && height > remaining_height {
-            break;
-        }
-        remaining_height = remaining_height.saturating_sub(height);
-        visible_events += 1;
-        if remaining_height == 0 {
-            break;
-        }
-    }
-    app.page_event_count = visible_events.max(1);
-    let items = event_texts
-        .into_iter()
-        .map(ListItem::new)
+        .map(|event| ListItem::new(event_lines(event, app, palette, inner.width)))
         .collect::<Vec<_>>();
 
     let scroll_target = browse_target.or_else(|| (!items.is_empty()).then(|| items.len() - 1));
@@ -3277,12 +3379,9 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette
             )]),
             Line::default(),
         )
-    } else if app.awaiting_stop_confirmation {
+    } else if app.stop_flow.is_some() {
         (
-            powerline_title(vec![(
-                "停止推流确认 · /obs confirm 或 /obs cancel".into(),
-                palette.warning,
-            )]),
+            powerline_title(vec![("停止推流 · 请在弹窗中操作".into(), palette.warning)]),
             Line::default(),
         )
     } else {
@@ -3292,14 +3391,13 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette
         )
     };
 
-    let meter_context =
-        if !app.secret_mode && !app.awaiting_stop_confirmation && app.obs_error.is_none() {
-            app.obs_status
-                .as_ref()
-                .map(|status| (status.microphone, app.microphone_level))
-        } else {
-            None
-        };
+    let meter_context = if !app.secret_mode && !app.stop_flow.is_some() && app.obs_error.is_none() {
+        app.obs_status
+            .as_ref()
+            .map(|status| (status.microphone, app.microphone_level))
+    } else {
+        None
+    };
 
     let visible = visible_input(app);
     if area.width < 6 {
@@ -3315,6 +3413,9 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette
             .take(app.input.cursor())
             .collect::<String>();
         let width = UnicodeWidthStr::width(before.as_str()) as u16;
+        if app.stop_flow.is_some() {
+            return;
+        }
         frame.set_cursor_position((
             area.x + 3 + width.min(area.width.saturating_sub(4)),
             area.y + 1,
@@ -3350,6 +3451,9 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette
         }
     }
     frame.render_widget(Paragraph::new(lines), area);
+    if app.stop_flow.is_some() {
+        return;
+    }
     frame.set_cursor_position((
         area.x + 3 + u16::try_from(cursor_column).unwrap_or(u16::MAX),
         area.y + 1 + u16::try_from(cursor_row.saturating_sub(viewport_start)).unwrap_or(0),
@@ -3538,11 +3642,10 @@ mod tests {
             show_name: true,
             show_time: false,
             account_status: AccountStatus::SignedOut,
-            awaiting_stop_confirmation: false,
+            stop_flow: None,
             login_qr: None,
             secret_mode: false,
             selection_active: false,
-            page_event_count: 1,
             quit_requested: false,
             unread_live_count: 0,
             obs_status: None,
@@ -3556,6 +3659,172 @@ mod tests {
             last_live_danmu_at: None,
             animation_tick: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn stop_flow_requires_selection_and_supports_cancelling_countdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        let (tx, _rx) = mpsc::channel(8);
+        let now = Instant::now();
+        app.command("/obs stop", tx.clone()).await.unwrap();
+        assert!(
+            !app.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                tx.clone()
+            )
+            .await
+            .unwrap()
+        );
+        app.advance_stop_at(now + Duration::from_secs(10), &tx);
+        assert!(app.stop_flow.is_none());
+
+        app.command("/obs stop", tx.clone()).await.unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), tx.clone())
+            .await
+            .unwrap();
+        // Holding Enter must not confirm through a repeat event.
+        app.handle_key(
+            KeyEvent::new_with_kind(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
+            ),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(app.stop_flow, Some(StopFlow::Confirm { .. })));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(app.stop_flow, Some(StopFlow::Countdown { .. })));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(app.input.is_empty());
+        assert!(
+            !app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx.clone())
+                .await
+                .unwrap()
+        );
+        app.advance_stop_at(now + Duration::from_secs(10), &tx);
+        assert!(app.stop_flow.is_none());
+
+        app.command("/obs stop", tx.clone()).await.unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx)
+            .await
+            .unwrap();
+        assert!(
+            app.stop_flow.is_none(),
+            "reopening must reset selection to return"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_flow_sends_one_request_only_after_three_seconds() {
+        use futures_util::SinkExt;
+        use serde_json::{Value, json};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        app.obs = ObsController::new(
+            ObsConfiguration {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                ..ObsConfiguration::default()
+            },
+            temp.path().join("obs.json"),
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        app.command("/obs stop", tx.clone()).await.unwrap();
+        let now = Instant::now();
+        app.handle_stop_key(KeyCode::Up, now);
+        app.handle_stop_key(KeyCode::Enter, now);
+        app.advance_stop_at(now + Duration::from_millis(2999), &tx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(socket).await.unwrap();
+            ws.send(Message::Text(
+                json!({"op": 0, "d": {"obsWebSocketVersion": "5.6.0", "rpcVersion": 1}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let identify: Value =
+                serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(identify["op"], 1);
+            ws.send(Message::Text(
+                json!({"op": 2, "d": {"negotiatedRpcVersion": 1}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let mut stops = 0;
+            while let Ok(message) =
+                tokio::time::timeout(Duration::from_millis(100), ws.next()).await
+            {
+                let request: Value =
+                    serde_json::from_str(message.unwrap().unwrap().to_text().unwrap()).unwrap();
+                let response = match request["d"]["requestType"].as_str().unwrap() {
+                    "GetVersion" => json!({
+                        "obsVersion": "31.0.0", "obsWebSocketVersion": "5.6.0", "rpcVersion": 1,
+                        "availableRequests": [], "supportedImageFormats": [],
+                        "platform": "macos", "platformDescription": "macOS"
+                    }),
+                    "StopStream" => {
+                        stops += 1;
+                        json!({})
+                    }
+                    "GetStreamStatus" => json!({
+                        "outputActive": false, "outputReconnecting": false,
+                        "outputTimecode": "00:00:00.000", "outputDuration": 0,
+                        "outputCongestion": 0.0, "outputBytes": 0,
+                        "outputSkippedFrames": 0, "outputTotalFrames": 0
+                    }),
+                    other => panic!("unexpected OBS request: {other}"),
+                };
+                let mut reply = json!({"op": 7, "d": {
+                    "requestType": request["d"]["requestType"], "requestId": request["d"]["requestId"],
+                    "requestStatus": {"result": true, "code": 100}
+                }});
+                if request["d"]["requestType"] != "StopStream" {
+                    reply["d"]["responseData"] = response;
+                }
+                ws.send(Message::Text(reply.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(stops, 1, "stop must be sent only once");
+        });
+        app.advance_stop_at(now + Duration::from_secs(3), &tx);
+        app.advance_stop_at(now + Duration::from_secs(4), &tx);
+        let result = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, UiEvent::ObsStopDone(Ok(()))), "{result:?}");
+        app.handle_ui_event(result);
+        assert!(app.stop_flow.is_none());
+        assert!(!app.quit_requested);
+        server.await.unwrap();
     }
 
     #[test]
@@ -4069,7 +4338,7 @@ mod tests {
             .unwrap();
         let details_row = normalized
             .iter()
-            .position(|line| line.contains("OBS<->"))
+            .position(|line| line.contains("OBS"))
             .unwrap();
         let business_row = normalized
             .iter()
@@ -4085,7 +4354,6 @@ mod tests {
         assert!(live.contains("◷"));
         assert!(!live.contains("@停车拾穗"));
         assert!(details.contains("@停车拾穗"));
-        assert!(details.contains("OBS<->"));
         assert!(details.contains("MIC◉"));
         assert!(!details.contains("知识"));
         assert!(!details.contains("测试直播标题"));
@@ -4132,19 +4400,13 @@ mod tests {
             .unwrap();
         assert_eq!(title_span.style.fg, Some(app.config.palette.rank));
         assert_eq!(title_span.style.bg, None);
-        assert!(
-            technical_lines[1]
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-                .ends_with("OBS <->  MIC ◉")
-        );
-        let obs_indicator = technical_lines[1]
+        assert_eq!(line_display_width(&technical_lines[1]), 120);
+        let obs_indicator = &technical_lines[1]
             .spans
-            .iter()
-            .find(|span| span.content == "<->")
-            .unwrap();
+            .windows(2)
+            .find(|pair| pair[0].content == "OBS ")
+            .unwrap()[1];
+        assert_eq!(obs_indicator.content.chars().count(), 1);
         assert_eq!(obs_indicator.style.fg, Some(STATUS_GREEN));
         assert_eq!(obs_indicator.style.bg, None);
         let mic_indicator = technical_lines[1]
@@ -4156,11 +4418,12 @@ mod tests {
         assert_eq!(mic_indicator.style.bg, None);
         app.handle_ui_event(UiEvent::ObsStatus(Err("offline".into())));
         let disconnected_lines = technical_status_lines(&app, app.config.palette, 120);
-        let disconnected_obs = disconnected_lines[1]
+        let disconnected_obs = &disconnected_lines[1]
             .spans
-            .iter()
-            .find(|span| span.content == "> <")
-            .unwrap();
+            .windows(2)
+            .find(|pair| pair[0].content == "OBS ")
+            .unwrap()[1];
+        assert_eq!(disconnected_obs.content, obs_indicator.content);
         assert_eq!(disconnected_obs.style.fg, Some(STATUS_RED));
         assert_eq!(disconnected_obs.style.bg, None);
         let muted_mic = disconnected_lines[1]
@@ -4330,7 +4593,7 @@ mod tests {
     }
 
     #[test]
-    fn history_paging_skips_activity_even_after_it_expires() {
+    fn history_scrolling_skips_activity_even_after_it_expires() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let now = Utc::now();
@@ -4342,20 +4605,19 @@ mod tests {
             activity.timestamp = now - chrono::Duration::seconds(29 - index * 2);
             app.ingest_event(activity);
         }
-        app.page_event_count = 3;
         for (older, expected) in [
-            (true, "message-6"),
-            (true, "message-3"),
-            (false, "message-6"),
+            (true, "message-8"),
+            (true, "message-7"),
+            (false, "message-8"),
         ] {
-            app.scroll_page(older);
+            app.scroll_history(older);
             assert_eq!(
                 app.session.recent_events[app.scroll_offset].content,
                 expected
             );
         }
         app.unread_live_count = 2;
-        app.scroll_page(false);
+        app.scroll_history(false);
         assert_eq!(app.scroll_offset, 0);
         assert_eq!(app.unread_live_count, 0);
     }
@@ -5087,7 +5349,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_pages_history_without_selecting_a_reply_target() {
+    fn mouse_wheel_scrolls_one_message_without_selecting_a_reply_target() {
         let temp = tempfile::tempdir().unwrap();
         let mut session = DanmuSession::new("1");
         for index in 0..8 {
@@ -5096,7 +5358,6 @@ mod tests {
             session.ingest(event);
         }
         let mut app = test_app(&temp, session);
-        app.page_event_count = 3;
         let wheel_up = MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: 0,
@@ -5109,11 +5370,44 @@ mod tests {
         };
 
         app.handle_mouse(wheel_up);
-        assert_eq!(app.scroll_offset, 3);
+        assert_eq!(
+            app.session.recent_events[app.scroll_offset].content,
+            "消息 6"
+        );
         assert!(!app.selection_active);
         app.handle_mouse(wheel_down);
         assert_eq!(app.scroll_offset, 0);
         assert!(!app.selection_active);
+
+        app.selection_active = true;
+        app.selected = 3;
+        app.handle_mouse(wheel_up);
+        assert_eq!(
+            app.session.recent_events[app.scroll_offset].content,
+            "消息 3"
+        );
+        assert!(!app.selection_active);
+        let mut arrival = DanmuEvent::new(DanmuEventKind::Danmu, "新到达的消息");
+        arrival.timestamp = Utc::now() + chrono::Duration::seconds(1);
+        app.ingest_event(arrival);
+        assert_eq!(
+            app.session.recent_events[app.scroll_offset].content,
+            "消息 3"
+        );
+        assert_eq!(app.unread_live_count, 1);
+
+        for _ in 0..20 {
+            app.handle_mouse(wheel_up);
+        }
+        assert_eq!(
+            app.session.recent_events[app.scroll_offset].content,
+            "消息 0"
+        );
+        for _ in 0..20 {
+            app.handle_mouse(wheel_down);
+        }
+        assert_eq!(app.scroll_offset, 0);
+        assert_eq!(app.unread_live_count, 0);
     }
 
     #[test]

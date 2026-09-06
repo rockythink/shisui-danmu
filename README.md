@@ -35,13 +35,21 @@
 
 它不是播放器，也不是另一套 OBS。它只解决直播时最容易失控的那一段：**看见互动、辨认问题、快速回应、保留现场。**
 
-## v0.4.3 更新：互动可读，正文不动
+## v0.4.4 更新：历史逐条滚动，停播连续确认
 
-- **进场、点赞不再挤动正文**：临时提示移到弹幕框底边，并与普通消息分开计算缓存限额；通知隐藏后不会留下被挤掉的历史弹幕缺口。
-- **名字留得住**：提示至少稳定展示 2 秒，同批合并姓名，进场优先；空间足够时附加点赞姓名摘要，重复互动只按可靠用户 ID 合并，不把同名观众混为一人。
-- **不积压点名队列**：只保留当前批次与下一批摘要，过期和已替换提示不补播；支持窄屏姓名适配与关闭姓名显示，历史浏览和回复选择保持稳定。
+- **历史不再整页跳动**：每个滚轮事件移动一条消息；从回复选择接续当前位置，新消息到达时保留阅读锚点，`End` 返回实时。
+- **OBS 状态更明确**：连接状态统一为单个 `●`，绿色表示已连接，红色表示未连接。
+- **停播连续确认**：`/obs stop` 打开弹窗，默认选中“返回”；方向键确认后显示 3 秒倒计时，Esc 可取消，不再输入 `/obs confirm` 或 `/obs cancel`。
 
-完整说明与安装包见 [v0.4.3 Release](https://github.com/rockythink/shisui-danmu/releases/tag/v0.4.3)。更新后重新启动 TUI。
+完整说明与安装包见 [v0.4.4 Release](https://github.com/rockythink/shisui-danmu/releases/tag/v0.4.4)。更新后重新启动 TUI。
+
+### v0.4.3：互动可读，正文不动
+
+- 进场、点赞移到弹幕框底边，不挤动正文，也不占用弹幕历史缓存。
+- 提示姓名至少稳定展示 2 秒，同批合并，进场优先；重复互动仅按可靠用户 ID 合并。
+- 只保留当前批次与下一批摘要，不积压点名队列；历史浏览和回复选择保持稳定。
+
+历史说明见 [v0.4.3 Release](https://github.com/rockythink/shisui-danmu/releases/tag/v0.4.3)。
 
 ## 真实运行录屏
 
@@ -164,7 +172,7 @@ danmu --logout
 | --- | --- |
 | 打开命令面板 | `/` |
 | 切换信息流 / 聊天布局 | `Tab` |
-| 浏览历史 | 鼠标滚轮 |
+| 浏览历史 | 鼠标滚轮，每次移动一条消息，不整页跳动 |
 | 回到最新消息 | `End` |
 | 选择回复对象 | `Shift+↑/↓` |
 | 插入 `@用户名` | 选择后按 `Enter` |
@@ -191,8 +199,7 @@ danmu --logout
 | `/obs config mic [名称]` | 列出或选择单路麦克风输入 |
 | `/obs start` | 开始推流 |
 | `/obs config password` | 隐藏输入并更新 TUI 私有 OBS 密码文件 |
-| `/obs stop` | 请求停止推流；必须再执行 `/obs confirm` |
-| `/obs cancel` | 取消待确认的停止推流操作 |
+| `/obs stop` | 打开停播确认弹窗，默认选中“返回”；按 ↑ 选中“确认”并按 Enter，倒计时 3 秒后停止推流；确认与倒计时期间可按 Esc 返回 |
 | `/quit` | 安全退出并写入会话状态 |
 
 ## OBS 接入
@@ -356,7 +363,7 @@ GitHub Actions 在 macOS、Linux、Windows 上执行对应 Rust 门禁。提交�
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rockythink/shisui-danmu/main/script/install_release.sh | \
-  DANMU_VERSION=v0.4.3 DANMU_INSTALL_DIR="$HOME/bin" bash
+  DANMU_VERSION=v0.4.4 DANMU_INSTALL_DIR="$HOME/bin" bash
 ```
 
 卸载：

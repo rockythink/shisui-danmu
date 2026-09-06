@@ -18,7 +18,7 @@ Rust `obs` Adapter 通过 `obws` 直接连接 OBS WebSocket v5。GUI 与 TUI 保
 - 密码写入 DANMU 独立的 `obs-password` 文件，Unix 权限固定为 `0600`，不进入系统凭据存储、非敏感配置、命令参数、日志或 Journal；`OBS_API_PASSWORD` 可临时覆盖；`danmu --configure-obs` 和 TUI 的 `/obs config password` 均使用隐藏输入。
 - 连接在进程内复用并串行创建；修改操作完成后重新读取 OBS 真相确认。
 - 高频音量事件聚合为 10 Hz；电平限制在 -60 至 0 dBFS，采用快速上升、平滑回落。
-- 停止推流必须二次确认；TUI 使用 `/obs stop` 后再输入 `/obs confirm`。
+- 停止推流必须二次确认；TUI 使用 `/obs stop` 打开交互弹窗，默认选中“返回”，必须通过方向键选中“确认”并按 Enter；倒计时 3 秒后才发送停止推流请求，倒计时期间 Esc 可取消。停播不退出 TUI、不结束弹幕会话；请求发出后等待 OBS 状态确认，失败则展示错误并恢复输入。
 - 开播不自动取消麦克风静音。
 
 ## 依赖与许可证
