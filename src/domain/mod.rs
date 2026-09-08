@@ -114,6 +114,9 @@ pub struct DanmuEvent {
     pub username: Option<String>,
     pub author_id: Option<String>,
     pub content: String,
+    /// Display name of the user being replied to, separate from the original body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
     #[serde(default)]
     pub origin: DanmuEventOrigin,
     pub platform_event_id: Option<String>,
@@ -132,6 +135,7 @@ impl DanmuEvent {
             username: None,
             author_id: None,
             content: content.into(),
+            reply_to: None,
             origin: DanmuEventOrigin::Live,
             platform_event_id: None,
             emotes: Vec::new(),
@@ -503,6 +507,7 @@ mod tests {
             username: Some("viewer".into()),
             author_id: Some("1".into()),
             content: content.into(),
+            reply_to: None,
             origin: DanmuEventOrigin::Live,
             platform_event_id: None,
             emotes: Vec::new(),

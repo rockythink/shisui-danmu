@@ -35,6 +35,13 @@
 
 它不是播放器，也不是另一套 OBS。它只解决直播时最容易失控的那一段：**看见互动、辨认问题、快速回应、保留现场。**
 
+## main 待人工核验：应用内AI候选回复（尚未发布）
+
+- 首次关闭AI总开关且使用建议模式。TUI内可发起独立ChatGPT订阅登录、选择账号可用文本模型及该模型支持的思考强度；保留独立API-key接入，不自动付费回退。
+- 人工弹幕按40个Unicode字素分段；AI每段的`✦`及昵称也计入40，必要时最多三段。上一段确认回流后才发下一段，不确定或失败立即停止。
+- 新事件异步生成，统一发送队列；场次消息持久去重、主播抢答/草稿/弹窗/换场/下播取消，频率与预算受限，搜索独立配置。
+- 已执行本地协议回归、无账号隔离运行时握手及无网络TUI回放。真实ChatGPT登录、订阅权益/推理和外部搜索仍需用户验证；不要把本节当已发布功能或所有账号可用的保证。
+
 ## v0.4.5 更新：历史浏览状态与返回方式
 
 - 历史模式使用高对比底色提示和醒目边框，持续显示返回按键、新消息数量与可选倒计时。
@@ -260,6 +267,53 @@ history_idle_seconds = 0 # 0：仅手动返回；例如 60：空闲 60 秒后自
 ```
 
 CLI 参数优先于 TOML。可通过 `--config <路径>` 使用指定配置文件。
+
+### AI连接与回复设置
+
+在输入栏执行 `/ai settings` 打开设置面板，Esc关闭，PageUp/PageDown滚动。账号授权与B站登录完全分离。
+
+| 操作 | TUI命令 |
+| --- | --- |
+| 官方ChatGPT订阅登录 | `/ai login`（打开官方浏览器授权；180秒超时） |
+| 取消登录／退出账号 | `/ai cancel-login` / `/ai logout` |
+| 恢复账号状态／刷新模型 | `/ai status` / `/ai models` |
+| 选择连接 | `/ai provider chatgpt` / `/ai provider api`，切换后总开关关闭 |
+| 选择实际模型 | `/ai model <列表中的模型ID>` |
+| 设置实际支持的思考强度 | `/ai effort <该模型列出的值>`；模型变更会校验并显示适用默认值 |
+| 独立启停 | `/ai enable` / `/ai disable`，启用不会改成自动模式 |
+| 三种模式 | `/ai suggest` / `/ai approve-mode` / `/ai auto` |
+| 批准／丢弃／立即暂停 | F7 / F8 / Ctrl-P，或 `/ai approve` / `/ai discard` / `/ai pause` |
+| 安全暂停后恢复发送队列 | `/ai resume-send`，回到建议模式，不自动启用总开关 |
+
+建议模式只展示候选；人工批准模式允许F7发送；自动模式只发送通过本地规则确认的低风险互动，模型生成的技术回答仍需人工核验。草稿、设置或其他弹窗优先于候选发送。关闭总开关会取消生成/检索与尚未提交的自动发送；已经交给平台的请求不会假称撤回，继续记录结果。
+
+**订阅运行时**：目前固定支持官方 `codex-cli 0.147.0`（app-server仍属实验协议）。应用检查版本，不安装或更新Codex，不维护fork。先自行确认 `codex --version`。TUI通过stdio启动专用进程；认证、配置及会话位于应用配置目录的`codex-subscription/`，不读取其他Agent的auth文件或环境密钥，不使用系统钥匙串。登录URL来自官方managed login；只有完成通知加account/read确认才算成功。官方OAuth的本机回调由Codex管理，应用不开放app-server网络监听端口。
+
+安全边界由固定版本的空执行环境`environments: []`、禁用shell/多智能体/插件/应用/hooks/代码模式/图片工具/内置搜索、空动态工具与能力根、独立空工作目录共同约束；运行时返回配置须匹配，任何工具请求或执行事件均拒绝并终止。不是仅靠提示词、只读sandbox或approval never。参考[官方app-server](https://developers.openai.com/codex/app-server)及[认证说明](https://developers.openai.com/codex/auth)。账号只使用其合法Codex权益，不等于通用Platform API余额或所有ChatGPT模型权限；权益/过期/限额异常暂停，不换账号、不回退API。面板只显示服务端已报告的额度和重置时间，未报告即未知。
+
+设置原子保存到当前`--config`文件或默认`config.toml`，保留其他TOML字段。首次配置等价于：
+
+```toml
+[autoreply]
+enabled = false
+provider = "chatgpt"
+mode = "suggest"
+```
+
+API模式保留`[autoreply.model]`的`id`、`endpoint.url`（完整OpenAI-compatible chat completions HTTPS端点）、`endpoint.key_env`（显式`DANMU_`专用环境变量名）及可选`request_cost_ceiling`。端点与密钥须由使用者自行核实；Luna仅早期候选，不是必需依赖。密钥值不得写入仓库。API适配器未声明reasoning参数支持时，`/ai effort`明确拒绝，不假装生效。
+
+受控搜索单独配置`[autoreply.search]`：公共HTTPS服务端点及专用凭据、官方域名列表`official_domains`、批准的`topics`（每项含`id`与公共`query`）。模型只能选择主题ID，不能生成URL或任意查询。服务接收`query/limit/timezone/prefer_domains`，返回`conflict`和最多4项`sources`；每项含`title/url/excerpt/published_at/retrieved_at`，时间须带时区。禁止直访观众链接、本机/内网/文件URL、重定向及DNS重绑定；网页始终不可信，来源不足、冲突或过期留主播。未配置搜索不阻塞订阅登录及本地互动。
+
+每场默认最多12次模型请求、3次搜索；并发1，单人60秒、全局10秒，候选45秒过期。输入/输出、传输大小/耗时与缓存TTL受限；`request_token_ceiling`与`token_budget`是保守预留及观测停止阈值，订阅服务并无本客户端可设置的硬生成token上限，回报可能滞后，不能保证实际用量绝不超过预留。取消不返还未知消耗；如设置货币预算却没有可核算请求上界，则暂停而非报0元。订阅不虚报精确货币费用。
+
+无网络回放（不读取B站账号/OBS/默认配置，不连接直播，不发送公开弹幕）：
+
+```bash
+cargo run --locked -- --replay tests/fixtures/autoreply-safe.json
+cargo run --locked -- --replay tests/fixtures/ai-settings-off.json
+```
+
+本轮只交付main供用户自行拉取、构建、安装和人工核验；不生成tag/release。真实浏览器登录、订阅候选推理、账号模型可用性及外部搜索尚未由维护者执行。
 
 ### 历史浏览与实时跟随
 

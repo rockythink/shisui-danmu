@@ -1,17 +1,24 @@
 mod activity;
+mod ai_settings;
 mod input;
 mod meter;
 mod qr;
+mod replay;
+pub use replay::run as replay;
+mod send;
+use send::TerminalTransport;
 
 pub use qr::qr_lines;
 
 use crate::{
+    autoreply::{self, Mode as ReplyMode, State as ReplyState},
     bilibili::{
         AccountClient, AccountStatus, BilibiliClient, BilibiliClientEvent, LoginPoll,
         RoomLiveStatus, RoomSnapshot, cross_origin_duplicate, kind_label, masked_name_matches,
         normalized_message, segment_message, usable_author_id,
     },
     config::TerminalConfig,
+    delivery::{Outcome, SendQueue, Transport},
     domain::{DanmuEvent, DanmuEventKind, DanmuEventOrigin, DanmuSession, DanmuSessionEndReason},
     obs::{MicrophoneLevel, MicrophoneState, ObsController, ObsStatus},
     persistence::SessionJournal,
@@ -44,13 +51,12 @@ use std::{
     collections::VecDeque,
     io::{self, Stdout},
     path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-const SEND_QUEUE_INTERVAL: Duration = Duration::from_secs(2);
+
 const DELIVERY_NOTICE_LIFETIME: Duration = Duration::from_secs(15);
 const STARTUP_MIN_DURATION: Duration = Duration::from_secs(2);
 
@@ -322,6 +328,12 @@ async fn load_startup_data(
 
 #[derive(Debug)]
 enum UiEvent {
+    AiSettings(ai_settings::Event),
+    ReplyDelivery {
+        key: String,
+        state: ReplyState,
+    },
+    DeliveryAccepted,
     Notice {
         message: String,
         level: NoticeLevel,
@@ -339,11 +351,6 @@ enum UiEvent {
     },
     DeliveryHistory {
         events: Vec<DanmuEvent>,
-    },
-    DeliveryFailed {
-        delivery_ids: Vec<String>,
-        content: String,
-        message: String,
     },
     DeliveryTimedOut {
         delivery_ids: Vec<String>,
@@ -527,6 +534,11 @@ enum SlashKeyAction {
 
 const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
+        completion: "/ai",
+        usage: "/ai settings · login/models/model/effort · enable/disable · 三模式",
+        description: "候选模式、批准、丢弃与立即暂停",
+    },
+    CommandSpec {
         completion: "/help",
         usage: "/help",
         description: "显示命令面板操作提示",
@@ -691,7 +703,10 @@ pub struct TerminalApp {
     config: TerminalConfig,
     client: BilibiliClient,
     account: AccountClient,
-    send_queue: Arc<tokio::sync::Mutex<()>>,
+    send_queue: SendQueue,
+    autoreply: Option<autoreply::Handle>,
+    ai_settings: ai_settings::Settings,
+    reply_panel: bool,
     obs: ObsController,
     journal: SessionJournal,
     session: DanmuSession,
@@ -955,13 +970,20 @@ impl TerminalApp {
         journal.start(&session)?;
         let room_updated_at = room.as_ref().map(|_| Local::now());
         let mut app = Self {
+            ai_settings: ai_settings::Settings::default(),
+            autoreply: Some(autoreply::Handle::start(
+                config.autoreply.clone(),
+                journal.clone(),
+                session.id.clone(),
+            )),
+            reply_panel: true,
             layout_chat: config.chat_layout,
             show_name: config.show_name,
             show_time: config.show_time,
             config,
             client: client.clone(),
             account,
-            send_queue: Arc::new(tokio::sync::Mutex::new(())),
+            send_queue: SendQueue::default(),
             obs,
             journal,
             session,
@@ -1087,6 +1109,7 @@ impl TerminalApp {
         let mut should_quit = false;
 
         while !should_quit {
+            app.advance_autoreply(ui_tx.clone()).await;
             terminal.terminal.draw(|frame| draw(frame, &mut app))?;
             tokio::select! {
                 _ = tick.tick() => {
@@ -1110,6 +1133,9 @@ impl TerminalApp {
                     app.microphone_level = *meter_rx.borrow_and_update();
                 },
             }
+        }
+        if let Some(reply) = app.autoreply.as_mut() {
+            reply.mode(ReplyMode::Paused);
         }
         let _ = stop_tx.send(true);
         app.session
@@ -1161,6 +1187,20 @@ impl TerminalApp {
 
     fn handle_ui_event(&mut self, event: UiEvent) {
         match event {
+            UiEvent::AiSettings(event) => {
+                if self.ai_settings.apply(event)
+                    && self.config.autoreply.provider == autoreply::Provider::Chatgpt
+                    && let Some(reply) = self.autoreply.as_mut()
+                {
+                    reply.mode(ReplyMode::Paused);
+                }
+            }
+            UiEvent::ReplyDelivery { key, state } => {
+                if let Some(reply) = self.autoreply.as_mut() {
+                    reply.delivery(key, state);
+                }
+            }
+            UiEvent::DeliveryAccepted => self.set_delivery_status(DeliveryStatus::AwaitingEcho),
             UiEvent::ObsStopDone(result) => {
                 self.stop_flow = None;
                 self.handle_ui_event(operation_notice(
@@ -1228,7 +1268,7 @@ impl TerminalApp {
                     delivery,
                     confirmation: Some(confirmation),
                 });
-                self.set_delivery_status(DeliveryStatus::AwaitingEcho);
+                self.set_delivery_status(DeliveryStatus::Sending);
             }
             UiEvent::DeliveryHistory { events } => {
                 for event in events {
@@ -1237,17 +1277,6 @@ impl TerminalApp {
                 if !self.pending_deliveries.is_empty() {
                     self.set_delivery_status(DeliveryStatus::Verifying);
                 }
-            }
-            UiEvent::DeliveryFailed {
-                delivery_ids,
-                content,
-                message,
-            } => {
-                for delivery_id in delivery_ids {
-                    self.clear_delivery(&delivery_id);
-                }
-                self.set_delivery_status(DeliveryStatus::Failed);
-                self.set_delivery_notice(format!("{message}；内容：「{content}」"));
             }
             UiEvent::DeliveryTimedOut { delivery_ids } => {
                 let contents = delivery_ids
@@ -1262,17 +1291,15 @@ impl TerminalApp {
                 for delivery_id in delivery_ids {
                     self.clear_delivery(&delivery_id);
                 }
-                if !contents.is_empty() {
-                    self.set_delivery_status(DeliveryStatus::Uncertain);
-                    self.set_delivery_notice(format!(
-                        "未确认送达，已停止提醒；内容：{}",
-                        contents
-                            .iter()
-                            .map(|content| format!("「{content}」"))
-                            .collect::<Vec<_>>()
-                            .join(" ｜ ")
-                    ));
-                }
+                self.set_delivery_status(DeliveryStatus::Uncertain);
+                self.set_delivery_notice(format!(
+                    "平台接受或回流未确认；队列暂停，不自动重发。{}",
+                    contents
+                        .iter()
+                        .map(|content| format!("「{content}」"))
+                        .collect::<Vec<_>>()
+                        .join(" ｜ ")
+                ));
             }
             UiEvent::DeliveryRejected { content, message } => {
                 self.set_delivery_status(DeliveryStatus::Failed);
@@ -1289,6 +1316,23 @@ impl TerminalApp {
     }
 
     fn ingest_event(&mut self, mut event: DanmuEvent) {
+        if let Some(reply) = self.autoreply.as_mut() {
+            let mut input = event.clone();
+            if matches!(&self.account_status, AccountStatus::SignedIn { user_id, .. } if event.author_id.as_ref() == Some(user_id))
+            {
+                input.kind = DanmuEventKind::System;
+                if event.origin == DanmuEventOrigin::Live && !event.content.starts_with('✦') {
+                    reply.discard();
+                }
+            }
+            reply.observe(input);
+        }
+        if event.kind == DanmuEventKind::RoomStatus
+            && event.origin == DanmuEventOrigin::Live
+            && let Some(room) = self.room.as_mut()
+        {
+            room.live_status = RoomLiveStatus::Offline;
+        }
         let live_arrival =
             event.origin == DanmuEventOrigin::Live && event.kind == DanmuEventKind::Danmu;
         let confirmed = self
@@ -1319,12 +1363,8 @@ impl TerminalApp {
             if let Some(confirmation) = active.confirmation.take() {
                 let _ = confirmation.send(());
             }
-            let status = if self.pending_deliveries.is_empty() {
-                DeliveryStatus::Delivered
-            } else {
-                DeliveryStatus::AwaitingEcho
-            };
-            self.set_delivery_status(status);
+            // Echo alone is insufficient: the sending service still checks HTTP acceptance.
+            self.set_delivery_status(DeliveryStatus::Verifying);
         }
 
         if reconcile_cross_origin_event(&mut self.session.recent_events, &event) {
@@ -1602,6 +1642,29 @@ impl TerminalApp {
     }
 
     async fn handle_key(&mut self, key: KeyEvent, tx: mpsc::Sender<UiEvent>) -> Result<bool> {
+        if key.code == KeyCode::F(7) && key.kind == crossterm::event::KeyEventKind::Press {
+            if let Some(reply) = self.autoreply.as_mut() {
+                reply.approve();
+            }
+            return Ok(false);
+        }
+        if key.code == KeyCode::F(8) && key.kind == crossterm::event::KeyEventKind::Press {
+            if let Some(reply) = self.autoreply.as_mut() {
+                reply.discard();
+            }
+            return Ok(false);
+        }
+        if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.send_queue.pause();
+            if let Some(reply) = self.autoreply.as_mut() {
+                reply.mode(ReplyMode::Paused);
+            }
+            self.set_notice(
+                "立即暂停；待发许可已撤销，在途请求仅等待结果",
+                NoticeLevel::Warning,
+            );
+            return Ok(false);
+        }
         if key.kind != crossterm::event::KeyEventKind::Release {
             self.last_user_activity = Instant::now();
         }
@@ -1614,6 +1677,23 @@ impl TerminalApp {
         if self.stop_flow.is_some() {
             self.handle_stop_key(key.code, Instant::now());
             return Ok(false);
+        }
+        if self.ai_settings.open {
+            match key.code {
+                KeyCode::Esc => {
+                    self.ai_settings.open = false;
+                    return Ok(false);
+                }
+                KeyCode::PageDown => {
+                    self.ai_settings.scroll = self.ai_settings.scroll.saturating_add(5);
+                    return Ok(false);
+                }
+                KeyCode::PageUp => {
+                    self.ai_settings.scroll = self.ai_settings.scroll.saturating_sub(5);
+                    return Ok(false);
+                }
+                _ => {}
+            }
         }
         match self.handle_slash_key(&key) {
             SlashKeyAction::Ignored => {}
@@ -1769,98 +1849,117 @@ impl TerminalApp {
         if input.starts_with('/') {
             return self.command(&input, tx).await;
         }
-        let segments = segment_message(&input, 20);
-        if segments.is_empty() {
-            return Ok(());
+        if let Some(reply) = self.autoreply.as_mut() {
+            reply.discard();
         }
-        let submitted_content = input;
-        let account = self.account.clone();
-        let client = self.client.clone();
-        let room = self.config.room_id.clone();
-        let send_queue = self.send_queue.clone();
+        let segments = segment_message(&input, crate::bilibili::SEND_SEGMENT_LIMIT);
+        if !segments.is_empty() {
+            self.enqueue(segments, None, tx);
+        }
+        Ok(())
+    }
+
+    fn enqueue(
+        &mut self,
+        segments: Vec<String>,
+        candidate: Option<autoreply::Candidate>,
+        tx: mpsc::Sender<UiEvent>,
+    ) {
+        let transport = TerminalTransport {
+            account: self.account.clone(),
+            client: self.client.clone(),
+            room: self.config.room_id.clone(),
+            tx: tx.clone(),
+            reply_key: candidate.as_ref().map(|c| c.key.clone()),
+        };
+        let queue = self.send_queue.clone();
+        let generation = queue.generation();
         tokio::spawn(async move {
-            let queue_guard = send_queue.lock().await;
-            let (broadcaster_name, broadcaster_id) = match account.status().await {
-                Ok(AccountStatus::SignedIn {
-                    display_name,
-                    user_id,
-                }) => (display_name, user_id),
-                Ok(AccountStatus::SignedOut) => {
-                    let _ = tx
-                        .send(UiEvent::DeliveryRejected {
-                            content: submitted_content.clone(),
-                            message: "发送失败：还没有 B 站登录态".into(),
-                        })
-                        .await;
-                    return;
-                }
-                Err(error) => {
-                    let _ = tx
-                        .send(UiEvent::DeliveryRejected {
-                            content: submitted_content.clone(),
-                            message: format!("读取 B 站登录态失败：{error}"),
-                        })
-                        .await;
-                    return;
-                }
-            };
-            let mut confirmations = Vec::with_capacity(segments.len());
-            let mut delivery_ids = Vec::with_capacity(segments.len());
-
-            for (index, segment) in segments.iter().enumerate() {
-                let delivery = PendingDelivery::new(
-                    segment.clone(),
-                    broadcaster_name.clone(),
-                    broadcaster_id.clone(),
-                    Utc::now(),
-                );
-                let delivery_id = delivery.id.clone();
-                delivery_ids.push(delivery_id.clone());
-                let (confirmation_tx, confirmation_rx) = oneshot::channel();
-                if tx
-                    .send(UiEvent::DeliveryStarted {
-                        delivery,
-                        confirmation: confirmation_tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                if let Err(error) = account.send_danmu(segment, &room, None).await {
-                    let _ = tx
-                        .send(UiEvent::DeliveryFailed {
-                            delivery_ids,
-                            content: segment.clone(),
-                            message: format!("第 {} 段发送失败：{error}", index + 1),
-                        })
-                        .await;
-                    return;
-                }
-                confirmations.push((delivery_id, confirmation_rx));
-                tokio::time::sleep(SEND_QUEUE_INTERVAL).await;
-            }
-            drop(queue_guard);
-
-            let unresolved =
-                wait_for_delivery_confirmations(&client, &room, &tx, confirmations).await;
-            if unresolved.is_empty() {
-                let _ = tx.send(UiEvent::DeliveryCompleted).await;
+            let outcome = if queue.generation() != generation {
+                Outcome::Cancelled
             } else {
+                queue
+                    .send(&transport, &segments, candidate.as_ref().map(|c| &c.permit))
+                    .await
+            };
+            if let Some(candidate) = candidate {
+                let state = match outcome {
+                    Outcome::Confirmed => ReplyState::Sent,
+                    Outcome::Cancelled => ReplyState::Cancelled,
+                    _ => ReplyState::Uncertain,
+                };
                 let _ = tx
-                    .send(UiEvent::DeliveryTimedOut {
-                        delivery_ids: unresolved,
+                    .send(UiEvent::ReplyDelivery {
+                        key: candidate.key,
+                        state,
                     })
                     .await;
             }
+            if outcome == Outcome::Confirmed {
+                let _ = tx.send(UiEvent::DeliveryCompleted).await;
+            }
         });
         self.set_delivery_status(DeliveryStatus::Sending);
-        Ok(())
+    }
+
+    async fn advance_autoreply(&mut self, tx: mpsc::Sender<UiEvent>) {
+        self.persist_ai_safety_stop().await;
+        if self.config.autoreply.enabled
+            && self.config.autoreply.provider == autoreply::Provider::Chatgpt
+            && !self.ai_settings.checked
+        {
+            self.ai_settings
+                .start("status", self.config.autoreply.codex.clone(), tx.clone());
+        }
+        let gate = autoreply::Gate {
+            session: format!(
+                "{}:{}",
+                self.config.room_id,
+                self.room
+                    .as_ref()
+                    .and_then(|r| r.live_started_at)
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| self.session.id.clone())
+            ),
+            live: self.room.as_ref().is_some_and(RoomSnapshot::is_live)
+                && self.connection.starts_with("已连接")
+                && !self.quit_requested,
+            busy: !self.input.is_empty()
+                || self.stop_flow.is_some()
+                || self.login_qr.is_some()
+                || self.secret_mode
+                || self.ai_settings.open
+                || !self.ai_settings.ready(&self.config.autoreply),
+            broadcaster: self
+                .room
+                .as_ref()
+                .map(|r| r.broadcaster_id.clone())
+                .unwrap_or_default(),
+        };
+        if let Some(reply) = self.autoreply.as_mut() {
+            reply.set_gate(gate);
+        }
+        let candidate = self
+            .autoreply
+            .as_mut()
+            .and_then(|reply| reply.ready.try_recv().ok());
+        if let Some(mut candidate) = candidate
+            && candidate.permit.valid()
+        {
+            let segments = std::mem::take(&mut candidate.segments);
+            self.enqueue(segments, Some(candidate), tx);
+        }
     }
 
     async fn command(&mut self, raw: &str, tx: mpsc::Sender<UiEvent>) -> Result<()> {
         let parts = raw.split_whitespace().collect::<Vec<_>>();
         match parts.as_slice() {
+            ["/ai", args @ ..] => {
+                if let Err(error) = self.ai_command(args, tx.clone()).await {
+                    self.ai_settings.status = error.to_string();
+                    self.set_notice(error.to_string(), NoticeLevel::Error);
+                }
+            }
             ["/quit"] | ["/q"] => {
                 self.quit_requested = true;
             }
@@ -2249,8 +2348,8 @@ impl Drop for TerminalGuard {
 }
 fn retain_unconfirmed(confirmations: &mut Vec<(String, oneshot::Receiver<()>)>) {
     confirmations.retain_mut(|(_, confirmation)| match confirmation.try_recv() {
-        Ok(()) | Err(oneshot::error::TryRecvError::Closed) => false,
-        Err(oneshot::error::TryRecvError::Empty) => true,
+        Ok(()) => false,
+        Err(_) => true,
     });
 }
 
@@ -2278,7 +2377,7 @@ async fn wait_for_delivery_confirmations(
         if let Ok(events) = client.history(room_id).await
             && tx.send(UiEvent::DeliveryHistory { events }).await.is_err()
         {
-            return Vec::new();
+            break;
         }
     }
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -2302,6 +2401,9 @@ fn reconcile_cross_origin_event(events: &mut [DanmuEvent], incoming: &DanmuEvent
         existing.platform_event_id = incoming.platform_event_id.clone();
     } else if existing.emotes.is_empty() && !incoming.emotes.is_empty() {
         existing.emotes = incoming.emotes.clone();
+    }
+    if incoming.reply_to.is_some() {
+        existing.reply_to.clone_from(&incoming.reply_to);
     }
     true
 }
@@ -2540,11 +2642,74 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
     ])
     .split(area);
     frame.render_widget(Paragraph::new(Text::from(status_lines)), rows[0]);
-    draw_body(frame, rows[1], app, palette);
+    if app.reply_panel && app.autoreply.is_some() && rows[1].height >= 8 {
+        let body = Layout::vertical([Constraint::Min(2), Constraint::Length(6)]).split(rows[1]);
+        draw_body(frame, body[0], app, palette);
+        let view = app.autoreply.as_ref().unwrap().view.borrow();
+        let candidates = view
+            .candidate
+            .as_ref()
+            .map(|c| c.segments.join(" ｜ "))
+            .unwrap_or_else(|| "无候选".into());
+        let sources = view
+            .sources
+            .iter()
+            .map(|s| {
+                format!(
+                    "{} {} 检索{} 发布{}",
+                    s.title,
+                    s.url,
+                    s.retrieved_at.to_rfc3339(),
+                    s.published_at.map(|v| v.to_rfc3339()).unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ｜ ");
+        let usage = &view.usage;
+        let text = format!(
+            "{} · {} · 模型 {} · F7批准 F8丢弃 Ctrl-P暂停\n{}\n{}\n请求预留{} token预留{}/报告{} 检索预留{} 费用{}\n{}",
+            if view.enabled {
+                "已开启"
+            } else {
+                "已关闭"
+            },
+            view.mode.label(),
+            view.model,
+            if app.autoreply.as_ref().unwrap().faulted {
+                "worker队列故障；已撤销许可，重启后检查日志"
+            } else {
+                &view.reason
+            },
+            candidates,
+            usage.requests,
+            usage.reserved_tokens,
+            usage.reported_tokens,
+            usage.searches,
+            if app.config.autoreply.cost_budget.is_some() {
+                format!("保守预留{}微单位，非账单", usage.reserved_cost)
+            } else {
+                "未核算；非0费用".into()
+            },
+            sources
+        );
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .title("✦ 候选回复 /ai 显隐"),
+                )
+                .wrap(Wrap { trim: false }),
+            body[1],
+        );
+    } else {
+        draw_body(frame, rows[1], app, palette);
+    }
     if notice_height > 0 {
         frame.render_widget(Paragraph::new(Text::from(notice_lines)), rows[2]);
     }
     draw_input(frame, rows[3], app, palette);
+    ai_settings::draw(frame, rows[1], app);
     draw_command_palette(frame, rows[1], app, palette);
 
     if let Some(lines) = &app.login_qr {
@@ -3251,6 +3416,17 @@ fn clean_platform_markup(value: &str) -> String {
 
 fn visible_event_content(event: &DanmuEvent) -> String {
     let content = clean_platform_markup(&map_event_emotes(event));
+    if let Some(target) = event.reply_to.as_deref() {
+        let target = clean_platform_markup(target);
+        let target = target.trim();
+        let already_in_body = content
+            .strip_prefix('@')
+            .and_then(|body| body.strip_prefix(target))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
+        if !target.is_empty() && !already_in_body {
+            return format!("@{target} {content}");
+        }
+    }
     if event.kind != DanmuEventKind::Danmu
         && let Some(username) = event.username.as_deref()
     {
@@ -3731,64 +3907,7 @@ mod tests {
     use crate::obs::ObsConfiguration;
     use ratatui::backend::TestBackend;
     fn test_app(temp: &tempfile::TempDir, session: DanmuSession) -> TerminalApp {
-        let themes = crate::theme::ThemeCatalog::load(temp.path().join("themes.json")).unwrap();
-        let theme_name = themes.selected().to_owned();
-        let config = TerminalConfig {
-            history_idle_seconds: 0,
-            room_id: "1".into(),
-            single_line: true,
-            chat_layout: false,
-            show_time: false,
-            show_name: true,
-            palette: Palette::default(),
-            theme_name,
-            themes,
-        };
-        TerminalApp {
-            config,
-            client: BilibiliClient::new(temp.path().join("account.json")).unwrap(),
-            account: AccountClient::new(temp.path().join("account.json")).unwrap(),
-            send_queue: Arc::new(tokio::sync::Mutex::new(())),
-            obs: ObsController::new(ObsConfiguration::default(), temp.path().join("obs.json")),
-            journal: SessionJournal::new(temp.path().join("sessions")),
-            session,
-            room: None,
-            room_updated_at: None,
-            connection: "已连接 1".into(),
-            watched: None,
-            likes: None,
-            online_viewers: None,
-            input: EditorInput::default(),
-            slash_selection: 0,
-            selected: 0,
-            scroll_offset: 0,
-            activity: activity::ActivityNotices::default(),
-            last_user_activity: Instant::now(),
-            notice: String::new(),
-            notice_deadline: None,
-            delivery_status: DeliveryStatus::Idle,
-            delivery_status_deadline: None,
-            layout_chat: false,
-            show_name: true,
-            show_time: false,
-            account_status: AccountStatus::SignedOut,
-            stop_flow: None,
-            login_qr: None,
-            secret_mode: false,
-            selection_active: false,
-            quit_requested: false,
-            unread_live_count: 0,
-            obs_status: None,
-            microphone_level: None,
-            obs_error: None,
-            obs_checked_at: None,
-            pending_deliveries: VecDeque::new(),
-            confirmed_deliveries: VecDeque::new(),
-            last_realtime_at: None,
-            live_danmu_count: 0,
-            last_live_danmu_at: None,
-            animation_tick: 0,
-        }
+        replay::app(temp.path(), session)
     }
 
     #[tokio::test]
@@ -4763,6 +4882,72 @@ mod tests {
     }
 
     #[test]
+    fn viewer_reply_target_survives_history_reconciliation() {
+        use serde_json::json;
+        for target in ["另一位观众", "拾穗数据"] {
+            let mut metadata = vec![serde_json::Value::Null; 16];
+            metadata[15] = json!({"extra": json!({
+                "show_reply": true, "reply_mid": 99, "reply_uname": target
+            }).to_string()});
+            let live = crate::bilibili::parse_command(&json!({
+                "cmd": "DANMU_MSG", "info": [metadata, "这个问题怎么看？", [42, "观众"]]
+            }))
+            .unwrap();
+            let mut history = DanmuEvent::new(DanmuEventKind::Danmu, "这个问题怎么看？");
+            history.username = Some("观众".into());
+            history.author_id = Some("42".into());
+            history.timestamp = live.timestamp;
+            history.origin = DanmuEventOrigin::History;
+            let expected = format!("@{target} 这个问题怎么看？");
+            assert_eq!(visible_event_content(&live), expected);
+            for (first, second) in [(live.clone(), history.clone()), (history, live)] {
+                let mut events = vec![first];
+                assert!(reconcile_cross_origin_event(&mut events, &second));
+                assert_eq!(visible_event_content(&events[0]), expected);
+                assert_eq!(events[0].content, "这个问题怎么看？");
+            }
+        }
+    }
+
+    #[test]
+    fn reply_metadata_does_not_drop_body_or_duplicate_text_mentions() {
+        use serde_json::json;
+        let cases = [
+            (serde_json::Value::Null, "普通弹幕", "普通弹幕"),
+            (json!("{broken"), "普通弹幕", "普通弹幕"),
+            (
+                json!(r#"{"show_reply":false,"reply_uname":"观众"}"#),
+                "普通弹幕",
+                "普通弹幕",
+            ),
+            (
+                json!(r#"{"show_reply":true,"reply_uname":" "}"#),
+                "普通弹幕",
+                "普通弹幕",
+            ),
+            (
+                json!(r#"{"reply_uname":"观众"}"#),
+                "@观众 你好",
+                "@观众 你好",
+            ),
+            (
+                json!(r#"{"reply_uname":"观众"}"#),
+                "@观众甲 你好",
+                "@观众 @观众甲 你好",
+            ),
+        ];
+        for (extra, body, expected) in cases {
+            let mut metadata = vec![serde_json::Value::Null; 16];
+            metadata[15] = json!({"extra": extra});
+            let event = crate::bilibili::parse_command(&json!({
+                "cmd": "DANMU_MSG", "info": [metadata, body, [42, "观众乙"]]
+            }))
+            .unwrap();
+            assert_eq!(visible_event_content(&event), expected);
+        }
+    }
+
+    #[test]
     fn event_badges_use_type_colors_and_strip_bilibili_markup() {
         let temp = tempfile::tempdir().unwrap();
         let event = DanmuEvent::new(DanmuEventKind::Enter, "<%战区超人%> 来了");
@@ -4968,6 +5153,8 @@ mod tests {
             delivery,
             confirmation: confirmation_tx,
         });
+        assert_eq!(app.delivery_status, DeliveryStatus::Sending);
+        app.handle_ui_event(UiEvent::DeliveryAccepted);
         assert_eq!(app.delivery_status, DeliveryStatus::AwaitingEcho);
         app.animation_tick = 1;
         assert!(
@@ -4991,6 +5178,8 @@ mod tests {
         );
         assert_eq!(app.live_danmu_count, 1);
         assert!(app.last_live_danmu_at.is_some());
+        assert_eq!(app.delivery_status, DeliveryStatus::Verifying);
+        app.handle_ui_event(UiEvent::DeliveryCompleted);
         assert_eq!(app.delivery_status, DeliveryStatus::Delivered);
         assert!(app.notice.is_empty());
     }
@@ -5036,7 +5225,7 @@ mod tests {
             Err(oneshot::error::TryRecvError::Empty)
         ));
         assert_eq!(app.pending_deliveries.len(), 1);
-        assert_eq!(app.delivery_status, DeliveryStatus::AwaitingEcho);
+        assert_eq!(app.delivery_status, DeliveryStatus::Verifying);
 
         let mut first_echo = DanmuEvent::new(DanmuEventKind::Danmu, "第一段");
         first_echo.timestamp = submitted_at + chrono::Duration::seconds(4);
@@ -5046,6 +5235,7 @@ mod tests {
 
         assert_eq!(first_rx.try_recv(), Ok(()));
         assert!(app.pending_deliveries.is_empty());
+        app.handle_ui_event(UiEvent::DeliveryCompleted);
         assert_eq!(app.delivery_status, DeliveryStatus::Delivered);
     }
     #[test]
@@ -5089,7 +5279,6 @@ mod tests {
         });
         assert_eq!(app.delivery_status, DeliveryStatus::Uncertain);
         assert!(app.notice.contains("待确认消息"));
-        assert!(app.notice.contains("已停止提醒"));
         assert!(
             delivery_status_title(&app, app.config.palette)
                 .spans

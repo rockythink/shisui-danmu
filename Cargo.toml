@@ -39,7 +39,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "net", "process", "io-util"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 toml = "0.9"
 tui-input = "0.15.4"
@@ -48,7 +48,6 @@ unicode-width = "0.2"
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
-[dev-dependencies]
 tempfile = "3"
 
 [profile.release]

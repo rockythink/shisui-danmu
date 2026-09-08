@@ -18,6 +18,9 @@ async fn main() {
 }
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(path) = &cli.replay {
+        return shisui_danmu::terminal::replay(path).await;
+    }
     let paths = StoragePaths::discover()?;
     paths.ensure()?;
 

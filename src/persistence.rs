@@ -28,6 +28,7 @@ pub enum JournalKind {
     SessionEnded,
     SessionInterrupted,
     UnhandledCommand,
+    AutoReply,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +158,49 @@ impl SessionJournal {
         Ok(())
     }
 
+    pub fn reply_record<T: Serialize>(&self, session_id: &str, record: &T) -> Result<()> {
+        self.append(session_id, JournalKind::AutoReply, record)
+    }
+
+    pub fn reply_records<T: serde::de::DeserializeOwned>(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<T>> {
+        let path = self.session_directory(session_id).join("journal.jsonl");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        read_records_strict(&path)?
+            .into_iter()
+            .filter(|record| record.kind == JournalKind::AutoReply)
+            .map(|record| serde_json::from_value(record.payload).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn reply_records_for_stream<T: serde::de::DeserializeOwned>(
+        &self,
+        stream: &str,
+    ) -> Result<Vec<T>> {
+        let prefix = format!("{stream}:");
+        let mut replies = Vec::new();
+        for session in self.session_ids()? {
+            for record in
+                read_records_strict(&self.session_directory(&session).join("journal.jsonl"))?
+            {
+                if record.kind == JournalKind::AutoReply
+                    && record
+                        .payload
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .is_some_and(|key| key.starts_with(&prefix))
+                {
+                    replies.push(serde_json::from_value(record.payload)?);
+                }
+            }
+        }
+        Ok(replies)
+    }
+
     fn append<T: Serialize>(&self, session_id: &str, kind: JournalKind, payload: T) -> Result<()> {
         let directory = self.session_directory(session_id);
         std::fs::create_dir_all(&directory).context("创建会话归档目录失败")?;
@@ -224,6 +268,18 @@ impl SessionJournal {
 fn count_lines(file: &File) -> Result<u64> {
     let cloned = file.try_clone()?;
     Ok(BufReader::new(cloned).lines().count() as u64)
+}
+
+fn read_records_strict(path: &Path) -> Result<Vec<JournalRecord>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    BufReader::new(file)
+        .lines()
+        .map(|line| serde_json::from_str(&line?).context("自动回复日志损坏；不能安全恢复去重状态"))
+        .collect()
 }
 
 fn read_records(path: &Path) -> Result<Vec<JournalRecord>> {

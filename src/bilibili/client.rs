@@ -293,6 +293,7 @@ impl BilibiliClient {
                     username,
                     author_id,
                     content: content.to_string(),
+                    reply_to: None,
                     origin: DanmuEventOrigin::History,
                     platform_event_id: platform_id,
                     emotes: Vec::new(),

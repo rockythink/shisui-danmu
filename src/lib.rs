@@ -1,5 +1,7 @@
+pub mod autoreply;
 pub mod bilibili;
 pub mod config;
+pub mod delivery;
 pub mod domain;
 pub mod obs;
 pub mod persistence;

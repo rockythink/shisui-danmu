@@ -1,0 +1,13 @@
+[
+  {"type":"settings_command","value":"disable"},
+  {"type":"settings_command","value":"provider chatgpt"},
+  {"type":"settings_command","value":"auto"},
+  {"type":"assert","state":"disabled"},
+  {"type":"event","text":"什么是流处理？","author":"viewer","name":"甲","id":"off-question"},
+  {"type":"event","text":"你好","author":"viewer2","name":"乙","id":"off-greeting"},
+  {"type":"assert","state":"no_candidate"},
+  {"type":"assert","state":"zero_calls"},
+  {"type":"settings_command","value":"suggest"},
+  {"type":"settings_command","value":"settings"},
+  {"type":"assert","state":"settings_open"}
+]

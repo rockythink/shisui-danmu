@@ -15,8 +15,8 @@ use std::collections::VecDeque;
 use unicode_segmentation::UnicodeSegmentation;
 
 pub const RECONNECT_DELAYS_SECONDS: &[u64] = &[1, 2, 4, 8, 15, 30];
-pub const SEND_SEGMENT_LIMIT: usize = 20;
-pub const ACCOUNT_MESSAGE_LIMIT: usize = 22;
+pub const SEND_SEGMENT_LIMIT: usize = 40;
+pub const ACCOUNT_MESSAGE_LIMIT: usize = SEND_SEGMENT_LIMIT;
 
 pub fn segment_message(message: &str, limit: usize) -> Vec<String> {
     let trimmed = message.trim();

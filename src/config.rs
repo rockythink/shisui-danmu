@@ -11,6 +11,9 @@ use std::path::PathBuf;
     about = "面向知识型主播的 B 站弹幕与直播监控工作台"
 )]
 pub struct Cli {
+    /// 无网络回放JSON数组；不读取账号/OBS/默认配置，不安装或连接直播
+    #[arg(long, value_name = "JSON路径")]
+    pub replay: Option<PathBuf>,
     #[arg(value_name = "房间号")]
     pub positional_room: Option<String>,
     #[arg(short, long, value_name = "房间号")]
@@ -40,6 +43,8 @@ pub struct Cli {
 
 #[derive(Debug, Clone)]
 pub struct TerminalConfig {
+    pub config_path: PathBuf,
+    pub autoreply: crate::autoreply::Config,
     pub history_idle_seconds: u32,
     pub room_id: String,
     pub single_line: bool,
@@ -53,6 +58,8 @@ pub struct TerminalConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
+    #[serde(default)]
+    autoreply: crate::autoreply::Config,
     history_idle_seconds: Option<u32>,
     #[serde(alias = "roomID", alias = "roomid")]
     room_id: Option<String>,
@@ -70,8 +77,12 @@ struct ConfigFile {
 
 impl TerminalConfig {
     pub fn load(cli: &Cli, default_path: PathBuf, themes_path: PathBuf) -> Result<Self> {
+        let codex_home = default_path
+            .parent()
+            .context("应用配置目录无效")?
+            .join("codex-subscription");
         let path = cli.config.clone().unwrap_or(default_path);
-        let file: ConfigFile = match std::fs::read_to_string(&path) {
+        let mut file: ConfigFile = match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text)
                 .with_context(|| format!("配置文件格式错误：{}", path.display()))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => ConfigFile::default(),
@@ -93,7 +104,10 @@ impl TerminalConfig {
         let themes = ThemeCatalog::load(themes_path)?;
         let requested_theme = cli.theme.as_deref().unwrap_or(themes.selected());
         let (theme_name, palette) = themes.resolve(requested_theme)?;
+        file.autoreply.codex.home = codex_home;
         Ok(Self {
+            config_path: path,
+            autoreply: file.autoreply,
             history_idle_seconds: cli
                 .history_idle_seconds
                 .or(file.history_idle_seconds)
@@ -113,6 +127,26 @@ impl TerminalConfig {
             theme_name,
             themes,
         })
+    }
+    pub fn save_autoreply(&self, config: &crate::autoreply::Config) -> Result<()> {
+        let mut document: toml::Value = match std::fs::read_to_string(&self.config_path) {
+            Ok(text) => toml::from_str(&text).context("配置格式错误；未覆盖")?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                toml::Value::Table(Default::default())
+            }
+            Err(e) => return Err(e.into()),
+        };
+        document
+            .as_table_mut()
+            .context("配置根节点必须为表")?
+            .insert("autoreply".into(), toml::Value::try_from(config)?);
+        let parent = self.config_path.parent().context("配置目录无效")?;
+        std::fs::create_dir_all(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        std::io::Write::write_all(&mut file, toml::to_string_pretty(&document)?.as_bytes())?;
+        file.as_file().sync_all()?;
+        file.persist(&self.config_path)?;
+        Ok(())
     }
 }
 

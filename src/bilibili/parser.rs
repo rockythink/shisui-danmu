@@ -171,11 +171,27 @@ fn parse_danmu(value: &Value) -> Option<DanmuEvent> {
         username,
         author_id,
         content,
+        reply_to: parse_reply_target(value),
         origin: Default::default(),
         platform_event_id: platform_id,
         emotes,
         gift: None,
     })
+}
+
+fn parse_reply_target(value: &Value) -> Option<String> {
+    // Bilibili keeps native replies outside info[1], inside JSON-encoded extra.
+    #[derive(serde::Deserialize)]
+    struct Extra {
+        show_reply: Option<bool>,
+        reply_uname: Option<String>,
+    }
+    let extra = value.pointer("/info/0/15/extra")?.as_str()?;
+    let extra: Extra = serde_json::from_str(extra).ok()?;
+    if extra.show_reply == Some(false) {
+        return None;
+    }
+    extra.reply_uname.filter(|name| !name.trim().is_empty())
 }
 
 fn live_source_identifier(value: &Value) -> Option<String> {
@@ -369,6 +385,7 @@ fn event(
         username,
         author_id,
         content,
+        reply_to: None,
         origin: Default::default(),
         platform_event_id,
         emotes: Vec::new(),
@@ -474,6 +491,7 @@ impl GiftPayload {
             username: self.username,
             author_id: self.author_id,
             content: gift.content(),
+            reply_to: None,
             origin: Default::default(),
             platform_event_id: self.platform_event_id,
             emotes: Vec::new(),
