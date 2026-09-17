@@ -371,11 +371,12 @@ pub struct Workspace {
     pub runtime: Arc<tempfile::TempDir>,
 }
 impl Workspace {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn isolated(runtime: Arc<tempfile::TempDir>) -> Self {
         Self { runtime }
     }
 }
+#[cfg(unix)]
 impl Drop for Workspace {
     fn drop(&mut self) {
         hosts::cleanup(self.runtime.path());

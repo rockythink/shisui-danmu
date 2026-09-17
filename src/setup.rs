@@ -164,12 +164,14 @@ fn check_directories(path: &Path, create: bool) -> Result<()> {
                 current.display()
             ),
             Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
-                let mut builder = fs::DirBuilder::new();
+                let builder = fs::DirBuilder::new();
                 #[cfg(unix)]
-                {
+                let builder = {
                     use std::os::unix::fs::DirBuilderExt;
+                    let mut builder = builder;
                     builder.mode(0o700);
-                }
+                    builder
+                };
                 match builder.create(&current) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

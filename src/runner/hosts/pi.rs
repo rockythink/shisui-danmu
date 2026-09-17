@@ -313,6 +313,7 @@ pub(super) fn configure(
     settings: &Settings,
     workspace: &Path,
 ) -> Result<serde_json::Value> {
+    ensure!(cfg!(unix), "Pi 安全启动器目前需要 Unix");
     let pi = executable("pi")?;
     let node = executable("node")?;
     ensure!(
@@ -332,8 +333,6 @@ pub(super) fn configure(
     if auth.is_file() {
         std::os::unix::fs::symlink(&auth, agent_dir.join("auth.json"))?;
     }
-    #[cfg(not(unix))]
-    bail!("Pi 安全启动器目前需要 Unix");
     let launcher = workspace.join("pi-text-launcher");
     let rpc_filter = workspace.join("pi-rpc-filter.js");
     super::private_write(&rpc_filter, include_bytes!("pi_rpc_filter.js"))?;

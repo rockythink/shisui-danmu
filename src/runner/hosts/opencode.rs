@@ -152,6 +152,10 @@ fn native_version(cmd: &Command, workspace: &Path) -> Result<String> {
 
 pub(super) fn configure(cmd: &mut Command, settings: &Settings, workspace: &Path) -> Result<()> {
     ensure!(
+        cfg!(unix),
+        "此平台尚无已验证的 OpenCode 只读配置目录隔离；请在非 root 的 macOS/Linux 原生环境运行"
+    );
+    ensure!(
         !settings.web_search,
         "OpenCode 的完整 search 通知与权限链未核实；请关闭联网搜索"
     );
@@ -184,8 +188,6 @@ pub(super) fn configure(cmd: &mut Command, settings: &Settings, workspace: &Path
         );
         fs::set_permissions(&config, fs::Permissions::from_mode(0o500))?;
     }
-    #[cfg(not(unix))]
-    bail!("此平台尚无已验证的 OpenCode 只读配置目录隔离；请在非 root 的 macOS/Linux 原生环境运行");
     if has_auth {
         // Share only native personal login, NOT the native database/account
         // organization state. Credential refresh remains OpenCode's operation.
@@ -254,6 +256,7 @@ pub(super) fn permit_option(id: Option<&str>, value: &SettingValue) -> Result<bo
 }
 
 /// Called after the child is gone, before the private TempDir is removed.
+#[cfg(unix)]
 pub(super) fn cleanup(workspace: &Path) {
     #[cfg(unix)]
     {

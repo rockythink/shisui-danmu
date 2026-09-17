@@ -3,7 +3,7 @@
 use super::super::{acp::SettingValue, settings::Settings};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::process::Command;
 
 pub(super) const IDENTITIES: &[&str] = &["amp-acp"];
@@ -16,6 +16,10 @@ fn quote(path: &Path) -> Result<String> {
 }
 
 pub(super) fn configure(cmd: &mut Command, settings: &Settings, workspace: &Path) -> Result<()> {
+    ensure!(
+        cfg!(target_os = "macos"),
+        "Amp 安全启动器目前需要 macOS 沙箱来禁止自动打开认证浏览器"
+    );
     ensure!(!settings.web_search, "Amp 当前仅启用无工具文本模式");
     let native = std::env::split_paths(&std::env::var_os("PATH").context("缺少 PATH")?)
         .map(|dir| dir.join("amp"))
@@ -40,25 +44,25 @@ pub(super) fn configure(cmd: &mut Command, settings: &Settings, workspace: &Path
             "amp.remoteThreadCreation.enabled": false
         }))?,
     )?;
-    let user_home = PathBuf::from(std::env::var_os("HOME").context("缺少 HOME")?);
     #[cfg(unix)]
-    for (source, destination) in [
-        (
-            user_home.join(".local/share/amp/secrets.json"),
-            data.join("amp/secrets.json"),
-        ),
-        (
-            user_home.join(".config/amp-acp/credentials.json"),
-            config.join("amp-acp/credentials.json"),
-        ),
-    ] {
+    for (source, destination) in {
+        let user_home = std::path::PathBuf::from(std::env::var_os("HOME").context("缺少 HOME")?);
+        [
+            (
+                user_home.join(".local/share/amp/secrets.json"),
+                data.join("amp/secrets.json"),
+            ),
+            (
+                user_home.join(".config/amp-acp/credentials.json"),
+                config.join("amp-acp/credentials.json"),
+            ),
+        ]
+    } {
         if source.is_file() {
             std::fs::create_dir_all(destination.parent().context("缺少认证目录")?)?;
             std::os::unix::fs::symlink(source, destination)?;
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    bail!("Amp 安全启动器目前需要 macOS 沙箱来禁止自动打开认证浏览器");
     ensure!(
         data.join("amp/secrets.json").is_file()
             || config.join("amp-acp/credentials.json").is_file(),

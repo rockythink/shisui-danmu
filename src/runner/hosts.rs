@@ -40,6 +40,7 @@ pub fn session_meta(settings: &Settings) -> Option<serde_json::Map<String, serde
     }
 }
 
+#[cfg(unix)]
 pub fn cleanup(workspace: &Path) {
     opencode::cleanup(workspace);
 }
@@ -248,11 +249,13 @@ pub fn command(
                 if !agent.join("config.yml").exists() {
                     private_write(&agent.join("config.yml"), b"{}\n")?;
                 }
-                let home = directories::BaseDirs::new().context("无法定位OMP认证主目录")?;
-                let auth = home.home_dir().join(".omp/agent/agent.db");
                 #[cfg(unix)]
-                if auth.is_file() && !agent.join("agent.db").exists() {
-                    std::os::unix::fs::symlink(auth, agent.join("agent.db"))?;
+                {
+                    let home = directories::BaseDirs::new().context("无法定位OMP认证主目录")?;
+                    let auth = home.home_dir().join(".omp/agent/agent.db");
+                    if auth.is_file() && !agent.join("agent.db").exists() {
+                        std::os::unix::fs::symlink(auth, agent.join("agent.db"))?;
+                    }
                 }
                 cmd.env("PI_CODING_AGENT_DIR", agent);
             }

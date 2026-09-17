@@ -1734,6 +1734,7 @@ fn ownership_is_not_global_and_approval_preserves_sending_results() {
     b.permission(false).unwrap();
     assert_eq!(b.candidates().len(), 1);
 }
+#[cfg(unix)]
 #[test]
 fn native_system_source_snapshots_content_and_never_runs_a_path_as_prompt() {
     let root = tempfile::tempdir().unwrap();
