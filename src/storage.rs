@@ -83,13 +83,10 @@ fn persist_atomic_windows(
         FileBasicInfo, FileRenameInfoEx, SetFileInformationByHandle,
     };
 
-    // The temporary file is a sibling of path. A leaf name renames within that directory.
+    // Win32 resolves relative names against the process cwd, which may be on another drive.
+    let absolute = std::path::absolute(path)?;
     let invalid_name = || io::Error::new(io::ErrorKind::InvalidInput, "无效原子替换文件名");
-    let mut name: Vec<u16> = path
-        .file_name()
-        .ok_or_else(invalid_name)?
-        .encode_wide()
-        .collect();
+    let mut name: Vec<u16> = absolute.as_os_str().encode_wide().collect();
     if name.contains(&0) {
         return Err(invalid_name());
     }
