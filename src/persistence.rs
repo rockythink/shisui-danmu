@@ -1141,7 +1141,8 @@ mod tests {
         let mut first = DanmuSession::new("123");
         journal.start(&first).unwrap();
         for index in 0..620 {
-            let mut event = DanmuEvent::new(DanmuEventKind::Danmu, format!("历史正文-{index}"));
+            let mut event =
+                DanmuEvent::new(DanmuEventKind::Danmu, format!("历史正文 archived{index}"));
             event.id = format!("old-{index}");
             first.ingest(event.clone());
             journal
@@ -1201,7 +1202,7 @@ mod tests {
             .unwrap();
         assert!(
             index
-                .search(["历史正文-0"].into_iter(), "", &[], 200_000)
+                .search(["archived0"].into_iter(), "", &[], 200_000)
                 .unwrap()
                 .iter()
                 .any(|row| row["id"] == "old-0")
