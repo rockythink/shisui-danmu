@@ -38,6 +38,7 @@ pub enum DanmuEventOrigin {
     #[default]
     Live,
     History,
+    Archived,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -217,6 +218,24 @@ impl DanmuSession {
             event_limit: event_limit.max(1),
             seen_event_ids: HashSet::new(),
         }
+    }
+
+    /// Preload bounded, display-only events from a previous session.
+    ///
+    /// They participate in deduplication without changing this new session's metrics.
+    pub(crate) fn preload_history(&mut self, events: impl IntoIterator<Item = DanmuEvent>) {
+        let mut events = events
+            .into_iter()
+            .filter(|event| event.kind.activity_lifetime().is_none())
+            .map(|mut event| {
+                event.origin = DanmuEventOrigin::Archived;
+                event
+            })
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| std::cmp::Reverse(event.timestamp));
+        events.truncate(self.event_limit);
+        self.seen_event_ids = events.iter().map(|event| event.id.clone()).collect();
+        self.recent_events = events;
     }
 
     pub fn ingest(&mut self, event: DanmuEvent) -> bool {
@@ -566,6 +585,36 @@ mod tests {
                 .any(|event| event.id == "newer")
         );
     }
+    #[test]
+    fn preloaded_history_is_bounded_and_not_counted_as_new_activity() {
+        let now = Utc::now();
+        let mut older = event("reused", DanmuEventKind::Danmu, "旧弹幕");
+        older.timestamp = now - Duration::seconds(1);
+        let mut newer = event("reused", DanmuEventKind::Danmu, "新弹幕");
+        newer.timestamp = now;
+        let activity = event("enter", DanmuEventKind::Enter, "进入直播间");
+        let mut session = DanmuSession::with_options("1", 2, now);
+
+        session.preload_history([older, activity, newer.clone()]);
+
+        assert_eq!(session.recent_events.len(), 2);
+        assert_eq!(session.recent_events[0].content, "新弹幕");
+        assert_eq!(session.recent_events[1].content, "旧弹幕");
+        assert!(
+            session
+                .recent_events
+                .iter()
+                .all(|event| event.origin == DanmuEventOrigin::Archived)
+        );
+        assert_eq!(session.metrics, SessionMetrics::default());
+        let mut platform_history = newer.clone();
+        platform_history.origin = DanmuEventOrigin::History;
+        assert!(!session.ingest(platform_history));
+        newer.origin = DanmuEventOrigin::Live;
+        assert!(!session.ingest(newer));
+        assert_eq!(session.metrics, SessionMetrics::default());
+    }
+
     #[test]
     fn legacy_event_defaults_origin_and_emotes() {
         let value = serde_json::json!({

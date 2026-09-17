@@ -1,5 +1,28 @@
 # Third-party notices
 
+## agent-client-protocol
+
+- Repository: <https://github.com/agentclientprotocol/rust-sdk>
+- Version: 2.1.0 (exact Cargo.lock pin; default features disabled).
+- License: Apache-2.0
+- Usage: official typed ACP v1 client, JSON-RPC correlation and dispatch. The
+  application retains bounded transport and native-host/business authorization.
+- Transitive versions and license identifiers are captured in the 04-SDK
+  dependency evidence; no adapter or native Agent is bundled.
+
+## rusqlite / libsqlite3-sys
+
+- Repository: <https://github.com/rusqlite/rusqlite>
+- Locked versions: rusqlite 0.37.0, libsqlite3-sys 0.35.0.
+- Rust binding license: MIT. Bundled SQLite implements the room-scoped persistent FTS5 history index.
+
+## toml_edit
+
+- Repository: <https://github.com/toml-rs/toml>
+- Locked version: 0.23.10+spec-1.0.0.
+- License: MIT OR Apache-2.0.
+- Usage: update TUI preferences without discarding user TOML comments or unrelated sections.
+
 ## obws
 
 - Repository: <https://forge.dnaka91.rocks/dnaka91/obws>

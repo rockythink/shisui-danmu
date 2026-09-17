@@ -10,3 +10,7 @@
 /website/dist/
 /website/.astro/
 /website/.wrangler/
+
+# Retired orchestration state and private evidence backups
+/.maestri/
+/.local-archive/

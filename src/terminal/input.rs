@@ -56,6 +56,25 @@ impl EditorInput {
         }
     }
 
+    /// Paste is text, never a stream of terminal key events.
+    pub(super) fn insert_paste(&mut self, text: &str, multiline: bool) {
+        let mut previous_cr = false;
+        for character in text.chars() {
+            if !(previous_cr && character == '\n') {
+                if multiline && matches!(character, '\r' | '\n') {
+                    self.inner.handle(InputRequest::InsertChar('\n'));
+                } else if matches!(character, '\r' | '\n' | '\t')
+                    || (character.is_whitespace() && !character.is_control())
+                {
+                    self.inner.handle(InputRequest::InsertChar(' '));
+                } else if !character.is_control() {
+                    self.inner.handle(InputRequest::InsertChar(character));
+                }
+            }
+            previous_cr = character == '\r';
+        }
+    }
+
     pub(super) fn move_to_start(&mut self) {
         self.inner.handle(InputRequest::GoToStart);
     }
@@ -153,5 +172,14 @@ mod tests {
         input.insert_text("🙂");
         assert_eq!(input, "甲🙂乙");
         assert_eq!(input.cursor(), 2);
+    }
+    #[test]
+    fn paste_normalizes_line_endings_without_inserting_terminal_controls() {
+        for (multiline, expected) in [(false, "甲A B C乙"), (true, "甲A\nB C乙")] {
+            let mut input = EditorInput::from("甲乙");
+            input.set_cursor(1);
+            input.insert_paste("A\r\nB\tC\u{1b}\u{3}\u{10}\u{7f}\u{85}", multiline);
+            assert_eq!(input, expected);
+        }
     }
 }

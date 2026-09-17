@@ -1,5 +1,20 @@
+struct MainLogin {
+    token: uuid::Uuid,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for MainLogin {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+mod accounts;
 mod activity;
-mod ai_settings;
+mod agent;
+mod assistant;
+mod settings;
+
+pub use agent::run_local as local;
 mod input;
 mod meter;
 mod qr;
@@ -11,12 +26,12 @@ use send::TerminalTransport;
 pub use qr::qr_lines;
 
 use crate::{
-    autoreply::{self, Mode as ReplyMode, State as ReplyState},
     bilibili::{
         AccountClient, AccountStatus, BilibiliClient, BilibiliClientEvent, LoginPoll,
         RoomLiveStatus, RoomSnapshot, cross_origin_duplicate, kind_label, masked_name_matches,
         normalized_message, segment_message, usable_author_id,
     },
+    bridge::{self, Bridge},
     config::TerminalConfig,
     delivery::{Outcome, SendQueue, Transport},
     domain::{DanmuEvent, DanmuEventKind, DanmuEventOrigin, DanmuSession, DanmuSessionEndReason},
@@ -28,8 +43,9 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Local, Utc};
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -58,10 +74,29 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const DELIVERY_NOTICE_LIFETIME: Duration = Duration::from_secs(15);
-const STARTUP_MIN_DURATION: Duration = Duration::from_secs(2);
-
-fn startup_can_finish(elapsed: Duration, data_ready: bool) -> bool {
-    data_ready && elapsed >= STARTUP_MIN_DURATION
+const DELIVERY_ECHO_WINDOW: chrono::Duration = chrono::Duration::seconds(90);
+// Register once and keep the receivers alive across all startup/main-loop draws.
+fn shutdown_signal() -> io::Result<impl std::future::Future<Output = ()>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = terminate.recv() => {},
+                _ = hangup.recv() => {},
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +123,7 @@ impl StartupView {
             local: StartupCheck::Running,
             account: StartupCheck::Running,
             room: StartupCheck::Waiting,
-            metrics: StartupCheck::Waiting,
+            metrics: StartupCheck::Skipped("进入后后台读取"),
             obs: StartupCheck::Running,
         }
     }
@@ -98,7 +133,6 @@ impl StartupView {
             StartupUpdate::Local(status) => self.local = status,
             StartupUpdate::Account(status) => self.account = status,
             StartupUpdate::Room(status) => self.room = status,
-            StartupUpdate::Metrics(status) => self.metrics = status,
         }
     }
 
@@ -109,10 +143,8 @@ impl StartupView {
             "检查登录状态"
         } else if self.room == StartupCheck::Running {
             "检查直播间　"
-        } else if self.metrics == StartupCheck::Running {
-            "同步直播指标"
         } else if self.obs == StartupCheck::Running {
-            "检查OBS连接 "
+            "后台检查OBS连接"
         } else {
             "启动自检完成"
         }
@@ -124,7 +156,6 @@ enum StartupUpdate {
     Local(StartupCheck),
     Account(StartupCheck),
     Room(StartupCheck),
-    Metrics(StartupCheck),
 }
 
 #[derive(Debug)]
@@ -132,10 +163,6 @@ struct StartupData {
     room: Option<RoomSnapshot>,
     initial_room_error: Option<String>,
     account_status: AccountStatus,
-    online_viewers: Option<u64>,
-    likes: Option<u64>,
-    initial_online_error: Option<String>,
-    initial_likes_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -162,7 +189,7 @@ impl StartupGate {
 
 impl StartupView {
     fn has_warning(self) -> bool {
-        [self.local, self.account, self.room, self.metrics, self.obs]
+        [self.local, self.room]
             .into_iter()
             .any(|status| matches!(status, StartupCheck::Warning(_)))
     }
@@ -187,26 +214,27 @@ async fn load_startup_session(
     room_id: String,
     updates: mpsc::UnboundedSender<StartupUpdate>,
 ) -> StartupSession {
-    let recovery = tokio::task::spawn_blocking(move || journal.recover_latest_interrupted()).await;
+    let history_room_id = room_id.clone();
+    let recovery = tokio::task::spawn_blocking(move || {
+        journal
+            .recent_room_history(&history_room_id, 240)
+            .map(|history| {
+                let mut session = DanmuSession::new(&history_room_id);
+                session.preload_history(history);
+                session
+            })
+    })
+    .await;
     let recovered = match recovery {
         Ok(result) => result.map_err(|error| error.to_string()),
         Err(error) => Err(format!("会话恢复任务失败：{error}")),
     };
     match recovered {
-        Ok(recovered) => {
-            let did_recover = recovered
-                .as_ref()
-                .is_some_and(|session| session.room_id == room_id);
-            let mut session = recovered
-                .filter(|session| session.room_id == room_id)
-                .unwrap_or_else(|| DanmuSession::new(&room_id));
-            if session.status != crate::domain::DanmuSessionStatus::Active {
-                session.resume();
-            }
-            let status = if did_recover {
-                "已恢复"
-            } else {
+        Ok(session) => {
+            let status = if session.recent_events.is_empty() {
                 "已读取"
+            } else {
+                "已恢复"
             };
             let _ = updates.send(StartupUpdate::Local(StartupCheck::Passed(status)));
             StartupSession {
@@ -243,111 +271,96 @@ async fn load_startup_data(
     room_id: String,
     updates: mpsc::UnboundedSender<StartupUpdate>,
 ) -> StartupData {
-    let account_status = match account.status().await {
-        Ok(status @ AccountStatus::SignedIn { .. }) => {
-            let _ = updates.send(StartupUpdate::Account(StartupCheck::Passed("已登录")));
-            status
-        }
-        Ok(AccountStatus::SignedOut) => {
-            let _ = updates.send(StartupUpdate::Account(StartupCheck::Passed(
-                "未登录 · 监看模式",
-            )));
-            AccountStatus::SignedOut
-        }
-        Err(_) => {
-            let _ = updates.send(StartupUpdate::Account(StartupCheck::Warning(
-                "检查失败 · 可重试",
-            )));
-            AccountStatus::SignedOut
+    let account_updates = updates.clone();
+    let account_request = async {
+        match account.status().await {
+            Ok(status @ AccountStatus::SignedIn { .. }) => {
+                let _ =
+                    account_updates.send(StartupUpdate::Account(StartupCheck::Passed("已登录")));
+                status
+            }
+            Ok(AccountStatus::SignedOut) => {
+                let _ = account_updates.send(StartupUpdate::Account(StartupCheck::Passed(
+                    "未登录 · 监看模式",
+                )));
+                AccountStatus::SignedOut
+            }
+            Err(_) => {
+                let _ = account_updates.send(StartupUpdate::Account(StartupCheck::Warning(
+                    "检查失败 · 可重试",
+                )));
+                AccountStatus::SignedOut
+            }
         }
     };
 
     let _ = updates.send(StartupUpdate::Room(StartupCheck::Running));
-    let (room, initial_room_error) = match client.room_snapshot(&room_id).await {
-        Ok(room) => {
-            let _ = updates.send(StartupUpdate::Room(StartupCheck::Passed("房间可访问")));
-            (Some(room), None)
-        }
-        Err(error) => {
-            let _ = updates.send(StartupUpdate::Room(StartupCheck::Warning(
-                "读取失败 · 可重试",
-            )));
-            (None, Some(error.to_string()))
+    let room_request = async {
+        match client.room_snapshot(&room_id).await {
+            Ok(room) => {
+                let _ = updates.send(StartupUpdate::Room(StartupCheck::Passed("房间可访问")));
+                (Some(room), None)
+            }
+            Err(error) => {
+                let _ = updates.send(StartupUpdate::Room(StartupCheck::Warning(
+                    "读取失败 · 可重试",
+                )));
+                (None, Some(error.to_string()))
+            }
         }
     };
 
-    let (online_viewers, likes, initial_online_error, initial_likes_error) =
-        if matches!(account_status, AccountStatus::SignedIn { .. }) {
-            match room.as_ref() {
-                Some(room) => {
-                    let _ = updates.send(StartupUpdate::Metrics(StartupCheck::Running));
-                    let (online_result, likes_result) = tokio::join!(
-                        account.current_online_viewers(&room.room_id, &room.broadcaster_id,),
-                        account.current_likes(&room.room_id),
-                    );
-                    let (online_viewers, online_error) = match online_result {
-                        Ok(viewers) => (viewers, None),
-                        Err(error) => (None, Some(error.to_string())),
-                    };
-                    let (likes, likes_error) = match likes_result {
-                        Ok(likes) => (likes, None),
-                        Err(error) => (None, Some(error.to_string())),
-                    };
-                    let metrics_status = if online_error.is_none() && likes_error.is_none() {
-                        StartupCheck::Passed("已同步")
-                    } else {
-                        StartupCheck::Warning("部分指标失败 · 可重试")
-                    };
-                    let _ = updates.send(StartupUpdate::Metrics(metrics_status));
-                    (online_viewers, likes, online_error, likes_error)
-                }
-                None => {
-                    let _ = updates.send(StartupUpdate::Metrics(StartupCheck::Skipped(
-                        "等待房间数据",
-                    )));
-                    (None, None, None, None)
-                }
-            }
-        } else {
-            let _ = updates.send(StartupUpdate::Metrics(StartupCheck::Skipped(
-                "未登录 · 已跳过",
-            )));
-            (None, None, None, None)
-        };
+    let (account_status, (room, initial_room_error)) = tokio::join!(account_request, room_request);
 
     StartupData {
         room,
         initial_room_error,
         account_status,
-        online_viewers,
-        likes,
-        initial_online_error,
-        initial_likes_error,
     }
 }
 
 #[derive(Debug)]
 enum UiEvent {
-    AiSettings(ai_settings::Event),
-    ReplyDelivery {
-        key: String,
-        state: ReplyState,
+    LocalEcho(String),
+    SettingSaved {
+        token: uuid::Uuid,
+        result: std::result::Result<settings::SavedSetting, String>,
     },
+
     DeliveryAccepted,
+    DeliveryNotice(String),
     Notice {
         message: String,
         level: NoticeLevel,
     },
-    LoginQr(Vec<String>),
-    LoginDone(AccountStatus),
+    LoginQr {
+        token: uuid::Uuid,
+        lines: Vec<String>,
+    },
+    LoginDone {
+        token: uuid::Uuid,
+        account: AccountClient,
+        status: AccountStatus,
+    },
+    LoginFailed {
+        token: uuid::Uuid,
+        message: String,
+    },
+    AssistantAccount(accounts::AccountEvent),
     ObsStatus(std::result::Result<ObsStatus, String>),
     ObsStopDone(std::result::Result<(), String>),
     RoomSnapshot(RoomSnapshot),
+    BroadcasterProfile {
+        room_id: String,
+        user_id: String,
+        result: std::result::Result<Option<crate::bilibili::PublicProfile>, String>,
+    },
     OnlineViewers(std::result::Result<Option<u64>, String>),
     Likes(std::result::Result<Option<u64>, String>),
     DeliveryStarted {
         delivery: PendingDelivery,
         confirmation: oneshot::Sender<()>,
+        registered: oneshot::Sender<()>,
     },
     DeliveryHistory {
         events: Vec<DanmuEvent>,
@@ -355,11 +368,41 @@ enum UiEvent {
     DeliveryTimedOut {
         delivery_ids: Vec<String>,
     },
+    DeliveryEchoMissing {
+        delivery_ids: Vec<String>,
+    },
+    DeliveryExpired {
+        delivery_id: String,
+    },
     DeliveryRejected {
         content: String,
         message: String,
     },
+    AssistantDelivery {
+        session_id: String,
+        record: serde_json::Value,
+    },
     DeliveryCompleted,
+}
+
+async fn send_room_metrics(
+    account: &AccountClient,
+    tx: &mpsc::Sender<UiEvent>,
+    room: &RoomSnapshot,
+) -> bool {
+    let (online, likes) = tokio::join!(
+        account.current_online_viewers(&room.room_id, &room.broadcaster_id),
+        account.current_likes(&room.room_id),
+    );
+    tx.send(UiEvent::OnlineViewers(
+        online.map_err(|error| error.to_string()),
+    ))
+    .await
+    .is_ok()
+        && tx
+            .send(UiEvent::Likes(likes.map_err(|error| error.to_string())))
+            .await
+            .is_ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,7 +445,7 @@ impl PendingDelivery {
         if event.kind != DanmuEventKind::Danmu
             || normalized_message(&event.content) != normalized_message(&self.content)
             || event.timestamp < self.submitted_at - chrono::Duration::seconds(3)
-            || event.timestamp > self.submitted_at + chrono::Duration::seconds(15)
+            || event.timestamp > self.submitted_at + DELIVERY_ECHO_WINDOW
         {
             return false;
         }
@@ -453,13 +496,6 @@ impl UiEvent {
         }
     }
 
-    fn warning(message: impl Into<String>) -> Self {
-        Self::Notice {
-            message: message.into(),
-            level: NoticeLevel::Warning,
-        }
-    }
-
     fn error(message: impl Into<String>) -> Self {
         Self::Notice {
             message: message.into(),
@@ -476,54 +512,33 @@ fn operation_notice(result: Result<String>) -> UiEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandCategory {
+    Display,
+    Account,
+    Obs,
+    Ai,
+    System,
+}
+
+impl CommandCategory {
+    fn color(self, palette: Palette) -> Color {
+        match self {
+            Self::Display => palette.host,
+            Self::Account => palette.info,
+            Self::Obs => palette.name,
+            Self::Ai => palette.success,
+            Self::System => palette.content,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CommandSpec {
     completion: &'static str,
     usage: &'static str,
     description: &'static str,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SlashSuggestion<'a> {
-    Command(&'static CommandSpec),
-    Theme {
-        id: &'a str,
-        label: &'a str,
-        current: bool,
-    },
-    ReloadThemes,
-}
-
-impl SlashSuggestion<'_> {
-    fn completion(self) -> String {
-        match self {
-            Self::Command(spec) => spec.completion.to_owned(),
-            Self::Theme { id, .. } => format!("/theme {id}"),
-            Self::ReloadThemes => "/theme reload".into(),
-        }
-    }
-
-    fn usage(self) -> String {
-        match self {
-            Self::Command(spec) => spec.usage.to_owned(),
-            Self::Theme { id, current, .. } => {
-                format!("{} {id}", if current { "●" } else { " " })
-            }
-            Self::ReloadThemes => "↻ reload".into(),
-        }
-    }
-
-    fn description(self) -> String {
-        match self {
-            Self::Command(spec) => spec.description.to_owned(),
-            Self::Theme { label, current, .. } if current => format!("{label} · 当前"),
-            Self::Theme { label, .. } => label.to_owned(),
-            Self::ReloadThemes => "重新读取 themes.json".into(),
-        }
-    }
-
-    fn opens_submenu(self) -> bool {
-        matches!(self, Self::Command(spec) if spec.completion == "/theme")
-    }
+    category: CommandCategory,
+    danger: bool,
 }
 
 enum SlashKeyAction {
@@ -534,163 +549,485 @@ enum SlashKeyAction {
 
 const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
-        completion: "/ai",
-        usage: "/ai settings · login/models/model/effort · enable/disable · 三模式",
-        description: "候选模式、批准、丢弃与立即暂停",
+        completion: "/mute",
+        usage: "静音麦克风",
+        description: "关闭声音；重复执行仍静音",
+        category: CommandCategory::Obs,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/unmute",
+        usage: "恢复麦克风",
+        description: "声音将公开",
+        category: CommandCategory::Obs,
+        danger: true,
+    },
+    CommandSpec {
+        completion: "/scene",
+        usage: "切换场景",
+        description: "输入场景名称",
+        category: CommandCategory::Obs,
+        danger: true,
+    },
+    CommandSpec {
+        completion: "/commands",
+        usage: "指令",
+        description: "中文搜索，保留草稿",
+        category: CommandCategory::System,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/more",
+        usage: "更多",
+        description: "OBS、诊断、帮助、退出",
+        category: CommandCategory::System,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/settings",
+        usage: "设置与操作",
+        description: "五类设置、本场与常用操作",
+        category: CommandCategory::System,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/diag",
+        usage: "诊断",
+        description: "历史告警与连接信息",
+        category: CommandCategory::System,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/pin",
+        usage: "重点消息",
+        description: "标记选中或最新消息",
+        category: CommandCategory::System,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/find",
+        usage: "搜索归档",
+        description: "输入关键词；也可直接带参数",
+        category: CommandCategory::System,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/obs ",
+        usage: "OBS",
+        description: "已有连接与控制操作",
+        category: CommandCategory::Obs,
+        danger: false,
     },
     CommandSpec {
         completion: "/help",
-        usage: "/help",
-        description: "显示命令面板操作提示",
-    },
-    CommandSpec {
-        completion: "/login",
-        usage: "/login",
-        description: "登录 B 站账号",
-    },
-    CommandSpec {
-        completion: "/logout",
-        usage: "/logout",
-        description: "清除独立登录态",
-    },
-    CommandSpec {
-        completion: "/layout",
-        usage: "/layout",
-        description: "切换聊天与信息流布局",
-    },
-    CommandSpec {
-        completion: "/history ",
-        usage: "/history [秒数|off]",
-        description: "历史空闲自动返回；off 仅手动，秒数启用",
-    },
-    CommandSpec {
-        completion: "/theme",
-        usage: "/theme",
-        description: "打开主题选择列表",
-    },
-    CommandSpec {
-        completion: "/names show",
-        usage: "/names show",
-        description: "显示用户名",
-    },
-    CommandSpec {
-        completion: "/names hide",
-        usage: "/names hide",
-        description: "隐藏用户名",
-    },
-    CommandSpec {
-        completion: "/time show",
-        usage: "/time show",
-        description: "显示消息时间",
-    },
-    CommandSpec {
-        completion: "/time hide",
-        usage: "/time hide",
-        description: "隐藏消息时间",
-    },
-    CommandSpec {
-        completion: "/feature",
-        usage: "/feature",
-        description: "设为重点消息",
-    },
-    CommandSpec {
-        completion: "/archive ",
-        usage: "/archive [关键词]",
-        description: "搜索归档会话",
-    },
-    CommandSpec {
-        completion: "/obs",
-        usage: "/obs",
-        description: "检查 OBS 连接并显示状态",
-    },
-    CommandSpec {
-        completion: "/obs status",
-        usage: "/obs status",
-        description: "查看 OBS 状态",
-    },
-    CommandSpec {
-        completion: "/obs connect",
-        usage: "/obs connect",
-        description: "检查 OBS 连接",
-    },
-    CommandSpec {
-        completion: "/obs mute",
-        usage: "/obs mute",
-        description: "静音麦克风",
-    },
-    CommandSpec {
-        completion: "/obs unmute",
-        usage: "/obs unmute",
-        description: "取消麦克风静音",
-    },
-    CommandSpec {
-        completion: "/obs scene ",
-        usage: "/obs scene [名称]",
-        description: "列出或切换场景",
-    },
-    CommandSpec {
-        completion: "/obs config mic ",
-        usage: "/obs config mic [名称]",
-        description: "列出或选择麦克风",
-    },
-    CommandSpec {
-        completion: "/obs config password",
-        usage: "/obs config password",
-        description: "更新本地 OBS 密码",
-    },
-    CommandSpec {
-        completion: "/obs start",
-        usage: "/obs start",
-        description: "开始推流",
-    },
-    CommandSpec {
-        completion: "/obs stop",
-        usage: "/obs stop",
-        description: "交互确认后倒计时 3 秒停止推流",
+        usage: "帮助",
+        description: "操作说明",
+        category: CommandCategory::System,
+        danger: false,
     },
     CommandSpec {
         completion: "/quit",
-        usage: "/quit",
-        description: "退出弹幕台",
+        usage: "退出弹幕台",
+        description: "不停止推流",
+        category: CommandCategory::System,
+        danger: true,
+    },
+    CommandSpec {
+        completion: "/ai",
+        usage: "AI助手",
+        description: "打开运行面板，不启动",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/review",
+        usage: "待审回复",
+        description: "全文审核后发送",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/pause",
+        usage: "暂停AI",
+        description: "撤权，保留可继续状态",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/ai start",
+        usage: "启动AI",
+        description: "连接工具，处理新弹幕",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/ai auto on",
+        usage: "自动发送",
+        description: "公开发送 · 同房间同账号记住",
+        category: CommandCategory::Ai,
+        danger: true,
+    },
+    CommandSpec {
+        completion: "/ai auto off",
+        usage: "逐条发送",
+        description: "立即撤销自动许可",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/ai range",
+        usage: "本场范围",
+        description: "仅改变当前场次",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/ai topic",
+        usage: "本场主题",
+        description: "仅影响AI上下文，不修改直播间",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/ai visible",
+        usage: "处理可见弹幕",
+        description: "重建上下文，处理可见内容",
+        category: CommandCategory::Ai,
+        danger: true,
+    },
+    CommandSpec {
+        completion: "/ai reset",
+        usage: "重建上下文",
+        description: "丢弃当前上下文",
+        category: CommandCategory::Ai,
+        danger: true,
+    },
+    CommandSpec {
+        completion: "/ai stop",
+        usage: "结束AI",
+        description: "释放进程并撤销许可",
+        category: CommandCategory::Ai,
+        danger: true,
+    },
+    CommandSpec {
+        completion: "/diag repair",
+        usage: "重建历史",
+        description: "先备份，再修复副本",
+        category: CommandCategory::System,
+        danger: true,
+    },
+    CommandSpec {
+        completion: "/ai model",
+        usage: "模型",
+        description: "AI工具与原生选项",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/ai replies",
+        usage: "发送策略",
+        description: "方案与默认范围",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/ai materials",
+        usage: "人设与资料",
+        description: "AI名字、人设与上下文",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/ai advanced",
+        usage: "Agent配置",
+        description: "规则、运行策略与维护",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/ai workspace",
+        usage: "工作空间",
+        description: "编辑Agent工作目录",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/about",
+        usage: "关于弹幕台",
+        description: "官网、创始人、版本与源码",
+        category: CommandCategory::System,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/room title",
+        usage: "直播间标题",
+        description: "公开修改B站标题；不改AI主题",
+        category: CommandCategory::Account,
+        danger: true,
+    },
+    CommandSpec {
+        completion: "/room cover",
+        usage: "直播间封面",
+        description: "上传本地图片并提交审核",
+        category: CommandCategory::Account,
+        danger: true,
+    },
+    CommandSpec {
+        completion: "/display theme",
+        usage: "主题",
+        description: "选择界面主题",
+        category: CommandCategory::Display,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/display names on",
+        usage: "显示昵称",
+        description: "保存显示设置",
+        category: CommandCategory::Display,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/display names off",
+        usage: "隐藏昵称",
+        description: "保存显示设置",
+        category: CommandCategory::Display,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/display time on",
+        usage: "显示时间",
+        description: "保存显示设置",
+        category: CommandCategory::Display,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/display time off",
+        usage: "隐藏时间",
+        description: "保存显示设置",
+        category: CommandCategory::Display,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/display layout chat",
+        usage: "聊天布局",
+        description: "保存显示设置",
+        category: CommandCategory::Display,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/display layout list",
+        usage: "列表布局",
+        description: "保存显示设置",
+        category: CommandCategory::Display,
+        danger: false,
     },
 ];
 
-fn slash_suggestions<'a>(
-    input: &str,
-    themes: &'a crate::theme::ThemeCatalog,
-) -> Vec<SlashSuggestion<'a>> {
-    if !input.starts_with('/') {
-        return Vec::new();
+const OBS_COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        completion: "/obs config host",
+        usage: "接入地址",
+        description: "编辑OBS WebSocket主机名或IP",
+        category: CommandCategory::Obs,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/obs config port",
+        usage: "接入端口",
+        description: "编辑OBS WebSocket端口",
+        category: CommandCategory::Obs,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/obs status",
+        usage: "连接状态",
+        description: "查看OBS",
+        category: CommandCategory::Obs,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/obs connect",
+        usage: "检查连接",
+        description: "检查OBS",
+        category: CommandCategory::Obs,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/obs config mic",
+        usage: "麦克风配置",
+        description: "输入麦克风名称",
+        category: CommandCategory::Obs,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/obs config password",
+        usage: "连接密码",
+        description: "编辑私有密码",
+        category: CommandCategory::Obs,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/obs start",
+        usage: "开始推流",
+        description: "立即开始直播",
+        category: CommandCategory::Obs,
+        danger: true,
+    },
+    CommandSpec {
+        completion: "/obs stop",
+        usage: "停止推流",
+        description: "直播将中断",
+        category: CommandCategory::Obs,
+        danger: true,
+    },
+];
+
+const SETTINGS_COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        completion: "/settings reading",
+        usage: "外观与显示",
+        description: "主题、布局与阅读",
+        category: CommandCategory::Display,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/settings account",
+        usage: "B站账号与直播间",
+        description: "主账号、AI发送账号、标题与封面",
+        category: CommandCategory::Account,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/settings obs",
+        usage: "OBS设置",
+        description: "接入配置与当前控制",
+        category: CommandCategory::Obs,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/settings ai",
+        usage: "AI助手设置",
+        description: "工作空间、Agent与发送策略",
+        category: CommandCategory::Ai,
+        danger: false,
+    },
+    CommandSpec {
+        completion: "/settings system",
+        usage: "系统与关于",
+        description: "工具信息、诊断与修复",
+        category: CommandCategory::System,
+        danger: false,
+    },
+];
+
+fn command_value(mut raw: &str, tokens: usize) -> Option<&str> {
+    for _ in 0..tokens {
+        raw = raw.trim_start();
+        raw = &raw[raw.find(char::is_whitespace).unwrap_or(raw.len())..];
     }
-    if let Some(rest) = input.strip_prefix("/theme")
-        && (rest.is_empty() || rest.starts_with(' '))
-    {
-        let query = rest.trim();
-        let selected = themes.selected();
-        let mut entries = themes
-            .entries()
-            .filter(|(id, _)| id.starts_with(query))
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|(id, _)| usize::from(*id != selected));
-        let mut suggestions = entries
-            .into_iter()
-            .map(|(id, label)| SlashSuggestion::Theme {
-                id,
-                label,
-                current: id == selected,
-            })
-            .collect::<Vec<_>>();
-        if "reload".starts_with(query) {
-            suggestions.push(SlashSuggestion::ReloadThemes);
-        }
-        return suggestions;
-    }
-    COMMAND_SPECS
+    let value = raw.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn ai_command(spec: &CommandSpec) -> bool {
+    matches!(spec.completion, "/ai" | "/review" | "/pause")
+        || spec.completion.starts_with("/ai ")
+        || spec.completion == "/settings ai"
+}
+
+fn obs_command(command: &str) -> bool {
+    matches!(command, "/obs" | "/mute" | "/unmute" | "/scene") || command.starts_with("/obs ")
+}
+
+fn command_suggestions(input: &str, include_ai: bool) -> Vec<&'static CommandSpec> {
+    let query = input.strip_prefix('/').unwrap_or(input);
+    let (primary, settings, obs): (&[CommandSpec], &[CommandSpec], &[CommandSpec]) =
+        if input.starts_with("/obs ") {
+            (OBS_COMMAND_SPECS, &[], &[])
+        } else if input.starts_with("/settings ") {
+            (SETTINGS_COMMAND_SPECS, &[], &[])
+        } else {
+            (COMMAND_SPECS, SETTINGS_COMMAND_SPECS, OBS_COMMAND_SPECS)
+        };
+    let show_ai = include_ai || !query.trim().is_empty();
+    let commands = primary
         .iter()
-        .filter(|spec| spec.completion.starts_with(input))
-        .map(SlashSuggestion::Command)
+        .chain(settings)
+        .chain(obs)
+        .filter(|spec| show_ai || !ai_command(spec))
+        .filter(|spec| {
+            !query.is_empty()
+                || matches!(
+                    spec.completion,
+                    "/mute"
+                        | "/unmute"
+                        | "/scene"
+                        | "/ai"
+                        | "/review"
+                        | "/pause"
+                        | "/pin"
+                        | "/find"
+                        | "/settings"
+                        | "/diag"
+                        | "/help"
+                        | "/quit"
+                )
+        });
+    let prefixes: Vec<_> = commands
+        .clone()
+        .filter(|spec| spec.completion.trim_start_matches('/').starts_with(query))
+        .collect();
+    if !prefixes.is_empty() {
+        return prefixes;
+    }
+    let titles: Vec<_> = commands
+        .clone()
+        .filter(|spec| spec.usage.contains(query))
+        .collect();
+    if !titles.is_empty() {
+        return titles;
+    }
+    commands
+        .filter(|spec| spec.description.contains(query))
         .collect()
 }
+
+#[derive(Default)]
+struct HelpState {
+    scroll: usize,
+    max_scroll: usize,
+    page_rows: usize,
+}
+
+const HELP_SECTIONS: &[(&str, &str)] = &[
+    (
+        "常用",
+        "输入 / 只显示常用操作；输入中文或命令前缀搜索全部，↑↓选择、Enter执行、Tab补全。/mute静音，/unmute恢复声音，/scene切场景，/diag看诊断。Ctrl-O独立搜索并保留草稿与光标。低频配置在/settings，AI运行操作在/ai。
+普通输入 Enter 人工发送；粘贴只插入、不执行。Shift-↑/↓选择回复对象，Enter插入@；滚轮或↑↓浏览历史，Esc / End回最新。主界面直接拖选文字，用终端复制快捷键（macOS为⌘C）；↶表示重启前的弹幕。/pin标记消息；/find 打开关键词编辑，/find [关键词]直接搜索归档。",
+    ),
+    (
+        "设置与回复",
+        "设置用方向键选择、Enter执行、Esc返回；“设置”“当前操作”为只读分组。直达页Esc一次关闭。Tab切换同级分类，F1或?展开说明。编辑Enter保存、Esc取消；归档搜索必须输入关键词，取消不搜索。
+/display theme选择主题；/display names或time on|off；/display layout chat|list保存布局。/settings ai集中AI配置；/ai model、/ai replies、/ai materials、/ai advanced直达子页，/ai workspace编辑工作空间。
+/review查看候选全文；Shift-Enter发送本条，e编辑，Delete丢弃，Tab下一条。长文须先下滑看完；编辑只保存，须重新看完才可发送。",
+    ),
+    (
+        "AI运行",
+        "/ai start 启动；/pause 暂停并撤权、保留可继续状态；/ai stop 释放专用进程。/ai range 本场范围，/ai topic 本场主题。\n/ai auto on 允许公开自动发送，同房间同账号记住；/ai auto off 立即撤权。旧自动偏好不是许可。/ai visible 处理可见弹幕；/ai reset 重建上下文。/diag repair 先备份再重建历史。",
+    ),
+    (
+        "指令与编辑",
+        "指令搜索用↑↓选择、Enter执行；Tab只补全，带参数命令不猜参数。Ctrl-O、Ctrl-G、Ctrl-P、Ctrl-C仍兼容；不需要鼠标点击。\n←/→移光标，Home/End到首尾，Alt-←/→跳词。Backspace/Delete删除，Ctrl-U清空，Ctrl-W删前词，Ctrl-K删到末尾。单次粘贴最多4096字节，控制字符过滤。",
+    ),
+    (
+        "状态与诊断",
+        "输入框右侧保留人数、点赞与在线数；-- 表示暂无可靠数据。✓送达，?送达未确认且不自动重发，×被拒。AI逐条为绿色，未授权为黄色，自动为红色。\n/settings system提供诊断和修复；/about查看官网、创始人和版本。/diag保留历史告警、真实路径与连接细节，不扫描工具。人工发送失败仅结束本次及旧排队任务，后续新输入可继续发送；未确认消息不自动重发，登录失效仍须重新登录。",
+    ),
+    (
+        "OBS与退出",
+        "/settings obs配置接入地址、端口、密码和输入；/obs config host、port、mic不带参数打开编辑器，带值立即保存；/obs connect检查连接。\n/mute静音；/unmute公开声音；/scene [名称]编辑或切换场景；/obs start开始推流。只有/obs stop二次确认，确认后3秒内可取消。/quit退出弹幕台，不停止推流。\n/room title [标题]公开修改直播间标题，/room cover [图片路径]提交封面；仅主账号本人的直播间可修改，审核中不代表已生效。本地模式拒绝真实账号、直播间修改与OBS。",
+    ),
+];
 
 #[derive(Debug, Clone, Copy)]
 enum StopFlow {
@@ -703,10 +1040,19 @@ pub struct TerminalApp {
     config: TerminalConfig,
     client: BilibiliClient,
     account: AccountClient,
-    send_queue: SendQueue,
-    autoreply: Option<autoreply::Handle>,
-    ai_settings: ai_settings::Settings,
-    reply_panel: bool,
+    assistant_accounts: accounts::AssistantAccounts,
+    manual_send_queue: SendQueue,
+    independent_send_queue: SendQueue,
+    bridge: Bridge,
+    local_transport: Option<std::sync::Arc<agent::LocalTransport>>,
+    live_scope: Option<String>,
+    candidate_selected: Option<(String, String)>,
+    candidate_edit: Option<agent::CandidateEdit>,
+    review_frame: Option<agent::ReviewFrame>,
+    runner: crate::runner::Runner,
+    assistant_panel: Option<assistant::Panel>,
+    settings_operation: Option<uuid::Uuid>,
+    profile: agent::ProfileState,
     obs: ObsController,
     journal: SessionJournal,
     session: DanmuSession,
@@ -718,12 +1064,17 @@ pub struct TerminalApp {
     online_viewers: Option<u64>,
     input: EditorInput,
     slash_selection: usize,
+    command_search_draft: Option<EditorInput>,
+    secret_draft: Option<EditorInput>,
+    help: Option<HelpState>,
     selected: usize,
     scroll_offset: usize,
     last_user_activity: Instant,
     activity: activity::ActivityNotices,
     notice: String,
     notice_deadline: Option<Instant>,
+    notice_is_delivery: bool,
+    notice_level: NoticeLevel,
     delivery_status: DeliveryStatus,
     delivery_status_deadline: Option<Instant>,
     layout_chat: bool,
@@ -732,6 +1083,7 @@ pub struct TerminalApp {
     account_status: AccountStatus,
     stop_flow: Option<StopFlow>,
     login_qr: Option<Vec<String>>,
+    main_login: Option<MainLogin>,
     secret_mode: bool,
     selection_active: bool,
     quit_requested: bool,
@@ -743,18 +1095,43 @@ pub struct TerminalApp {
     pending_deliveries: VecDeque<ActiveDelivery>,
     confirmed_deliveries: VecDeque<PendingDelivery>,
     last_realtime_at: Option<DateTime<Local>>,
-    live_danmu_count: u64,
     last_live_danmu_at: Option<DateTime<Local>>,
     animation_tick: u64,
+    resume_pending: bool,
 }
 
 impl TerminalApp {
+    fn record_reading_config(&mut self) {
+        self.runner
+            .record_reading_config(crate::workspace_config::Reading {
+                single_line: self.config.single_line,
+                chat_layout: self.layout_chat,
+                show_time: self.show_time,
+                show_name: self.show_name,
+                history_idle_seconds: self.config.history_idle_seconds,
+                theme: self.config.theme_name.clone(),
+            });
+        if let Some(warning) = self.runner.config_warning.clone() {
+            self.set_notice(warning, NoticeLevel::Error);
+        }
+    }
+    fn persist_ui(&mut self, key: &str, value: toml_edit::Value) -> bool {
+        match self.config.save_value(key, value) {
+            Ok(()) => true,
+            Err(error) => {
+                self.set_notice(format!("配置未保存：{error}"), NoticeLevel::Error);
+                false
+            }
+        }
+    }
     pub async fn run(
         config: TerminalConfig,
         account_session: PathBuf,
         obs: ObsController,
         journal: SessionJournal,
     ) -> Result<()> {
+        let shutdown = shutdown_signal()?;
+        tokio::pin!(shutdown);
         let room_id = config.room_id.clone();
         let palette = config.palette;
         let mut terminal = TerminalGuard::enter()?;
@@ -786,27 +1163,27 @@ impl TerminalApp {
         ));
         let mut startup_data = None;
         let mut startup_obs_check = Box::pin(check_startup_obs(obs.clone()));
-        let mut startup_result = None;
+        let mut startup_result: Option<StartupData> = None;
         let mut startup_session_result = None;
         let mut startup_obs_done = false;
         let mut startup_gate = StartupGate::default();
+        let mut runner = crate::runner::Runner::load(&config.config_path);
+        let mut startup_accounts: Option<accounts::AssistantAccounts> = None;
+        let mut automatic_restore = false;
+        let mut automatic_restore_warning = None;
+        let mut resume_decision = (!runner.settings.resume_on_start).then_some(false);
         let (
             StartupData {
                 room,
                 initial_room_error,
                 account_status,
-                online_viewers,
-                likes,
-                initial_online_error,
-                initial_likes_error,
             },
             StartupSession {
                 session,
                 initial_error: initial_session_error,
             },
         ) = loop {
-            let checks_ready =
-                startup_result.is_some() && startup_session_result.is_some() && startup_obs_done;
+            let checks_ready = startup_result.is_some() && startup_session_result.is_some();
             if checks_ready && matches!(startup_gate, StartupGate::Checking) {
                 startup_gate = if startup_view.has_warning() {
                     StartupGate::Blocked
@@ -814,20 +1191,35 @@ impl TerminalApp {
                     StartupGate::Ready
                 };
             }
-            if startup_can_finish(
-                startup_started_at.elapsed(),
-                checks_ready && startup_gate.can_finish(),
-            ) {
-                break (
-                    startup_result.take().expect("startup result checked above"),
-                    startup_session_result
-                        .take()
-                        .expect("startup session checked above"),
-                );
+            if checks_ready && startup_gate.can_finish() {
+                if resume_decision.is_none() {
+                    let accounts = startup_accounts
+                        .as_ref()
+                        .expect("startup accounts are loaded");
+                    let status = &startup_result
+                        .as_ref()
+                        .expect("startup data is ready")
+                        .account_status;
+                    if runner.settings.automatic && accounts.automatic_matches(&room_id, status) {
+                        automatic_restore = true;
+                        resume_decision = Some(true);
+                        continue;
+                    }
+                    resume_decision = Some(false);
+                    continue;
+                } else {
+                    break (
+                        startup_result.take().expect("startup result checked above"),
+                        startup_session_result
+                            .take()
+                            .expect("startup session checked above"),
+                    );
+                }
             }
             tokio::select! {
                 result = &mut startup_clients, if clients.is_none() => {
                     let (client, account) = result?;
+                    startup_accounts = Some(accounts::AssistantAccounts::load(&account, &config.config_path)?);
                     startup_data = Some(Box::pin(load_startup_data(
                         client.clone(),
                         account.clone(),
@@ -845,6 +1237,11 @@ impl TerminalApp {
                         .expect("startup data is guarded above")
                         .await
                 }, if startup_data.is_some() && startup_result.is_none() => {
+                    let accounts = startup_accounts.as_mut().expect("startup accounts are loaded");
+                    if accounts.has_automatic_grant() && !accounts.automatic_matches(&room_id, &result.account_status)
+                        && let Err(error) = accounts.forget_automatic() {
+                        automatic_restore_warning = Some(format!("房间或账号不匹配，未恢复自动发送；清除旧授权失败：{error}"));
+                    }
                     startup_result = Some(result);
                 }
                 status = &mut startup_obs_check, if !startup_obs_done => {
@@ -854,6 +1251,7 @@ impl TerminalApp {
                 Some(update) = startup_update_rx.recv() => {
                     startup_view.apply(update);
                 }
+                _ = &mut shutdown => return Ok(()),
                 _ = startup_tick.tick() => {
                     startup_frame = startup_frame.wrapping_add(1);
                     terminal.terminal.draw(|frame| {
@@ -869,9 +1267,8 @@ impl TerminalApp {
                     })?;
                 }
                 event = events.next() => {
-                    let Some(Ok(event)) = event else {
-                        continue;
-                    };
+                    let Some(event) = event else { return Ok(()); };
+                    let event = event?;
                     match event {
                         Event::Key(key) => {
                             if key.code == KeyCode::Char('c')
@@ -957,8 +1354,10 @@ impl TerminalApp {
                             }
                         }
                         Event::Paste(text) => {
-                            if let StartupGate::EnteringObsPassword(input) = &mut startup_gate {
-                                input.insert_text(&text);
+                            if let StartupGate::EnteringObsPassword(input) = &mut startup_gate
+                                && text.len() <= 4096
+                            {
+                                input.insert_paste(&text, false);
                             }
                         }
                         _ => {}
@@ -968,44 +1367,59 @@ impl TerminalApp {
         };
         let (client, account) = clients.expect("startup clients checked above");
         journal.start(&session)?;
+        let history_error = runner
+            .begin_history_import(&session.room_id, &journal)
+            .err();
         let room_updated_at = room.as_ref().map(|_| Local::now());
         let mut app = Self {
-            ai_settings: ai_settings::Settings::default(),
-            autoreply: Some(autoreply::Handle::start(
-                config.autoreply.clone(),
-                journal.clone(),
-                session.id.clone(),
-            )),
-            reply_panel: true,
+            bridge: Bridge::new(false),
+            local_transport: None,
+            live_scope: None,
+            candidate_selected: None,
+            candidate_edit: None,
+
+            review_frame: None,
+            runner,
+            assistant_panel: None,
+            settings_operation: None,
+            profile: agent::ProfileState::default(),
             layout_chat: config.chat_layout,
             show_name: config.show_name,
             show_time: config.show_time,
+            assistant_accounts: startup_accounts.expect("startup accounts are loaded"),
             config,
             client: client.clone(),
             account,
-            send_queue: SendQueue::default(),
+            manual_send_queue: SendQueue::default(),
+            independent_send_queue: SendQueue::default(),
             obs,
             journal,
             session,
             room,
             connection: "连接中".into(),
             watched: None,
-            likes,
-            online_viewers,
+            likes: None,
+            online_viewers: None,
             input: EditorInput::default(),
             room_updated_at,
             slash_selection: 0,
+            command_search_draft: None,
+            secret_draft: None,
+            help: None,
             selected: 0,
             scroll_offset: 0,
             last_user_activity: Instant::now(),
             activity: activity::ActivityNotices::default(),
-            notice: "Tab 切换布局；输入 /help 查看命令".into(),
+            notice: "/ · Commands     Tab · Layout".into(),
             notice_deadline: Some(Instant::now() + Duration::from_secs(6)),
+            notice_is_delivery: false,
+            notice_level: NoticeLevel::Info,
             delivery_status: DeliveryStatus::Idle,
             delivery_status_deadline: None,
             account_status,
             stop_flow: None,
             login_qr: None,
+            main_login: None,
             secret_mode: false,
             selection_active: false,
             quit_requested: false,
@@ -1015,21 +1429,24 @@ impl TerminalApp {
             pending_deliveries: VecDeque::new(),
             confirmed_deliveries: VecDeque::new(),
             last_realtime_at: None,
-            live_danmu_count: 0,
             obs_error: None,
             obs_checked_at: None,
             last_live_danmu_at: None,
             animation_tick: 0,
+            resume_pending: false,
         };
-        if let Some(error) = initial_session_error {
+        if let Some(error) = history_error {
+            app.runner.history_warning = Some(format!("后台历史加载未启动：{error:#}"));
+            app.set_notice("历史后台加载未启动；输入 /diag 查看", NoticeLevel::Error);
+        } else if let Some(error) = initial_session_error {
             app.set_notice(format!("本地会话恢复失败：{error}"), NoticeLevel::Error);
         } else if let Some(error) = initial_room_error {
             app.set_notice(format!("房间数据读取失败：{error}"), NoticeLevel::Error);
-        } else if let Some(error) = initial_online_error {
-            app.set_notice(format!("在线人数读取失败：{error}"), NoticeLevel::Error);
-        } else if let Some(error) = initial_likes_error {
-            app.set_notice(format!("点赞数读取失败：{error}"), NoticeLevel::Error);
         }
+        if let Some(warning) = automatic_restore_warning {
+            app.set_notice(warning, NoticeLevel::Error);
+        }
+        app.record_reading_config();
         let (client_tx, mut client_rx) = mpsc::channel(512);
         let (stop_tx, stop_rx) = watch::channel(false);
         let stream_room_id = room_id.clone();
@@ -1066,6 +1483,12 @@ impl TerminalApp {
         let refresh_room_id = room_id.clone();
         let mut last_room = app.room.clone();
         tokio::spawn(async move {
+            if let Some(room) = last_room.as_ref()
+                && !send_room_metrics(&room_account, &room_tx, room).await
+            {
+                return;
+            }
+
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 match room_client
@@ -1074,18 +1497,15 @@ impl TerminalApp {
                 {
                     Ok(snapshot) => {
                         last_room = Some(snapshot.clone());
-                        let (online, likes) = tokio::join!(
-                            room_account.current_online_viewers(
-                                &snapshot.room_id,
-                                &snapshot.broadcaster_id,
-                            ),
-                            room_account.current_likes(&snapshot.room_id),
-                        );
-                        let online = online.map_err(|error| error.to_string());
-                        let likes = likes.map_err(|error| error.to_string());
                         if room_tx.send(UiEvent::RoomSnapshot(snapshot)).await.is_err()
-                            || room_tx.send(UiEvent::OnlineViewers(online)).await.is_err()
-                            || room_tx.send(UiEvent::Likes(likes)).await.is_err()
+                            || !send_room_metrics(
+                                &room_account,
+                                &room_tx,
+                                last_room
+                                    .as_ref()
+                                    .expect("successful room refresh is stored"),
+                            )
+                            .await
                         {
                             break;
                         }
@@ -1106,23 +1526,100 @@ impl TerminalApp {
             }
         });
         let mut tick = tokio::time::interval(Duration::from_millis(250));
+        let _bridge_server = if let Some(root) = &app.config.instance {
+            Some(bridge::wire::serve(root, app.bridge.clone()).await?)
+        } else {
+            None
+        };
         let mut should_quit = false;
+        app.resume_pending = resume_decision == Some(true);
+        if !app.resume_pending && app.runner.settings.resume_on_start {
+            app.set_notice("AI已暂停 · /ai start 继续", NoticeLevel::Info);
+        }
+        let restore_scope = (app.bridge.session_id(), app.assistant_accounts.generation());
+        let mut restore_verified = !automatic_restore;
+        let mut restore_check = if automatic_restore {
+            let identity = app.assistant_accounts.send_identity(&app.account_status);
+            Some(tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(10), identity.status())
+                    .await
+                    .map_err(|_| "发送身份验证超时；本次未恢复自动发送".to_string())?
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }))
+        } else {
+            None
+        };
+        if app.resume_pending {
+            app.set_notice(
+                "已记住自动发送；后台核对发送身份，Esc 可取消本次恢复",
+                NoticeLevel::Info,
+            );
+        }
 
+        let loop_result: Result<()> = async {
         while !should_quit {
-            app.advance_autoreply(ui_tx.clone()).await;
-            terminal.terminal.draw(|frame| draw(frame, &mut app))?;
+            if !app.resume_pending && let Some(check) = restore_check.take() { check.abort(); }
+            app.advance_bridge(ui_tx.clone());
+            if app.resume_pending
+                && restore_verified
+                && !app.runner.history_loading()
+                && app.bridge.status()["available"] == true
+            {
+                app.resume_pending = false;
+                let result = app
+                    .restore_automatic(&restore_scope.0, restore_scope.1)
+                    .and_then(|()| app.runner.start(&app.bridge, false, false));
+                if let Err(error) = result {
+                    app.runner.pause(&app.bridge);
+                    app.set_notice(
+                        format!("助手未启用：{error}；请从 /ai 检查后重试"),
+                        NoticeLevel::Error,
+                    );
+                } else {
+                    app.set_notice(
+                        "身份核验通过，AI正在启动；/pause 暂停",
+                        NoticeLevel::Info,
+                    );
+                }
+            }
+            terminal.draw_app(&mut app)?;
             tokio::select! {
+                result = async { restore_check.as_mut().expect("restore check is guarded").await }, if restore_check.is_some() => {
+                    restore_check = None;
+                    match result {
+                        Ok(Ok(())) => restore_verified = true,
+                        error => {
+                            app.resume_pending = false;
+                            app.set_notice(format!("自动发送未恢复：{}；请从 /ai 检查身份", match error {
+                                Ok(Err(message)) => message,
+                                Err(error) => error.to_string(),
+                                Ok(Ok(())) => unreachable!(),
+                            }), NoticeLevel::Error);
+                        }
+                    }
+                },
+                _ = &mut shutdown => { should_quit = true; },
                 _ = tick.tick() => {
                     app.animation_tick = app.animation_tick.wrapping_add(1);
                     app.expire_notice_at(Instant::now());
                     app.advance_stop_at(Instant::now(), &ui_tx);
                     app.advance_history_at(Instant::now());
                 },
-                event = events.next() => if let Some(Ok(event)) = event {
+                event = events.next() => {
+                    let Some(event) = event else { break; };
+                    let event = event?;
                     match event {
                         Event::Key(key) => {
+                            if app.resume_pending && key.kind == crossterm::event::KeyEventKind::Press
+                                && (!automatic_restore || key.code == KeyCode::Esc || (key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL))) {
+                                app.resume_pending = false;
+                                if let Some(check) = restore_check.take() { check.abort(); }
+                                app.set_notice("已取消本次待启用；助手保持关闭", NoticeLevel::Info);
+                            }
                             should_quit = app.handle_key(key, ui_tx.clone()).await?;
                         }
+                        Event::Paste(text) => app.handle_paste(&text),
                         Event::Mouse(mouse) => app.handle_mouse(mouse),
                         _ => {}
                     }
@@ -1134,10 +1631,19 @@ impl TerminalApp {
                 },
             }
         }
-        if let Some(reply) = app.autoreply.as_mut() {
-            reply.mode(ReplyMode::Paused);
+        Ok(())
+        }.await;
+        if let Some(check) = restore_check {
+            check.abort();
         }
+        let routing_log = app
+            .runner
+            .record_routing(&app.bridge, &app.journal, &app.session, true);
+        app.runner.shutdown(&app.bridge).await;
+        app.bridge.end();
         let _ = stop_tx.send(true);
+        loop_result?;
+        routing_log?;
         app.session
             .end(Utc::now(), DanmuSessionEndReason::Completed);
         app.journal.end(&app.session)?;
@@ -1177,7 +1683,6 @@ impl TerminalApp {
             BilibiliClientEvent::Danmu(event) => {
                 self.last_realtime_at = Some(Local::now());
                 if event.origin == DanmuEventOrigin::Live && event.kind == DanmuEventKind::Danmu {
-                    self.live_danmu_count = self.live_danmu_count.saturating_add(1);
                     self.last_live_danmu_at = Some(Local::now());
                 }
                 self.ingest_event(event);
@@ -1187,20 +1692,16 @@ impl TerminalApp {
 
     fn handle_ui_event(&mut self, event: UiEvent) {
         match event {
-            UiEvent::AiSettings(event) => {
-                if self.ai_settings.apply(event)
-                    && self.config.autoreply.provider == autoreply::Provider::Chatgpt
-                    && let Some(reply) = self.autoreply.as_mut()
-                {
-                    reply.mode(ReplyMode::Paused);
-                }
+            UiEvent::SettingSaved { token, result } => self.finish_setting_save(token, result),
+            UiEvent::LocalEcho(text) => {
+                let mut event = DanmuEvent::new(DanmuEventKind::Danmu, text);
+                event.username = Some("本机发送".into());
+                event.author_id = Some("local-host".into());
+                self.ingest_event(event);
             }
-            UiEvent::ReplyDelivery { key, state } => {
-                if let Some(reply) = self.autoreply.as_mut() {
-                    reply.delivery(key, state);
-                }
-            }
+
             UiEvent::DeliveryAccepted => self.set_delivery_status(DeliveryStatus::AwaitingEcho),
+            UiEvent::DeliveryNotice(message) => self.set_delivery_notice(message),
             UiEvent::ObsStopDone(result) => {
                 self.stop_flow = None;
                 self.handle_ui_event(operation_notice(
@@ -1209,27 +1710,120 @@ impl TerminalApp {
                         .map_err(anyhow::Error::msg),
                 ));
             }
+            UiEvent::AssistantAccount(event) => {
+                let ready = matches!(&event, accounts::AccountEvent::Ready { .. });
+                let unavailable = matches!(&event, accounts::AccountEvent::Unavailable { .. });
+                if let Some(mut message) = self.assistant_accounts.apply_event(event) {
+                    if unavailable {
+                        self.resume_pending = false;
+                        self.bridge.identity_changed();
+                        self.runner.pause(&self.bridge);
+                        self.review_frame = None;
+                        if let Err(error) = self.assistant_accounts.forget_automatic() {
+                            message.push_str(&format!("；清除记住的授权失败：{error}"));
+                        }
+                    } else {
+                        self.login_qr = self.assistant_accounts.qr_lines().map(<[String]>::to_vec);
+                    }
+                    self.set_notice(
+                        message,
+                        if unavailable {
+                            NoticeLevel::Error
+                        } else {
+                            NoticeLevel::Info
+                        },
+                    );
+                    if ready {
+                        let result = self
+                            .assistant_accounts
+                            .complete_independent_ready(&self.account_status);
+                        match result {
+                            Ok(message) => {
+                                self.bridge.identity_changed();
+                                self.runner.pause(&self.bridge);
+                                self.review_frame = None;
+                                self.set_notice(message, NoticeLevel::Success);
+                            }
+                            Err(error) => self.set_notice(error.to_string(), NoticeLevel::Error),
+                        }
+                        // Keep the visited account page and its return stack.
+                    }
+                }
+            }
             UiEvent::Notice { message, level } => {
                 self.set_notice(message, level);
-                self.login_qr = None;
             }
-            UiEvent::LoginQr(lines) => {
-                self.login_qr = Some(lines);
-                self.set_notice("请使用哔哩哔哩客户端扫码登录", NoticeLevel::Progress);
+            UiEvent::LoginQr { token, lines } => {
+                if self
+                    .main_login
+                    .as_ref()
+                    .is_some_and(|login| login.token == token)
+                {
+                    self.login_qr = Some(lines);
+                    self.set_notice("请使用主账号扫码登录", NoticeLevel::Progress);
+                }
             }
-            UiEvent::LoginDone(status) => {
-                self.account_status = status;
-                self.login_qr = None;
-                self.set_notice("B 站账号登录成功", NoticeLevel::Success);
+            UiEvent::LoginDone {
+                token,
+                account,
+                status,
+            } => {
+                if self
+                    .main_login
+                    .as_ref()
+                    .is_some_and(|login| login.token == token)
+                {
+                    self.cancel_main_login();
+                    let saved = self
+                        .account
+                        .session_path()
+                        .ok_or_else(|| anyhow!("主账号凭据目录不可用"))
+                        .and_then(|path| account.persist_to(path.to_path_buf()));
+                    match saved {
+                        Ok(_) => {
+                            self.account_status = status;
+                            let forgotten = self.assistant_accounts.main_changed();
+                            self.bridge.identity_changed();
+                            self.runner.pause(&self.bridge);
+                            self.review_frame = None;
+                            match forgotten {
+                                Ok(()) => self.set_notice(
+                                    "主账号登录成功；助手仍暂停，未授权发送",
+                                    NoticeLevel::Success,
+                                ),
+                                Err(error) => self.set_notice(
+                                    format!("主账号已登录，助手已停发；清除旧授权失败：{error}"),
+                                    NoticeLevel::Error,
+                                ),
+                            }
+                        }
+                        Err(error) => self.set_notice(
+                            format!("登录态保存失败，原账号保留：{error}"),
+                            NoticeLevel::Error,
+                        ),
+                    }
+                }
+            }
+            UiEvent::LoginFailed { token, message } => {
+                if self
+                    .main_login
+                    .as_ref()
+                    .is_some_and(|login| login.token == token)
+                {
+                    self.cancel_main_login();
+                    self.set_notice(message, NoticeLevel::Error);
+                }
             }
             UiEvent::ObsStatus(result) => {
                 self.obs_checked_at = Some(Local::now());
                 match result {
                     Ok(status) => {
+                        self.runner.observe_microphone(status.microphone);
                         self.obs_status = Some(status);
                         self.obs_error = None;
                     }
                     Err(error) => {
+                        self.runner.observe_microphone(MicrophoneState::Unknown);
                         self.obs_status = None;
                         self.obs_error = Some(error);
                     }
@@ -1238,6 +1832,32 @@ impl TerminalApp {
             UiEvent::RoomSnapshot(snapshot) => {
                 self.room = Some(snapshot);
                 self.room_updated_at = Some(Local::now());
+                self.sync_assistant_room();
+            }
+            UiEvent::BroadcasterProfile {
+                room_id,
+                user_id,
+                result,
+            } => {
+                if self
+                    .room
+                    .as_ref()
+                    .is_some_and(|room| room.room_id == room_id && room.broadcaster_id == user_id)
+                {
+                    self.profile.pending = false;
+                    self.profile.checked_at = Some(Instant::now());
+                    match result {
+                        Ok(value) => {
+                            self.profile.value = value;
+                            self.profile.error = None;
+                        }
+                        Err(error) => {
+                            self.profile.value = None;
+                            self.profile.error = Some(error);
+                        }
+                    }
+                    self.sync_assistant_room();
+                }
             }
             UiEvent::OnlineViewers(result) => match result {
                 Ok(viewers) => self.online_viewers = viewers,
@@ -1263,12 +1883,26 @@ impl TerminalApp {
             UiEvent::DeliveryStarted {
                 delivery,
                 confirmation,
+                registered,
             } => {
+                while self.pending_deliveries.len() >= 32 {
+                    self.pending_deliveries.pop_front();
+                }
                 self.pending_deliveries.push_back(ActiveDelivery {
                     delivery,
                     confirmation: Some(confirmation),
                 });
+                let _ = registered.send(());
                 self.set_delivery_status(DeliveryStatus::Sending);
+            }
+            UiEvent::AssistantDelivery { session_id, record } => {
+                if let Err(error) = self.journal.reply_record(&session_id, &record) {
+                    self.runner.pause(&self.bridge);
+                    self.set_notice(
+                        format!("发送结果归档失败，助手已暂停；真实发送结果不变且不重发：{error}"),
+                        NoticeLevel::Error,
+                    );
+                }
             }
             UiEvent::DeliveryHistory { events } => {
                 for event in events {
@@ -1277,6 +1911,19 @@ impl TerminalApp {
                 if !self.pending_deliveries.is_empty() {
                     self.set_delivery_status(DeliveryStatus::Verifying);
                 }
+            }
+            UiEvent::DeliveryEchoMissing { delivery_ids } => {
+                if self
+                    .pending_deliveries
+                    .iter()
+                    .any(|active| delivery_ids.contains(&active.delivery.id))
+                {
+                    self.set_delivery_status(DeliveryStatus::Uncertain);
+                    self.set_delivery_notice("未确认送达；不自动重发，详情见助手");
+                }
+            }
+            UiEvent::DeliveryExpired { delivery_id } => {
+                self.clear_delivery(&delivery_id);
             }
             UiEvent::DeliveryTimedOut { delivery_ids } => {
                 let contents = delivery_ids
@@ -1293,7 +1940,7 @@ impl TerminalApp {
                 }
                 self.set_delivery_status(DeliveryStatus::Uncertain);
                 self.set_delivery_notice(format!(
-                    "平台接受或回流未确认；队列暂停，不自动重发。{}",
+                    "平台接受或回流未确认；本次剩余部分取消，可继续输入新消息，不自动重发。{}",
                     contents
                         .iter()
                         .map(|content| format!("「{content}」"))
@@ -1306,6 +1953,11 @@ impl TerminalApp {
                 self.set_delivery_notice(format!("{message}；内容：「{content}」"));
             }
             UiEvent::DeliveryCompleted => {
+                if self.notice_is_delivery {
+                    self.notice.clear();
+                    self.notice_deadline = None;
+                    self.notice_is_delivery = false;
+                }
                 if self.pending_deliveries.is_empty() {
                     self.set_delivery_status(DeliveryStatus::Delivered);
                 } else {
@@ -1316,22 +1968,12 @@ impl TerminalApp {
     }
 
     fn ingest_event(&mut self, mut event: DanmuEvent) {
-        if let Some(reply) = self.autoreply.as_mut() {
-            let mut input = event.clone();
-            if matches!(&self.account_status, AccountStatus::SignedIn { user_id, .. } if event.author_id.as_ref() == Some(user_id))
-            {
-                input.kind = DanmuEventKind::System;
-                if event.origin == DanmuEventOrigin::Live && !event.content.starts_with('✦') {
-                    reply.discard();
-                }
-            }
-            reply.observe(input);
-        }
         if event.kind == DanmuEventKind::RoomStatus
             && event.origin == DanmuEventOrigin::Live
             && let Some(room) = self.room.as_mut()
         {
             room.live_status = RoomLiveStatus::Offline;
+            self.bridge.end();
         }
         let live_arrival =
             event.origin == DanmuEventOrigin::Live && event.kind == DanmuEventKind::Danmu;
@@ -1339,9 +1981,8 @@ impl TerminalApp {
             .pending_deliveries
             .iter()
             .position(|active| active.delivery.matches(&event));
-        self.confirmed_deliveries.retain(|delivery| {
-            event.timestamp <= delivery.submitted_at + chrono::Duration::seconds(15)
-        });
+        self.confirmed_deliveries
+            .retain(|delivery| event.timestamp <= delivery.submitted_at + DELIVERY_ECHO_WINDOW);
         if confirmed.is_none()
             && self
                 .confirmed_deliveries
@@ -1385,7 +2026,21 @@ impl TerminalApp {
             .flatten()
             .map(|event| event.id.clone());
         if self.session.ingest(event.clone()) {
-            let _ = self.journal.event(&self.session, &event);
+            if is_new_logical_event {
+                self.bridge.ingest(event.clone());
+                if let Err(error) = self.runner.record_history(&self.session.room_id, &event) {
+                    self.set_notice(
+                        format!("历史索引未更新；原件仍单独保存：{error}"),
+                        NoticeLevel::Error,
+                    );
+                }
+            }
+            if let Err(error) = self.journal.event(&self.session, &event) {
+                self.set_notice(
+                    format!("直播原始归档或工作区副本未完整保存：{error}"),
+                    NoticeLevel::Error,
+                );
+            }
             self.activity.push(&event, Instant::now(), Utc::now());
             self.selected = selected_anchor
                 .as_deref()
@@ -1435,11 +2090,15 @@ impl TerminalApp {
     fn set_delivery_notice(&mut self, message: impl Into<String>) {
         self.notice = message.into();
         self.notice_deadline = Some(Instant::now() + DELIVERY_NOTICE_LIFETIME);
+        self.notice_is_delivery = true;
+        self.notice_level = NoticeLevel::Warning;
     }
 
     fn set_notice_at(&mut self, message: impl Into<String>, level: NoticeLevel, now: Instant) {
         self.notice = message.into();
         self.notice_deadline = level.lifetime().map(|lifetime| now + lifetime);
+        self.notice_is_delivery = false;
+        self.notice_level = level;
     }
     fn set_delivery_status(&mut self, status: DeliveryStatus) {
         self.set_delivery_status_at(status, Instant::now());
@@ -1477,7 +2136,13 @@ impl TerminalApp {
 
     fn advance_history_at(&mut self, now: Instant) {
         // Modal operations must not silently discard a reply target underneath them.
-        if self.stop_flow.is_some() || self.login_qr.is_some() || self.secret_mode {
+        if self.stop_flow.is_some()
+            || self.login_qr.is_some()
+            || self.secret_mode
+            || self.candidate_edit.is_some()
+            || self.assistant_panel.is_some()
+            || self.help.is_some()
+        {
             self.last_user_activity = now;
             return;
         }
@@ -1487,7 +2152,7 @@ impl TerminalApp {
                 >= Duration::from_secs(u64::from(self.config.history_idle_seconds))
         {
             self.return_to_live();
-            self.set_notice("历史浏览空闲超时，已恢复实时跟随", NoticeLevel::Info);
+            self.set_notice("FOLLOW", NoticeLevel::Info);
         }
     }
 
@@ -1499,14 +2164,50 @@ impl TerminalApp {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) {
-        if !matches!(event.kind, MouseEventKind::Moved) {
-            self.last_user_activity = Instant::now();
+        if !matches!(
+            event.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            return;
         }
-        match event.kind {
-            MouseEventKind::ScrollUp => self.scroll_history(true),
-            MouseEventKind::ScrollDown => self.scroll_history(false),
-            _ => {}
+        self.last_user_activity = Instant::now();
+        if self.stop_flow.is_some()
+            || self.login_qr.is_some()
+            || self.secret_mode
+            || self.candidate_edit.is_some()
+        {
+            return;
         }
+        if let Some(help) = self.help.as_mut() {
+            match event.kind {
+                MouseEventKind::ScrollUp => help.scroll = help.scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => {
+                    help.scroll = help.scroll.saturating_add(3).min(help.max_scroll)
+                }
+                _ => {}
+            }
+        } else if self.command_search_draft.is_some() || self.input.starts_with('/') {
+            let count = self.command_suggestions().len();
+            if count > 0 {
+                self.slash_selection = if event.kind == MouseEventKind::ScrollUp {
+                    self.slash_selection.saturating_sub(1)
+                } else {
+                    (self.slash_selection + 1).min(count - 1)
+                };
+            }
+        } else if self.assistant_panel.is_some() {
+            self.assistant_mouse(event);
+        } else {
+            self.scroll_history(event.kind == MouseEventKind::ScrollUp);
+        }
+    }
+
+    fn open_commands(&mut self) {
+        if self.command_search_draft.is_none() {
+            self.command_search_draft = Some(std::mem::take(&mut self.input));
+        }
+        self.slash_selection = 0;
+        self.clear_review_surface();
     }
 
     fn scroll_history(&mut self, older: bool) {
@@ -1545,22 +2246,35 @@ impl TerminalApp {
     }
 
     fn handle_slash_key(&mut self, key: &KeyEvent) -> SlashKeyAction {
-        if !self.input.starts_with('/') {
+        let searching = self.command_search_draft.is_some();
+        if self.secret_mode || (!searching && !self.input.starts_with('/')) {
             return SlashKeyAction::Ignored;
         }
 
-        let suggestions = slash_suggestions(&self.input, &self.config.themes);
-        let move_up = key.code == KeyCode::Up
-            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'));
+        let suggestions = self.command_suggestions();
+        let move_up = key.code == KeyCode::Up;
         let move_down = key.code == KeyCode::Down
             || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n'));
 
         if key.code == KeyCode::Esc {
-            self.input.clear();
+            self.close_command_search();
             self.slash_selection = 0;
             return SlashKeyAction::Handled;
         }
         if suggestions.is_empty() {
+            if searching
+                && matches!(
+                    key.code,
+                    KeyCode::Enter | KeyCode::Tab | KeyCode::Up | KeyCode::Down
+                )
+            {
+                if key.code == KeyCode::Enter && self.input.starts_with('/') {
+                    let command = sanitize_input(self.input.take());
+                    self.close_command_search();
+                    return SlashKeyAction::Submit(command);
+                }
+                return SlashKeyAction::Handled;
+            }
             return SlashKeyAction::Ignored;
         }
         if move_up {
@@ -1576,24 +2290,56 @@ impl TerminalApp {
         }
         let selected = self.slash_selection.min(suggestions.len() - 1);
         if key.code == KeyCode::Tab {
-            self.input.replace(suggestions[selected].completion());
+            self.input
+                .replace(suggestions[selected].completion.to_owned());
             self.slash_selection = 0;
             return SlashKeyAction::Handled;
         }
         if key.code == KeyCode::Enter {
-            let suggestion = suggestions[selected];
-            let completion = suggestion.completion();
-            let opens_submenu = suggestion.opens_submenu();
-            drop(suggestions);
-            self.slash_selection = 0;
-            if opens_submenu {
-                self.input.replace(completion);
-                return SlashKeyAction::Handled;
-            }
-            self.input.clear();
-            return SlashKeyAction::Submit(sanitize_input(completion));
+            return self.activate_palette_row(selected);
         }
         SlashKeyAction::Ignored
+    }
+
+    fn activate_palette_row(&mut self, index: usize) -> SlashKeyAction {
+        let suggestions = self.command_suggestions();
+        let Some(suggestion) = suggestions.get(index) else {
+            return SlashKeyAction::Handled;
+        };
+        let completion = suggestion.completion;
+        let raw = self.input.trim();
+        let has_arguments = raw.starts_with(completion.trim_end())
+            && raw.len() > completion.trim_end().len()
+            && raw.as_bytes().get(completion.trim_end().len()) == Some(&b' ');
+        if completion.ends_with(' ') && !has_arguments {
+            self.input.replace(completion.to_owned());
+            self.slash_selection = 0;
+            return SlashKeyAction::Handled;
+        }
+        let command = if has_arguments {
+            raw.to_owned()
+        } else {
+            completion.to_owned()
+        };
+        self.close_command_search();
+        SlashKeyAction::Submit(sanitize_input(command))
+    }
+
+    fn command_suggestions(&self) -> Vec<&'static CommandSpec> {
+        let include_ai = self.runner.has_saved_settings()
+            || self.runner.running
+            || self.runner.report.connected
+            || self.bridge.candidate_count() != 0;
+        if self.command_search_draft.is_some() || self.input.starts_with('/') {
+            command_suggestions(&self.input, include_ai)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn close_command_search(&mut self) {
+        self.input = self.command_search_draft.take().unwrap_or_default();
+        self.slash_selection = 0;
     }
 
     fn handle_stop_key(&mut self, key: KeyCode, now: Instant) {
@@ -1642,29 +2388,60 @@ impl TerminalApp {
     }
 
     async fn handle_key(&mut self, key: KeyEvent, tx: mpsc::Sender<UiEvent>) -> Result<bool> {
-        if key.code == KeyCode::F(7) && key.kind == crossterm::event::KeyEventKind::Press {
-            if let Some(reply) = self.autoreply.as_mut() {
-                reply.approve();
-            }
+        if key.kind == crossterm::event::KeyEventKind::Press
+            && self.stop_flow.is_some()
+            && !(key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c' | 'p')))
+        {
+            self.handle_stop_key(key.code, Instant::now());
             return Ok(false);
         }
-        if key.code == KeyCode::F(8) && key.kind == crossterm::event::KeyEventKind::Press {
-            if let Some(reply) = self.autoreply.as_mut() {
-                reply.discard();
+        if key.kind == crossterm::event::KeyEventKind::Press {
+            if key.code == KeyCode::Esc && self.main_login.is_some() {
+                self.cancel_main_login();
+                self.set_notice("已取消主账号扫码，原账号未更改", NoticeLevel::Info);
+                return Ok(false);
             }
-            return Ok(false);
-        }
-        if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.send_queue.pause();
-            if let Some(reply) = self.autoreply.as_mut() {
-                reply.mode(ReplyMode::Paused);
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Ok(true);
             }
-            self.set_notice(
-                "立即暂停；待发许可已撤销，在途请求仅等待结果",
-                NoticeLevel::Warning,
-            );
-            return Ok(false);
+            if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.pause_assistant();
+                return Ok(false);
+            }
+            if key.code == KeyCode::Esc && self.assistant_accounts.login_pending() {
+                self.assistant_accounts.cancel_login();
+                self.login_qr = None;
+                self.set_notice("已取消助手扫码，原账号未更改", NoticeLevel::Info);
+                return Ok(false);
+            }
+            if self.login_qr.is_some() {
+                if key.code == KeyCode::Esc {
+                    self.login_qr = None;
+                }
+                return Ok(false);
+            }
+            if self.handle_help_key(key.code) {
+                return Ok(false);
+            }
+            if self.command_search_draft.is_none()
+                && self.candidate_edit.is_none()
+                && !self.secret_mode
+                && self.assistant_key(key, tx.clone()).await
+            {
+                return Ok(self.quit_requested);
+            }
+            if key.code == KeyCode::Char('g')
+                && key.modifiers == KeyModifiers::CONTROL
+                && self.command_search_draft.is_none()
+            {
+                if let Err(error) = self.open_assistant() {
+                    self.set_notice(error.to_string(), NoticeLevel::Error);
+                }
+                return Ok(false);
+            }
         }
+
         if key.kind != crossterm::event::KeyEventKind::Release {
             self.last_user_activity = Instant::now();
         }
@@ -1674,28 +2451,53 @@ impl TerminalApp {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(true);
         }
+        if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT {
+            if self.secret_mode
+                || self.stop_flow.is_some()
+                || self.login_qr.is_some()
+                || self.command_search_draft.is_some()
+            {
+                return Ok(false);
+            }
+            self.review_key(key);
+            return Ok(false);
+        }
         if self.stop_flow.is_some() {
             self.handle_stop_key(key.code, Instant::now());
             return Ok(false);
         }
-        if self.ai_settings.open {
+        if key.code == KeyCode::Char('o') && key.modifiers == KeyModifiers::CONTROL {
+            if self.candidate_edit.is_none() && !self.secret_mode {
+                if self.command_search_draft.is_some() {
+                    self.close_command_search();
+                } else {
+                    self.open_commands();
+                }
+            }
+            return Ok(false);
+        }
+
+        if self.candidate_edit.is_some() {
             match key.code {
+                KeyCode::Enter => {
+                    self.save_candidate_edit();
+                    return Ok(false);
+                }
                 KeyCode::Esc => {
-                    self.ai_settings.open = false;
+                    self.finish_candidate_edit();
+                    self.set_notice("已取消回复编辑；人工草稿已恢复", NoticeLevel::Info);
                     return Ok(false);
                 }
-                KeyCode::PageDown => {
-                    self.ai_settings.scroll = self.ai_settings.scroll.saturating_add(5);
-                    return Ok(false);
-                }
-                KeyCode::PageUp => {
-                    self.ai_settings.scroll = self.ai_settings.scroll.saturating_sub(5);
-                    return Ok(false);
-                }
+                KeyCode::Tab | KeyCode::Up | KeyCode::Down => return Ok(false),
                 _ => {}
             }
         }
-        match self.handle_slash_key(&key) {
+
+        match if self.candidate_edit.is_some() {
+            SlashKeyAction::Ignored
+        } else {
+            self.handle_slash_key(&key)
+        } {
             SlashKeyAction::Ignored => {}
             SlashKeyAction::Handled => return Ok(false),
             SlashKeyAction::Submit(command) => {
@@ -1703,9 +2505,15 @@ impl TerminalApp {
                 return Ok(self.quit_requested);
             }
         }
-        let selection_navigation = key.modifiers.contains(KeyModifiers::SHIFT)
+        let selection_navigation = (key.modifiers.is_empty()
+            || key.modifiers.contains(KeyModifiers::SHIFT))
             && matches!(key.code, KeyCode::Up | KeyCode::Down);
-        if self.selection_active
+        if self.candidate_edit.is_none()
+            && !self.secret_mode
+            && self.command_search_draft.is_none()
+            && self.selection_active
+            && !(self.input.starts_with('/')
+                || (self.input.is_empty() && key.code == KeyCode::Char('/')))
             && !selection_navigation
             && !matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::End)
         {
@@ -1750,7 +2558,7 @@ impl TerminalApp {
                 }
                 if self.secret_mode {
                     self.secret_mode = false;
-                    self.input.clear();
+                    self.input = self.secret_draft.take().unwrap_or_default();
                     return Ok(false);
                 }
                 if self.selection_active || self.scroll_offset > 0 {
@@ -1760,6 +2568,9 @@ impl TerminalApp {
                 return Ok(false);
             }
             KeyCode::Tab => {
+                if !self.persist_ui("chat_layout", (!self.layout_chat).into()) {
+                    return Ok(false);
+                }
                 self.layout_chat = !self.layout_chat;
                 self.set_notice(
                     format!(
@@ -1772,13 +2583,21 @@ impl TerminalApp {
                     ),
                     NoticeLevel::Success,
                 );
+                self.record_reading_config();
             }
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.move_selection(true),
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.move_selection(false)
             }
+            KeyCode::Up | KeyCode::Down if key.modifiers.is_empty() && !self.secret_mode => {
+                self.scroll_history(key.code == KeyCode::Up);
+            }
             KeyCode::Home => self.input.move_to_start(),
-            KeyCode::End if self.selection_active || self.scroll_offset > 0 => {
+            KeyCode::End
+                if self.candidate_edit.is_none()
+                    && self.command_search_draft.is_none()
+                    && (self.selection_active || self.scroll_offset > 0) =>
+            {
                 self.return_to_live()
             }
             KeyCode::End => self.input.move_to_end(),
@@ -1799,7 +2618,7 @@ impl TerminalApp {
                 self.slash_selection = 0;
             }
             KeyCode::Enter => {
-                if self.selection_active {
+                if !self.secret_mode && self.selection_active && !self.input.starts_with('/') {
                     let username = self
                         .session
                         .recent_events
@@ -1841,17 +2660,20 @@ impl TerminalApp {
 
     async fn submit(&mut self, input: String, tx: mpsc::Sender<UiEvent>) -> Result<()> {
         if self.secret_mode {
-            self.secret_mode = false;
-            self.obs.set_password(&input).await?;
-            self.set_notice("OBS 密码已保存到 TUI 私有文件", NoticeLevel::Success);
+            if let Err(error) = self.obs.set_password(&input).await {
+                self.input.replace(input);
+                self.set_notice(format!("保存失败：{error}（内容保留）"), NoticeLevel::Error);
+            } else {
+                self.secret_mode = false;
+                self.input = self.secret_draft.take().unwrap_or_default();
+                self.set_notice("已保存", NoticeLevel::Success);
+            }
             return Ok(());
         }
         if input.starts_with('/') {
             return self.command(&input, tx).await;
         }
-        if let Some(reply) = self.autoreply.as_mut() {
-            reply.discard();
-        }
+
         let segments = segment_message(&input, crate::bilibili::SEND_SEGMENT_LIMIT);
         if !segments.is_empty() {
             self.enqueue(segments, None, tx);
@@ -1859,378 +2681,248 @@ impl TerminalApp {
         Ok(())
     }
 
-    fn enqueue(
-        &mut self,
-        segments: Vec<String>,
-        candidate: Option<autoreply::Candidate>,
-        tx: mpsc::Sender<UiEvent>,
-    ) {
-        let transport = TerminalTransport {
-            account: self.account.clone(),
-            client: self.client.clone(),
-            room: self.config.room_id.clone(),
-            tx: tx.clone(),
-            reply_key: candidate.as_ref().map(|c| c.key.clone()),
-        };
-        let queue = self.send_queue.clone();
-        let generation = queue.generation();
-        tokio::spawn(async move {
-            let outcome = if queue.generation() != generation {
-                Outcome::Cancelled
-            } else {
-                queue
-                    .send(&transport, &segments, candidate.as_ref().map(|c| &c.permit))
-                    .await
-            };
-            if let Some(candidate) = candidate {
-                let state = match outcome {
-                    Outcome::Confirmed => ReplyState::Sent,
-                    Outcome::Cancelled => ReplyState::Cancelled,
-                    _ => ReplyState::Uncertain,
-                };
-                let _ = tx
-                    .send(UiEvent::ReplyDelivery {
-                        key: candidate.key,
-                        state,
-                    })
-                    .await;
-            }
-            if outcome == Outcome::Confirmed {
-                let _ = tx.send(UiEvent::DeliveryCompleted).await;
-            }
-        });
-        self.set_delivery_status(DeliveryStatus::Sending);
-    }
-
-    async fn advance_autoreply(&mut self, tx: mpsc::Sender<UiEvent>) {
-        self.persist_ai_safety_stop().await;
-        if self.config.autoreply.enabled
-            && self.config.autoreply.provider == autoreply::Provider::Chatgpt
-            && !self.ai_settings.checked
-        {
-            self.ai_settings
-                .start("status", self.config.autoreply.codex.clone(), tx.clone());
-        }
-        let gate = autoreply::Gate {
-            session: format!(
-                "{}:{}",
-                self.config.room_id,
-                self.room
-                    .as_ref()
-                    .and_then(|r| r.live_started_at)
-                    .map(|t| t.to_rfc3339())
-                    .unwrap_or_else(|| self.session.id.clone())
-            ),
-            live: self.room.as_ref().is_some_and(RoomSnapshot::is_live)
-                && self.connection.starts_with("已连接")
-                && !self.quit_requested,
-            busy: !self.input.is_empty()
-                || self.stop_flow.is_some()
-                || self.login_qr.is_some()
-                || self.secret_mode
-                || self.ai_settings.open
-                || !self.ai_settings.ready(&self.config.autoreply),
-            broadcaster: self
-                .room
-                .as_ref()
-                .map(|r| r.broadcaster_id.clone())
-                .unwrap_or_default(),
-        };
-        if let Some(reply) = self.autoreply.as_mut() {
-            reply.set_gate(gate);
-        }
-        let candidate = self
-            .autoreply
-            .as_mut()
-            .and_then(|reply| reply.ready.try_recv().ok());
-        if let Some(mut candidate) = candidate
-            && candidate.permit.valid()
-        {
-            let segments = std::mem::take(&mut candidate.segments);
-            self.enqueue(segments, Some(candidate), tx);
-        }
-    }
-
     async fn command(&mut self, raw: &str, tx: mpsc::Sender<UiEvent>) -> Result<()> {
-        let parts = raw.split_whitespace().collect::<Vec<_>>();
-        match parts.as_slice() {
-            ["/ai", args @ ..] => {
-                if let Err(error) = self.ai_command(args, tx.clone()).await {
-                    self.ai_settings.status = error.to_string();
-                    self.set_notice(error.to_string(), NoticeLevel::Error);
+        let action: Result<()> = async {
+            let parts = raw.split_whitespace().collect::<Vec<_>>();
+            if self.local_transport.is_some()
+                && parts
+                    .first()
+                    .is_some_and(|command| obs_command(command) || *command == "/room")
+            {
+                anyhow::bail!("本地模式禁止账号与OBS操作");
+            }
+            match parts.as_slice() {
+                ["/about"] => self.open_about()?,
+                ["/display", "theme"] => self.open_theme_settings()?,
+                ["/display", setting, value] => self.configure_display(setting, value)?,
+                [
+                    "/ai",
+                    section @ ("model" | "replies" | "materials" | "advanced"),
+                ] => self.open_ai_section(section)?,
+                ["/ai", "workspace", ..] => {
+                    self.edit_workspace(command_value(raw, 2), tx)?;
                 }
-            }
-            ["/quit"] | ["/q"] => {
-                self.quit_requested = true;
-            }
-            ["/help"] => {
-                self.set_notice(
-                    "输入 / 打开命令面板；↑/↓ 选择；Enter 执行；Tab 仅补全",
-                    NoticeLevel::Info,
-                );
-            }
-            ["/history"] => {
-                let seconds = self.config.history_idle_seconds;
-                self.set_notice(
-                    if seconds == 0 {
-                        "历史返回：仅手动；Esc 返回实时；/history 60 启用空闲自动返回".into()
+                ["/settings", "obs"] => self.open_obs_settings().await?,
+                ["/room", setting @ ("title" | "cover"), ..] => {
+                    let field = if *setting == "title" {
+                        settings::ExternalField::RoomTitle
                     } else {
-                        format!("历史返回：空闲 {seconds} 秒自动返回，Esc 也可立即返回；/history off 关闭自动返回")
-                    },
-                    NoticeLevel::Info,
-                );
-            }
-            ["/history", value] => {
-                let seconds = if *value == "off" {
-                    Some(0)
-                } else {
-                    value.parse::<u32>().ok()
-                };
-                if let Some(seconds) = seconds {
-                    self.config.history_idle_seconds = seconds;
-                    self.last_user_activity = Instant::now();
+                        settings::ExternalField::RoomCover
+                    };
+                    self.open_external_editor(field, command_value(raw, 2), tx)
+                        .await?;
+                }
+                ["/obs", "config", setting @ ("host" | "port" | "mic"), ..] => {
+                    let field = match *setting {
+                        "host" => settings::ExternalField::ObsHost,
+                        "port" => settings::ExternalField::ObsPort,
+                        _ => settings::ExternalField::ObsMicrophone,
+                    };
+                    self.open_external_editor(field, command_value(raw, 3), tx)
+                        .await?;
+                }
+                ["/scene", ..] => {
+                    self.open_external_editor(
+                        settings::ExternalField::ObsScene,
+                        command_value(raw, 1),
+                        tx,
+                    )
+                    .await?;
+                }
+                ["/commands"] => self.open_commands(),
+                ["/more"] => self.open_more()?,
+                ["/ai", "start"] => {
+                    self.start_assistant(false, false)?;
+                }
+                ["/ai", "auto", "on"] => {
+                    self.set_automatic_permission(true)?;
+                }
+                ["/ai", "auto", "off"] => {
+                    self.set_automatic_permission(false)?;
+                }
+                ["/ai", "range"] => self.open_ai_range()?,
+                ["/ai", "topic"] => self.open_ai_topic()?,
+                ["/ai", "visible"] => self.start_assistant(true, true)?,
+                ["/ai", "reset"] => self.start_assistant(false, true)?,
+                ["/ai", "stop"] => self.stop_assistant(),
+                ["/diag", "repair"] => {
+                    self.runner.repair_history(&self.journal)?;
+                }
+                ["/settings", section] => {
+                    if let Err(error) = self.open_settings_section(section) {
+                        self.set_notice(error.to_string(), NoticeLevel::Error);
+                    }
+                }
+                ["/settings"] | ["/diag"] | ["/ai"] | ["/review"] => {
+                    let result = match parts[0] {
+                        "/settings" => self.open_settings(),
+                        "/diag" => self.open_diagnostics(),
+                        "/ai" => self.open_assistant(),
+                        _ => self.open_candidate_review(),
+                    };
+                    if let Err(error) = result {
+                        self.set_notice(error.to_string(), NoticeLevel::Error);
+                    }
+                }
+                ["/pause"] => self.pause_assistant(),
+
+                ["/quit"] => {
+                    self.quit_requested = true;
+                }
+                ["/help"] => {
+                    self.help = Some(HelpState::default());
+                }
+                ["/pin"] => {
+                    let notice = if self.selection_active {
+                        "已将选中消息设为重点"
+                    } else {
+                        "未选择消息，已将最新一条设为重点"
+                    };
+                    self.with_selected(|session, id| session.feature(Some(id)), notice)
+                }
+                ["/find"] => self.open_archive_search()?,
+                ["/find", rest @ ..] => self.search_archive(&rest.join(" ")),
+                ["/obs"] | ["/obs", "status"] | ["/obs", "connect"] => {
+                    self.set_notice("正在检查 OBS 连接…", NoticeLevel::Progress);
+                    let obs = self.obs.clone();
+                    tokio::spawn(async move {
+                        let result = obs.fetch_status().await.map(|status| {
+                            format!(
+                                "OBS 场景：{}；推流：{:?}；麦克风：{:?}{}",
+                                status.current_scene,
+                                status.stream,
+                                status.microphone,
+                                status
+                                    .compatibility_warning
+                                    .map(|value| format!("；{value}"))
+                                    .unwrap_or_default()
+                            )
+                        });
+                        let _ = tx.send(operation_notice(result)).await;
+                    });
+                }
+                ["/mute"] | ["/unmute"] => {
                     self.set_notice(
-                        if seconds == 0 {
-                            "本次会话已关闭自动返回；Esc 手动返回实时".into()
+                        if parts[0] == "/mute" {
+                            "正在静音麦克风…"
                         } else {
-                            format!("本次会话空闲 {seconds} 秒自动返回实时；Esc 仍可手动返回")
+                            "正在取消麦克风静音…"
                         },
-                        NoticeLevel::Success,
+                        NoticeLevel::Progress,
                     );
-                } else {
+                    let muted = parts[0] == "/mute";
+                    let obs = self.obs.clone();
+                    tokio::spawn(async move {
+                        let result = obs.set_microphone_muted(muted).await.map(|_| {
+                            if muted {
+                                "麦克风已静音"
+                            } else {
+                                "麦克风已取消静音"
+                            }
+                            .to_string()
+                        });
+                        let _ = tx.send(operation_notice(result)).await;
+                    });
+                }
+                ["/obs", "config", "password"] => {
+                    self.secret_mode = true;
+                    self.secret_draft = Some(std::mem::take(&mut self.input));
                     self.set_notice(
-                        "用法：/history [秒数|off]；0 或 off 关闭自动返回",
-                        NoticeLevel::Error,
+                        "请输入 OBS WebSocket 密码并按 Enter；输入不会显示或进入历史",
+                        NoticeLevel::Progress,
                     );
                 }
-            }
-            ["/layout"] => {
-                self.layout_chat = !self.layout_chat;
-                self.set_notice("已切换布局", NoticeLevel::Success);
-            }
-            ["/theme"] => {
-                let choices = self.config.themes.choices().join("、");
-                let path = self.config.themes.path().display().to_string();
-                self.set_notice(
-                    format!(
-                        "当前主题：{}；可选：{choices}；配置：{path}",
-                        self.config.theme_name
-                    ),
-                    NoticeLevel::Info,
-                );
-            }
-            ["/theme", "reload"] => match self.config.themes.reload() {
-                Ok((theme_name, palette)) => {
-                    self.config.theme_name = theme_name.clone();
-                    self.config.palette = palette;
-                    self.set_notice(
-                        format!("已重新加载主题：{theme_name}"),
-                        NoticeLevel::Success,
-                    );
-                }
-                Err(error) => self.set_notice(error.to_string(), NoticeLevel::Error),
-            },
-            ["/theme", theme_name] => match self.config.themes.select(theme_name) {
-                Ok((theme_name, palette)) => {
-                    self.config.theme_name = theme_name.clone();
-                    self.config.palette = palette;
-                    self.set_notice(format!("已切换主题：{theme_name}"), NoticeLevel::Success);
-                }
-                Err(error) => self.set_notice(error.to_string(), NoticeLevel::Error),
-            },
-            ["/names", "show"] => {
-                self.show_name = true;
-                self.set_notice("已显示用户名", NoticeLevel::Success);
-            }
-            ["/names", "hide"] => {
-                self.show_name = false;
-                self.set_notice("已隐藏用户名", NoticeLevel::Success);
-            }
-            ["/time", "show"] => {
-                self.show_time = true;
-                self.set_notice("已显示时间", NoticeLevel::Success);
-            }
-            ["/time", "hide"] => {
-                self.show_time = false;
-                self.set_notice("已隐藏时间", NoticeLevel::Success);
-            }
-            ["/login"] => {
-                self.set_notice("正在创建 B 站登录二维码…", NoticeLevel::Progress);
-                self.start_login(tx);
-            }
-            ["/logout"] => match self.account.sign_out() {
-                Ok(()) => {
-                    self.account_status = AccountStatus::SignedOut;
-                    self.set_notice("已清除 TUI 独立登录态", NoticeLevel::Success);
-                }
-                Err(error) => self.set_notice(error.to_string(), NoticeLevel::Error),
-            },
-            ["/feature"] => {
-                self.with_selected(|session, id| session.feature(Some(id)), "已设为重点消息")
-            }
-            ["/archive"] => self.search_archive(""),
-            ["/archive", rest @ ..] => self.search_archive(&rest.join(" ")),
-            ["/obs"] | ["/obs", "status"] | ["/obs", "connect"] => {
-                self.set_notice("正在检查 OBS 连接…", NoticeLevel::Progress);
-                let obs = self.obs.clone();
-                tokio::spawn(async move {
-                    let result = obs.fetch_status().await.map(|status| {
-                        format!(
-                            "OBS 场景：{}；推流：{:?}；麦克风：{:?}{}",
-                            status.current_scene,
-                            status.stream,
-                            status.microphone,
-                            status
-                                .compatibility_warning
-                                .map(|value| format!("；{value}"))
-                                .unwrap_or_default()
-                        )
-                    });
-                    let _ = tx.send(operation_notice(result)).await;
-                });
-            }
-            ["/obs", "mute"] | ["/obs", "unmute"] => {
-                self.set_notice(
-                    if parts[1] == "mute" {
-                        "正在静音麦克风…"
-                    } else {
-                        "正在取消麦克风静音…"
-                    },
-                    NoticeLevel::Progress,
-                );
-                let muted = parts[1] == "mute";
-                let obs = self.obs.clone();
-                tokio::spawn(async move {
-                    let result = obs.set_microphone_muted(muted).await.map(|_| {
-                        if muted {
-                            "麦克风已静音"
-                        } else {
-                            "麦克风已取消静音"
-                        }
-                        .to_string()
-                    });
-                    let _ = tx.send(operation_notice(result)).await;
-                });
-            }
-            ["/obs", "scene"] => {
-                self.set_notice("正在读取 OBS 场景…", NoticeLevel::Progress);
-                let obs = self.obs.clone();
-                tokio::spawn(async move {
-                    let result = obs
-                        .list_scenes()
-                        .await
-                        .map(|items| format!("OBS 场景：{}", items.join("、")));
-                    let _ = tx.send(operation_notice(result)).await;
-                });
-            }
-            ["/obs", "scene", scene @ ..] if !scene.is_empty() => {
-                let scene = scene.join(" ");
-                self.set_notice(format!("正在切换到场景：{scene}"), NoticeLevel::Progress);
-                let obs = self.obs.clone();
-                tokio::spawn(async move {
-                    let result = obs
-                        .switch_scene(&scene)
-                        .await
-                        .map(|_| format!("已切换场景：{scene}"));
-                    let _ = tx.send(operation_notice(result)).await;
-                });
-            }
-            ["/obs", "config", "mic"] => {
-                self.set_notice("正在读取 OBS 输入…", NoticeLevel::Progress);
-                let obs = self.obs.clone();
-                tokio::spawn(async move {
-                    let result = obs.list_inputs().await.map(|items| {
-                        format!(
-                            "OBS 输入：{}；使用 /obs config mic <名称>",
-                            items.join("、")
-                        )
-                    });
-                    let _ = tx.send(operation_notice(result)).await;
-                });
-            }
-            ["/obs", "config", "mic", name @ ..] if !name.is_empty() => {
-                let name = name.join(" ");
-                self.set_notice(format!("正在验证麦克风输入：{name}"), NoticeLevel::Progress);
-                let obs = self.obs.clone();
-                tokio::spawn(async move {
-                    let result = obs
-                        .set_microphone_name(name.clone())
-                        .await
-                        .map(|_| format!("麦克风输入已切换为：{name}"));
-                    let _ = tx.send(operation_notice(result)).await;
-                });
-            }
-            ["/obs", "config", "password"] => {
-                self.secret_mode = true;
-                self.input.clear();
-                self.set_notice(
-                    "请输入 OBS WebSocket 密码并按 Enter；输入不会显示或进入历史",
-                    NoticeLevel::Progress,
-                );
-            }
-            ["/obs", "start"] => {
-                self.set_notice("正在启动 OBS 推流…", NoticeLevel::Progress);
-                let obs = self.obs.clone();
-                tokio::spawn(async move {
-                    let result = obs
-                        .start_stream()
-                        .await
-                        .map(|_| "OBS 已开始推流".to_string());
-                    let _ = tx.send(operation_notice(result)).await;
-                });
-            }
-            ["/obs", "stop"] => {
-                if self.stop_flow.is_none() {
-                    self.stop_flow = Some(StopFlow::Confirm {
-                        stop_selected: false,
+                ["/obs", "start"] => {
+                    self.set_notice("正在启动 OBS 推流…", NoticeLevel::Progress);
+                    let obs = self.obs.clone();
+                    tokio::spawn(async move {
+                        let result = obs
+                            .start_stream()
+                            .await
+                            .map(|_| "OBS 已开始推流".to_string());
+                        let _ = tx.send(operation_notice(result)).await;
                     });
                 }
+                ["/obs", "stop"] => {
+                    if self.stop_flow.is_none() {
+                        self.stop_flow = Some(StopFlow::Confirm {
+                            stop_selected: false,
+                        });
+                    }
+                }
+                _ => self.set_notice(
+                    format!("未知命令：{raw}；输入 /help 查看命令"),
+                    NoticeLevel::Error,
+                ),
             }
-            _ => self.set_notice(
-                format!("未知命令：{raw}；输入 /help 查看命令"),
-                NoticeLevel::Error,
-            ),
+            Ok(())
         }
-        let _ = self.journal.snapshot(&self.session);
+        .await;
+        if let Err(error) = action {
+            self.set_notice(error.to_string(), NoticeLevel::Error);
+            return Ok(());
+        }
+        // Operation failures stay in the UI; current journal write failures still propagate.
+        self.journal.snapshot(&self.session)?;
         Ok(())
     }
 
+    fn cancel_main_login(&mut self) {
+        if self.main_login.take().is_some() {
+            self.login_qr = None;
+        }
+    }
+
     fn start_login(&mut self, tx: mpsc::Sender<UiEvent>) {
-        let account = self.account.clone();
-        tokio::spawn(async move {
-            let challenge = match account.login_challenge().await {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = tx.send(UiEvent::error(error.to_string())).await;
-                    return;
+        self.cancel_main_login();
+        self.assistant_accounts.cancel_login();
+        self.bridge.identity_changed();
+        self.runner.pause(&self.bridge);
+        self.review_frame = None;
+        self.login_qr = None;
+        let token = uuid::Uuid::new_v4();
+        let account = self.account.staged();
+        let task = tokio::spawn(async move {
+            let result: Result<AccountStatus> = async {
+                let challenge =
+                    tokio::time::timeout(Duration::from_secs(10), account.login_challenge())
+                        .await??;
+                let lines = compact_qr_lines(challenge.url.as_str())?;
+                tx.send(UiEvent::LoginQr { token, lines }).await?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+                loop {
+                    anyhow::ensure!(
+                        tokio::time::Instant::now() < deadline,
+                        "登录二维码已过期，请重新扫码"
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        account.poll_login(&challenge.key),
+                    )
+                    .await??
+                    {
+                        LoginPoll::Waiting | LoginPoll::Scanned => {}
+                        LoginPoll::Expired => return Err(anyhow!("登录二维码已过期，请重新扫码")),
+                        LoginPoll::SignedIn(status) => return Ok(status),
+                    }
                 }
+            }
+            .await;
+            let event = match result {
+                Ok(status) => UiEvent::LoginDone {
+                    token,
+                    account,
+                    status,
+                },
+                Err(error) => UiEvent::LoginFailed {
+                    token,
+                    message: format!("主账号登录失败，原账号未更改：{error}"),
+                },
             };
-            let lines = compact_qr_lines(challenge.url.as_str())
-                .unwrap_or_else(|_| vec![challenge.url.to_string()]);
-            if tx.send(UiEvent::LoginQr(lines)).await.is_err() {
-                return;
-            }
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                match account.poll_login(&challenge.key).await {
-                    Ok(LoginPoll::Waiting | LoginPoll::Scanned) => continue,
-                    Ok(LoginPoll::Expired) => {
-                        let _ = tx
-                            .send(UiEvent::warning("登录二维码已过期，请重新输入 /login"))
-                            .await;
-                        return;
-                    }
-                    Ok(LoginPoll::SignedIn(status)) => {
-                        let _ = tx.send(UiEvent::LoginDone(status)).await;
-                        return;
-                    }
-                    Err(error) => {
-                        let _ = tx.send(UiEvent::error(error.to_string())).await;
-                        return;
-                    }
-                }
-            }
+            let _ = tx.send(event).await;
         });
+        self.main_login = Some(MainLogin { token, task });
     }
 
     fn with_selected(&mut self, operation: impl FnOnce(&mut DanmuSession, &str), notice: &str) {
@@ -2317,6 +3009,61 @@ impl TerminalApp {
         self.insert_text(character.encode_utf8(&mut buffer));
     }
 
+    fn handle_help_key(&mut self, key: KeyCode) -> bool {
+        let Some(help) = self.help.as_mut() else {
+            return false;
+        };
+        match key {
+            KeyCode::Esc | KeyCode::Enter => self.help = None,
+            KeyCode::Up => help.scroll = help.scroll.saturating_sub(1),
+            KeyCode::Down => help.scroll = help.scroll.saturating_add(1).min(help.max_scroll),
+            KeyCode::PageUp => help.scroll = help.scroll.saturating_sub(help.page_rows),
+            KeyCode::PageDown => {
+                help.scroll = help
+                    .scroll
+                    .saturating_add(help.page_rows)
+                    .min(help.max_scroll)
+            }
+            KeyCode::Home => help.scroll = 0,
+            KeyCode::End => help.scroll = help.max_scroll,
+            _ => {}
+        }
+        true
+    }
+
+    fn handle_paste(&mut self, text: &str) {
+        if self.help.is_some()
+            || self.stop_flow.is_some()
+            || self.login_qr.is_some()
+            || self.main_login.is_some()
+            || self.assistant_accounts.login_pending()
+        {
+            return;
+        }
+        if self.assistant_panel.is_some()
+            && self.candidate_edit.is_none()
+            && self.command_search_draft.is_none()
+        {
+            self.paste_assistant(text);
+            return;
+        }
+        if !self.secret_mode
+            && self.candidate_edit.is_none()
+            && self.command_search_draft.is_none()
+            && self.selection_active
+            && !(self.input.starts_with('/') || (self.input.is_empty() && text.starts_with('/')))
+        {
+            return;
+        }
+        if text.len() > 4096 {
+            self.set_notice("粘贴超过4096字节，未插入", NoticeLevel::Error);
+            return;
+        }
+        self.last_user_activity = Instant::now();
+        self.input.insert_paste(text, false);
+        self.slash_selection = 0;
+    }
+
     fn insert_text(&mut self, text: &str) {
         self.input.insert_text(text);
         self.slash_selection = 0;
@@ -2325,14 +3072,57 @@ impl TerminalApp {
 
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    mouse_capture: bool,
 }
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            DisableMouseCapture,
+            EnableBracketedPaste,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
+        )?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            mouse_capture: false,
+        })
+    }
+
+    fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
+        if self.mouse_capture == enabled {
+            return Ok(());
+        }
+        if enabled {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)?;
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)?;
+        }
+        self.mouse_capture = enabled;
+        Ok(())
+    }
+
+    pub(super) fn draw_app(&mut self, app: &mut TerminalApp) -> Result<()> {
+        // Main-screen dragging belongs to the terminal. Alternate-screen wheels
+        // arrive as arrow keys; overlays retain their existing mouse handling.
+        self.set_mouse_capture(
+            app.stop_flow.is_some()
+                || app.login_qr.is_some()
+                || app.secret_mode
+                || app.candidate_edit.is_some()
+                || app.help.is_some()
+                || app.assistant_panel.is_some()
+                || app.command_search_draft.is_some()
+                || app.input.starts_with('/'),
+        )?;
+        self.terminal.draw(|frame| draw(frame, app))?;
+        Ok(())
     }
 }
 impl Drop for TerminalGuard {
@@ -2341,53 +3131,13 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             self.terminal.backend_mut(),
             DisableMouseCapture,
+            DisableBracketedPaste,
+            PopKeyboardEnhancementFlags,
             LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();
     }
 }
-fn retain_unconfirmed(confirmations: &mut Vec<(String, oneshot::Receiver<()>)>) {
-    confirmations.retain_mut(|(_, confirmation)| match confirmation.try_recv() {
-        Ok(()) => false,
-        Err(_) => true,
-    });
-}
-
-async fn wait_for_delivery_confirmations(
-    client: &BilibiliClient,
-    room_id: &str,
-    tx: &mpsc::Sender<UiEvent>,
-    mut confirmations: Vec<(String, oneshot::Receiver<()>)>,
-) -> Vec<String> {
-    for attempt in 0..8 {
-        retain_unconfirmed(&mut confirmations);
-        if confirmations.is_empty() {
-            return Vec::new();
-        }
-        let delay = if attempt == 0 {
-            Duration::from_millis(350)
-        } else {
-            Duration::from_secs(2)
-        };
-        tokio::time::sleep(delay).await;
-        retain_unconfirmed(&mut confirmations);
-        if confirmations.is_empty() {
-            return Vec::new();
-        }
-        if let Ok(events) = client.history(room_id).await
-            && tx.send(UiEvent::DeliveryHistory { events }).await.is_err()
-        {
-            break;
-        }
-    }
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    retain_unconfirmed(&mut confirmations);
-    confirmations
-        .into_iter()
-        .map(|(delivery_id, _)| delivery_id)
-        .collect()
-}
-
 fn reconcile_cross_origin_event(events: &mut [DanmuEvent], incoming: &DanmuEvent) -> bool {
     let Some(existing) = events
         .iter_mut()
@@ -2440,11 +3190,11 @@ fn startup_progress_line(
     width: usize,
     palette: Palette,
 ) -> Line<'static> {
-    let budget = STARTUP_MIN_DURATION.as_millis().max(1);
-    let mut filled = ((elapsed.as_millis() * width as u128) / budget).min(width as u128) as usize;
-    if !data_ready {
-        filled = filled.min(width.saturating_sub(1));
-    }
+    let filled = if data_ready {
+        width
+    } else {
+        ((elapsed.as_millis() / 90) as usize % width.max(1)).min(width.saturating_sub(1))
+    };
     Line::from(vec![
         Span::styled("━".repeat(filled), Style::default().fg(palette.info)),
         Span::styled(
@@ -2606,6 +3356,7 @@ fn draw_startup(
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
+    app.clear_review_surface();
     let palette = app.config.palette;
     let area = frame.area();
     frame.render_widget(
@@ -2614,10 +3365,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
     );
     if area.width < 32 || area.height < 7 {
         draw_compact(frame, area, app, palette);
-        if let Some(lines) = &app.login_qr {
-            draw_qr(frame, area, lines, palette);
-        }
-        draw_stop_flow(frame, area, app, palette);
+        draw_overlays(frame, area, app, palette);
         return;
     }
     let status_lines = technical_status_lines(app, palette, area.width);
@@ -2631,170 +3379,185 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
         .unwrap_or(u16::MAX)
         .min(3)
         .min(available_after_body.saturating_sub(2));
+    let review_height =
+        agent::review_height(app).min(available_after_body.saturating_sub(notice_height + 2));
     let input_height = input_area_height(app, area.width)
-        .min(available_after_body.saturating_sub(notice_height))
+        .min(available_after_body.saturating_sub(notice_height + review_height))
         .max(2);
     let rows = Layout::vertical([
         Constraint::Length(status_height),
         Constraint::Min(2),
         Constraint::Length(notice_height),
+        Constraint::Length(review_height),
         Constraint::Length(input_height),
     ])
     .split(area);
     frame.render_widget(Paragraph::new(Text::from(status_lines)), rows[0]);
-    if app.reply_panel && app.autoreply.is_some() && rows[1].height >= 8 {
-        let body = Layout::vertical([Constraint::Min(2), Constraint::Length(6)]).split(rows[1]);
-        draw_body(frame, body[0], app, palette);
-        let view = app.autoreply.as_ref().unwrap().view.borrow();
-        let candidates = view
-            .candidate
-            .as_ref()
-            .map(|c| c.segments.join(" ｜ "))
-            .unwrap_or_else(|| "无候选".into());
-        let sources = view
-            .sources
-            .iter()
-            .map(|s| {
-                format!(
-                    "{} {} 检索{} 发布{}",
-                    s.title,
-                    s.url,
-                    s.retrieved_at.to_rfc3339(),
-                    s.published_at.map(|v| v.to_rfc3339()).unwrap_or_default()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ｜ ");
-        let usage = &view.usage;
-        let text = format!(
-            "{} · {} · 模型 {} · F7批准 F8丢弃 Ctrl-P暂停\n{}\n{}\n请求预留{} token预留{}/报告{} 检索预留{} 费用{}\n{}",
-            if view.enabled {
-                "已开启"
-            } else {
-                "已关闭"
-            },
-            view.mode.label(),
-            view.model,
-            if app.autoreply.as_ref().unwrap().faulted {
-                "worker队列故障；已撤销许可，重启后检查日志"
-            } else {
-                &view.reason
-            },
-            candidates,
-            usage.requests,
-            usage.reserved_tokens,
-            usage.reported_tokens,
-            usage.searches,
-            if app.config.autoreply.cost_budget.is_some() {
-                format!("保守预留{}微单位，非账单", usage.reserved_cost)
-            } else {
-                "未核算；非0费用".into()
-            },
-            sources
-        );
-        frame.render_widget(
-            Paragraph::new(text)
-                .block(
-                    Block::default()
-                        .borders(Borders::TOP)
-                        .title("✦ 候选回复 /ai 显隐"),
-                )
-                .wrap(Wrap { trim: false }),
-            body[1],
-        );
-    } else {
-        draw_body(frame, rows[1], app, palette);
-    }
+    draw_body(frame, rows[1], app, palette);
+
     if notice_height > 0 {
         frame.render_widget(Paragraph::new(Text::from(notice_lines)), rows[2]);
     }
-    draw_input(frame, rows[3], app, palette);
-    ai_settings::draw(frame, rows[1], app);
-    draw_command_palette(frame, rows[1], app, palette);
+    agent::draw_review(frame, rows[3], app);
+    draw_input(frame, rows[4], app, palette);
 
-    if let Some(lines) = &app.login_qr {
-        draw_qr(frame, area, lines, palette);
-    }
-    draw_stop_flow(frame, area, app, palette);
+    draw_overlays(frame, area, app, palette);
 }
 
-fn draw_stop_flow(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette: Palette) {
-    let Some(flow) = app.stop_flow else { return };
-    let width = area.width.min(58);
-    let height = area.height.min(8);
+fn draw_overlays(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, palette: Palette) {
+    if app.stop_flow.is_some() {
+        draw_stop_flow(frame, area, app, palette);
+    } else if let Some(lines) = &app.login_qr {
+        draw_qr(frame, area, lines, palette);
+    } else if app.secret_mode || app.candidate_edit.is_some() {
+        // The focused input already carries Enter/Esc instructions.
+    } else if app
+        .assistant_panel
+        .as_ref()
+        .is_some_and(|panel| panel.is_editing())
+    {
+        assistant::draw(frame, app);
+    } else if app.help.is_some() {
+        draw_help(frame, area, app, palette);
+    } else if app.command_search_draft.is_some() || app.input.starts_with('/') {
+        draw_command_palette(frame, area, app, palette);
+    } else if app.assistant_panel.is_some() {
+        assistant::draw(frame, app);
+    }
+}
+
+fn draw_stop_flow(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, palette: Palette) {
+    let Some(flow) = app.stop_flow else {
+        return;
+    };
+    let width = area.width.min(42);
+    let height = area.height.min(6);
     let popup = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
         width,
         height,
     );
-    let base = Style::default().bg(palette.background).fg(palette.content);
-    let selected = Style::default()
-        .bg(palette.frame)
-        .fg(palette.content)
-        .add_modifier(Modifier::BOLD);
-    let mut lines = match flow {
-        StopFlow::Confirm { stop_selected } => vec![
-            Line::from("停止 OBS 推流将中断直播。"),
-            Line::from("确认后倒计时 3 秒，期间可按 Esc 返回。"),
-            Line::from(""),
-            Line::styled(
-                if stop_selected {
-                    "› 确认"
-                } else {
-                    "  确认"
-                },
-                if stop_selected { selected } else { base },
-            ),
-            Line::styled(
-                if stop_selected {
-                    "  返回"
-                } else {
-                    "› 返回"
-                },
-                if stop_selected { base } else { selected },
-            ),
-            Line::styled(
-                "↑/↓ 选择 · Enter 继续 · Esc 返回",
-                Style::default().fg(palette.time),
-            ),
-        ],
-        StopFlow::Countdown { deadline } => {
-            let remaining = deadline
+    let block = rounded_block(" 停止推流？ ", palette);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let text = match flow {
+        StopFlow::Confirm { .. } => "直播将中断".to_owned(),
+        StopFlow::Countdown { deadline } => format!(
+            "{} 秒后停止推流",
+            deadline
                 .saturating_duration_since(Instant::now())
                 .as_secs_f64()
-                .ceil() as u64;
-            vec![
-                Line::styled(
-                    format!("{} 秒后停止推流", remaining.max(1)),
-                    Style::default()
-                        .fg(palette.warning)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Line::from("Esc 返回，取消本次停播"),
-            ]
-        }
-        StopFlow::Stopping => vec![
-            Line::from("正在停止 OBS 推流…"),
-            Line::from("正在等待 OBS 响应"),
-        ],
+                .ceil()
+                .max(1.0) as u64
+        ),
+        StopFlow::Stopping => "正在停止推流…".to_owned(),
     };
-    // Keep both choices visible when the terminal cannot fit the full explanation.
-    if (width < 58 || height < 8) && matches!(flow, StopFlow::Confirm { .. }) {
-        lines.drain(..3);
-    }
-    let block = if height < 6 {
-        Block::default()
-    } else {
-        rounded_block(" 停止推流 ", palette)
-    };
-    frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines)
-            .style(base)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        popup,
+        Paragraph::new(text).style(Style::default().fg(palette.content)),
+        inner,
+    );
+    if inner.height < 2 {
+        return;
+    }
+    match flow {
+        StopFlow::Confirm { stop_selected } => {
+            for (row, label, selected, color) in [
+                (1, "停止推流", stop_selected, Color::Red),
+                (2, "取消", !stop_selected, palette.content),
+            ] {
+                if row < inner.height {
+                    frame.render_widget(
+                        Paragraph::new(format!("{} {label}", if selected { "›" } else { " " }))
+                            .style(Style::default().fg(color)),
+                        Rect::new(inner.x, inner.y + row, inner.width, 1),
+                    );
+                }
+            }
+            if inner.height > 3 {
+                frame.render_widget(
+                    Paragraph::new("↑↓选择 · Enter执行 · Esc取消")
+                        .style(Style::default().fg(palette.time)),
+                    Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+                );
+            }
+        }
+        StopFlow::Countdown { .. } => {
+            frame.render_widget(
+                Paragraph::new("Esc 取消停止").style(Style::default().fg(palette.info)),
+                Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            );
+        }
+        StopFlow::Stopping => {}
+    }
+}
+
+fn draw_help(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, palette: Palette) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .title(" 帮助 ")
+        .style(Style::default().bg(palette.background).fg(palette.content));
+    let inner = block.inner(area);
+    let mut lines = Vec::new();
+    for (heading, body) in HELP_SECTIONS {
+        lines.extend(wrap_styled_spans(
+            vec![Span::styled(
+                *heading,
+                Style::default()
+                    .fg(palette.info)
+                    .add_modifier(Modifier::BOLD),
+            )],
+            inner.width,
+            Alignment::Left,
+        ));
+        lines.extend(wrap_styled_spans(
+            vec![Span::raw(*body)],
+            inner.width,
+            Alignment::Left,
+        ));
+        lines.push(Line::default());
+    }
+    if app.local_transport.is_some() {
+        lines.extend(wrap_styled_spans(
+            vec![Span::styled(
+                "仅本地练习（不连接直播平台）",
+                Style::default().fg(palette.info),
+            )],
+            inner.width,
+            Alignment::Left,
+        ));
+        lines.extend(wrap_styled_spans(
+            vec![Span::raw("/event 姓名 正文 注入本地弹幕；/local confirmed|uncertain|rejected 设下一次本地送达结果。\n/session end 结束本地场次；/session new 新建场次且不授权，不是 OBS 控制。")],
+            inner.width,
+            Alignment::Left,
+        ));
+    }
+    let help = app.help.as_mut().expect("帮助已打开");
+    help.page_rows = usize::from(inner.height).max(1);
+    help.max_scroll = lines.len().saturating_sub(help.page_rows);
+    help.scroll = help.scroll.min(help.max_scroll);
+    let footer = format!(
+        " {}/{} · ↑↓/PgDn · Esc返回 · 助手发送{} ",
+        help.scroll + 1,
+        help.max_scroll + 1,
+        if app.bridge.sending_enabled() {
+            "已许可"
+        } else {
+            "未许可"
+        },
+    );
+    frame.render_widget(block.title_bottom(footer), area);
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(help.scroll)
+                .take(help.page_rows)
+                .collect::<Vec<_>>(),
+        ),
+        inner,
     );
 }
 
@@ -2804,17 +3567,31 @@ fn draw_command_palette(
     app: &mut TerminalApp,
     palette: Palette,
 ) {
-    let suggestions = slash_suggestions(&app.input, &app.config.themes);
-    if suggestions.is_empty() || area.height < 4 {
+    if app.candidate_edit.is_some() || app.secret_mode {
+        return;
+    }
+    let area = Rect {
+        height: area
+            .height
+            .saturating_sub(input_area_height(app, area.width) + 1),
+        ..area
+    };
+    let suggestions = app.command_suggestions();
+    if (suggestions.is_empty() && app.command_search_draft.is_none()) || area.height < 4 {
         return;
     }
 
-    let visible = suggestions.len().min(5);
-    app.slash_selection = app.slash_selection.min(suggestions.len() - 1);
+    let capacity = usize::from(
+        (area.height / 2)
+            .clamp(8, 12)
+            .min(area.height.saturating_sub(2)),
+    );
+    let visible = suggestions.len().max(1).min(capacity);
+    app.slash_selection = app.slash_selection.min(suggestions.len().saturating_sub(1));
     let offset = app
         .slash_selection
         .saturating_sub(visible - 1)
-        .min(suggestions.len() - visible);
+        .min(suggestions.len().saturating_sub(visible));
     let height = (visible as u16 + 2).min(area.height);
     let width = area.width.saturating_sub(4).min(72);
     let popup = Rect::new(
@@ -2823,43 +3600,86 @@ fn draw_command_palette(
         width,
         height,
     );
-    let items = suggestions
+    let mut items = suggestions
         .iter()
         .skip(offset)
         .take(visible)
         .map(|suggestion| {
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{:<24}", suggestion.usage()),
+                    format!(
+                        "{}  {}   ",
+                        suggestion.usage,
+                        suggestion.completion.trim_end()
+                    ),
                     Style::default()
-                        .fg(palette.info)
+                        .fg(if suggestion.danger {
+                            Color::Red
+                        } else {
+                            suggestion.category.color(palette)
+                        })
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(suggestion.description(), Style::default().fg(palette.time)),
+                Span::styled(suggestion.description, Style::default().fg(palette.time)),
             ]))
         })
         .collect::<Vec<_>>();
+    if items.is_empty() {
+        items.push(ListItem::new("没有匹配项；请换个词，Esc恢复草稿"));
+    }
     let mut state = ListState::default().with_selected(Some(app.slash_selection - offset));
-    let title = if app.input.starts_with("/theme") {
-        " 主题 · Enter 选择 · ↑/↓ 移动 "
-    } else {
-        " 命令 · Enter 执行 · Tab 补全 · ↑/↓ 移动 "
-    };
+    let title = format!(
+        " 命令 · 共 {} 项 · ↑↓选择 · Enter执行 · Tab补全 ",
+        suggestions.len()
+    );
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_set(border::ROUNDED)
-                .title(title),
+                .title(title)
+                .title_bottom(if app.command_search_draft.is_some() {
+                    " 输入中文搜索全部 · Esc恢复草稿 · 不会发送弹幕 "
+                } else {
+                    " 常用操作 · 输入中文搜索全部 · Ctrl-O保留草稿 "
+                }),
         )
         .style(Style::default().bg(palette.background).fg(palette.content))
-        .highlight_style(Style::default().bg(palette.frame).fg(palette.content))
+        .highlight_style(
+            Style::default()
+                .bg(palette.frame)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("› ");
     frame.render_widget(Clear, popup);
     frame.render_stateful_widget(list, popup, &mut state);
 }
 
-fn draw_compact(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, palette: Palette) {
+fn draw_compact(
+    frame: &mut ratatui::Frame,
+    mut area: Rect,
+    app: &mut TerminalApp,
+    palette: Palette,
+) {
+    if app.runner.running || app.resume_pending {
+        let assistant = assistant::compact(app, area.width.saturating_sub(8));
+        let room = fit_display_width(
+            &format!(" ROOM {}", app.config.room_id),
+            usize::from(area.width).saturating_sub(assistant.width()),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                assistant,
+                Span::styled(room, Style::default().fg(palette.content)),
+            ])),
+            Rect::new(area.x, area.y, area.width, area.height.min(1)),
+        );
+        area.y = area.y.saturating_add(1);
+        area.height = area.height.saturating_sub(1);
+    }
+    if area.height == 0 {
+        return;
+    }
     if app.is_browsing_history() && area.height < 3 {
         draw_history_status(frame, area, app, palette);
         return;
@@ -2867,7 +3687,7 @@ fn draw_compact(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, p
     if area.height < 3 {
         frame.render_widget(
             Paragraph::new(format!(
-                "{} · 房间 {} · ❯ {}",
+                "{} · ROOM {} · ❯ {}",
                 connection_badge(app),
                 app.config.room_id,
                 visible_input(app)
@@ -2882,12 +3702,17 @@ fn draw_compact(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, p
         .max(2);
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(input_height)]).split(area);
     if app.is_browsing_history() {
-        draw_events(frame, rows[0], app, palette, "历史");
+        draw_events(frame, rows[0], app, palette, "History");
         draw_input(frame, rows[1], app, palette);
         return;
     }
     let latest = display_events(&app.session.recent_events)
-        .map(|event| Line::from(map_event_emotes(event)))
+        .map(|event| {
+            Line::from(Span::styled(
+                map_event_emotes(event),
+                Style::default().fg(palette.content),
+            ))
+        })
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(latest).style(Style::default().fg(palette.content)),
@@ -2942,6 +3767,8 @@ const STATUS_ORANGE: Color = Color::Rgb(194, 65, 12);
 const STATUS_GREEN: Color = Color::Rgb(21, 128, 61);
 const STATUS_BLUE: Color = Color::Rgb(29, 78, 216);
 
+// Local identity emphasis, deliberately distinct from green delivery confirmation.
+const ASSISTANT_MESSAGE_COLOR: Color = Color::Rgb(255, 175, 95);
 fn status_span(content: String, background: Color, palette: Palette) -> Span<'static> {
     Span::styled(
         content,
@@ -2993,7 +3820,7 @@ fn primary_status_line(
     width: u16,
 ) -> Line<'static> {
     let indicator_on = (app.animation_tick / 2).is_multiple_of(2);
-    // Keep the same six columns when both the red dot and LIVE text turn off.
+    // Preserve the original six-column indicator throughout its blink cycle.
     let live_label = if room.is_live() && !indicator_on {
         "      "
     } else {
@@ -3053,26 +3880,29 @@ fn secondary_status_line(
     } else {
         STATUS_RED
     };
-    let microphone_on = app.obs_error.is_none()
-        && app
-            .obs_status
-            .as_ref()
-            .is_some_and(|status| status.microphone == crate::obs::MicrophoneState::Unmuted);
-    let (microphone_indicator, microphone_color) = if microphone_on {
-        ("◉", STATUS_RED)
-    } else {
-        ("○ ", palette.rank)
+    let (microphone_indicator, microphone_color) = match app
+        .obs_status
+        .as_ref()
+        .filter(|_| app.obs_error.is_none())
+        .map(|status| status.microphone)
+    {
+        Some(MicrophoneState::Unmuted) => ("◉", STATUS_RED),
+        Some(MicrophoneState::Muted) => ("○ ", palette.rank),
+        _ => ("?", palette.rank),
     };
     let devices_width = UnicodeWidthStr::width("OBS ")
         + UnicodeWidthStr::width(obs_indicator)
         + UnicodeWidthStr::width("  MIC ")
         + UnicodeWidthStr::width(microphone_indicator);
+    let assistant = assistant::compact(app, width.saturating_sub(devices_width as u16 + 8));
+    let assistant_width = UnicodeWidthStr::width(assistant.content.as_ref());
     let broadcaster = fit_display_width(
         &format!(" @ {} ", room.broadcaster_name),
-        usize::from(width).saturating_sub(devices_width),
+        usize::from(width).saturating_sub(devices_width + assistant_width),
     );
-    let gap = usize::from(width)
-        .saturating_sub(UnicodeWidthStr::width(broadcaster.as_str()) + devices_width);
+    let gap = usize::from(width).saturating_sub(
+        UnicodeWidthStr::width(broadcaster.as_str()) + devices_width + assistant_width,
+    );
     let neutral = Style::default()
         .fg(palette.content)
         .add_modifier(Modifier::BOLD);
@@ -3080,6 +3910,7 @@ fn secondary_status_line(
     if !broadcaster.is_empty() {
         spans.push(status_span(broadcaster, STATUS_GREEN, palette));
     }
+    spans.push(assistant);
     spans.push(Span::raw(" ".repeat(gap)));
     spans.extend([
         Span::styled("OBS ", neutral),
@@ -3100,11 +3931,10 @@ fn secondary_status_line(
 
 fn technical_status_lines(app: &TerminalApp, palette: Palette, width: u16) -> Vec<Line<'static>> {
     let Some(room) = app.room.as_ref() else {
-        return vec![Line::from(status_span(
-            " ◌ ROOM ".into(),
-            STATUS_ORANGE,
-            palette,
-        ))];
+        return vec![Line::from(vec![
+            assistant::compact(app, width.saturating_sub(8)),
+            status_span(" ◌ ROOM ".into(), STATUS_ORANGE, palette),
+        ])];
     };
     vec![
         primary_status_line(room, app, palette, width),
@@ -3115,14 +3945,23 @@ fn application_notice_lines(app: &TerminalApp, palette: Palette, width: u16) -> 
     if app.notice.is_empty() {
         return Vec::new();
     }
-    wrap_styled_spans(
-        vec![Span::styled(
-            format!("⚠ {}", app.notice),
-            Style::default().fg(palette.warning),
-        )],
-        width,
-        Alignment::Left,
-    )
+    let (prefix, color) = match app.notice_level {
+        NoticeLevel::Info => ("·", palette.time),
+        NoticeLevel::Success => ("+", palette.success),
+        NoticeLevel::Progress => ("·", palette.info),
+        NoticeLevel::Warning => ("!", palette.rank),
+        NoticeLevel::Error => ("!", palette.warning),
+    };
+    vec![Line::from(Span::styled(
+        format!(
+            "{prefix} {}",
+            fit_display_width(
+                &app.notice.replace(['\n', '\r'], " "),
+                usize::from(width).saturating_sub(2).min(64)
+            )
+        ),
+        Style::default().fg(color),
+    ))]
 }
 
 fn draw_history_status(
@@ -3132,23 +3971,23 @@ fn draw_history_status(
     palette: Palette,
 ) {
     let first = if area.width >= 44 {
-        " 浏览历史 · 已暂停跟随 · Esc 返回实时"
+        " HISTORY · Esc to follow"
     } else if area.width >= 24 {
-        " 历史浏览 · Esc 返回实时"
+        " HISTORY · Esc"
     } else {
-        " 历史 · Esc 返回"
+        " HISTORY"
     };
-    let mut second = format!(" 新增 {} 条", app.unread_live_count);
+    let mut second = format!(" +{} NEW", app.unread_live_count);
     if app.config.history_idle_seconds > 0 {
         if app.stop_flow.is_some() || app.login_qr.is_some() || app.secret_mode {
-            second.push_str(" · 弹窗期间暂停计时");
+            second.push_str(" · TIMER PAUSED");
         } else {
             let remaining = u64::from(app.config.history_idle_seconds)
                 .saturating_sub(app.last_user_activity.elapsed().as_secs());
-            second.push_str(&format!(" · {remaining}s 后自动返回"));
+            second.push_str(&format!(" · AUTO {remaining}s"));
         }
     } else {
-        second.push_str(" · 仅手动返回");
+        second.push_str(" · MANUAL");
     }
     frame.render_widget(
         Paragraph::new(vec![Line::from(first), Line::from(second)]).style(
@@ -3193,9 +4032,9 @@ fn draw_events(
             .position(|event| event.id == selected.id)
     });
     let title = if browse_target.is_some() {
-        format!("{title} · 浏览历史")
+        format!("{title} · HISTORY")
     } else {
-        format!("{title} · 实时跟随")
+        format!("{title} · FOLLOW")
     };
     let mut block = rounded_block(&title, palette);
     if browse_target.is_some() {
@@ -3267,6 +4106,14 @@ fn event_marker(kind: DanmuEventKind) -> &'static str {
     }
 }
 
+fn is_assistant_message(event: &DanmuEvent, app: &TerminalApp) -> bool {
+    event.kind == DanmuEventKind::Danmu
+        && app
+            .assistant_accounts
+            .independent_user_id(&app.account_status)
+            .is_some_and(|uid| event.author_id.as_deref() == Some(uid))
+}
+
 fn event_lines(
     event: &DanmuEvent,
     app: &TerminalApp,
@@ -3277,6 +4124,7 @@ fn event_lines(
         .room
         .as_ref()
         .is_some_and(|room| event.author_id.as_deref() == Some(room.broadcaster_id.as_str()));
+    let assistant = is_assistant_message(event, app);
     let mut metadata = Vec::new();
     if app.show_time {
         metadata.push(Span::styled(
@@ -3287,6 +4135,9 @@ fn event_lines(
                 .to_string(),
             Style::default().fg(palette.time),
         ));
+    }
+    if event.origin == DanmuEventOrigin::Archived {
+        metadata.push(Span::styled("↶ ", Style::default().fg(palette.time)));
     }
     if event.kind != DanmuEventKind::Danmu {
         let color = event_color(event.kind, palette);
@@ -3314,7 +4165,9 @@ fn event_lines(
         metadata.push(Span::styled(
             name,
             Style::default()
-                .fg(if broadcaster {
+                .fg(if assistant {
+                    ASSISTANT_MESSAGE_COLOR
+                } else if broadcaster {
                     palette.host
                 } else {
                     palette.name
@@ -3328,6 +4181,18 @@ fn event_lines(
                 .fg(palette.name)
                 .add_modifier(Modifier::BOLD),
         ));
+    }
+    if app.runner.running
+        && let Some(mark) = app.bridge.mark(&event.id)
+    {
+        let color = match mark {
+            bridge::Mark::Processing => Color::Yellow,
+            bridge::Mark::Confirmed => Color::Green,
+            bridge::Mark::Finished => Color::DarkGray,
+            bridge::Mark::Failed => Color::Red,
+        };
+        metadata.push(Span::raw(" "));
+        metadata.push(Span::styled("◆", Style::default().fg(color)));
     }
     let featured = app
         .session
@@ -3358,7 +4223,7 @@ fn event_lines(
         Text::from(lines)
     } else {
         if !metadata.is_empty() {
-            metadata.push(Span::raw("  "));
+            metadata.push(Span::raw(" "));
         }
         metadata.push(content);
         Text::from(wrap_styled_spans(metadata, width, Alignment::Left))
@@ -3455,12 +4320,12 @@ fn connection_badge(app: &TerminalApp) -> String {
     if app.connection.starts_with("已连接") {
         app.last_realtime_at
             .as_ref()
-            .map(|timestamp| format!("● 实时 {}", timestamp.format("%H:%M:%S")))
-            .unwrap_or_else(|| "● 实时".into())
+            .map(|timestamp| format!("实时 {}", timestamp.format("%H:%M:%S")))
+            .unwrap_or_else(|| "已连接".into())
     } else if app.connection.contains("重连") {
-        "◌ 重连中".into()
+        "正在重连".into()
     } else {
-        "○ 连接中".into()
+        "正在连接".into()
     }
 }
 
@@ -3532,15 +4397,20 @@ fn input_business_title(app: &TerminalApp, palette: Palette, width: u16) -> Line
     let online = app
         .online_viewers
         .map_or_else(|| "--".into(), |value| value.to_string());
-    let mut segments = Vec::with_capacity(4);
-    segments.push((format!("◉ {watched}"), palette.rank));
-    if width >= 24 {
-        segments.push((format!("♥ {likes}"), palette.warning));
+    let mut segments = Vec::with_capacity(3);
+    let mut remaining = usize::from(width);
+    for (label, value, color) in [
+        ("◉", watched, palette.rank),
+        ("♥", likes, palette.warning),
+        ("●", online, palette.success),
+    ] {
+        let needed = UnicodeWidthStr::width(label) + UnicodeWidthStr::width(value.as_str()) + 3;
+        if needed > remaining {
+            break;
+        }
+        remaining -= needed;
+        segments.push((format!("{label} {value}"), color));
     }
-    if width >= 32 {
-        segments.push((format!("▤ {}", app.live_danmu_count), palette.name));
-    }
-    segments.push((format!("● {online}"), palette.success));
     powerline_title(segments)
 }
 
@@ -3675,10 +4545,23 @@ fn input_final_line(content: &str, width: u16, palette: Palette) -> Line<'static
 }
 
 fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette: Palette) {
-    let (left, right) = if app.secret_mode {
+    let (left, right) = if app.candidate_edit.is_some() {
         (
             powerline_title(vec![(
-                "OBS WebSocket 密码 · Esc 取消".into(),
+                "编辑待确认回复 · Enter保存 · Esc取消 · 不发送".into(),
+                palette.warning,
+            )]),
+            Line::default(),
+        )
+    } else if app.command_search_draft.is_some() {
+        (
+            Line::from(" 命令搜索 · 输入中文 · Esc恢复草稿 "),
+            Line::default(),
+        )
+    } else if app.secret_mode {
+        (
+            powerline_title(vec![(
+                "OBS 密码 · Enter保存 · Esc取消".into(),
                 palette.warning,
             )]),
             Line::default(),
@@ -3689,10 +4572,11 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette
             Line::default(),
         )
     } else {
-        (
-            delivery_status_title(app, palette),
-            input_business_title(app, palette, area.width),
-        )
+        let status = delivery_status_title(app, palette);
+        let available = area
+            .width
+            .saturating_sub(line_display_width(&status) as u16 + 6);
+        (status, input_business_title(app, palette, available))
     };
 
     let meter_context = if !app.secret_mode && !app.stop_flow.is_some() && app.obs_error.is_none() {
@@ -3717,7 +4601,7 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette
             .take(app.input.cursor())
             .collect::<String>();
         let width = UnicodeWidthStr::width(before.as_str()) as u16;
-        if app.stop_flow.is_some() {
+        if app.stop_flow.is_some() || app.assistant_panel.is_some() {
             return;
         }
         frame.set_cursor_position((
@@ -3755,7 +4639,7 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette
         }
     }
     frame.render_widget(Paragraph::new(lines), area);
-    if app.stop_flow.is_some() {
+    if app.stop_flow.is_some() || app.assistant_panel.is_some() {
         return;
     }
     frame.set_cursor_position((
@@ -3909,6 +4793,106 @@ mod tests {
     fn test_app(temp: &tempfile::TempDir, session: DanmuSession) -> TerminalApp {
         replay::app(temp.path(), session)
     }
+    #[tokio::test]
+    async fn startup_history_creates_a_fresh_session_without_live_metrics() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = SessionJournal::new(temp.path().join("sessions"));
+        let mut archived = DanmuSession::new("42");
+        let event = DanmuEvent::new(DanmuEventKind::Danmu, "上次直播的弹幕");
+        archived.ingest(event.clone());
+        journal.start(&archived).unwrap();
+        archived.end(Utc::now(), DanmuSessionEndReason::Completed);
+        journal.end(&archived).unwrap();
+        let source = temp
+            .path()
+            .join("sessions")
+            .join(&archived.id)
+            .join("journal.jsonl");
+        let original = std::fs::read(&source).unwrap();
+        let (updates, _) = mpsc::unbounded_channel();
+
+        let loaded = load_startup_session(journal.clone(), "42".into(), updates).await;
+
+        assert_ne!(loaded.session.id, archived.id);
+        assert_eq!(
+            loaded.session.status,
+            crate::domain::DanmuSessionStatus::Active
+        );
+        assert_eq!(
+            loaded.session.metrics,
+            crate::domain::SessionMetrics::default()
+        );
+        assert_eq!(loaded.session.recent_events.len(), 1);
+        assert_eq!(loaded.session.recent_events[0].id, event.id);
+        assert_eq!(
+            loaded.session.recent_events[0].origin,
+            DanmuEventOrigin::Archived
+        );
+        journal.start(&loaded.session).unwrap();
+        assert_eq!(std::fs::read(source).unwrap(), original);
+    }
+
+    #[test]
+    fn independent_assistant_message_color_requires_uid_not_name_or_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        crate::storage::write_private_atomic(
+            &temp.path().join("assistant-account.json"),
+            &serde_json::to_vec(&serde_json::json!({"mode":"independent", "account":id})).unwrap(),
+        )
+        .unwrap();
+        crate::storage::write_private_atomic(
+            &temp.path().join(format!("AssistantAccounts/{id}.json")),
+            &serde_json::to_vec(&serde_json::json!({
+                "cookieHeader":"SESSDATA=fake-local; bili_jct=fake-local; DedeUserID=22",
+                "csrf":"fake-local",
+                "identity":{"SignedIn":{"display_name":"助手", "user_id":"22"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        let mut event = DanmuEvent::new(DanmuEventKind::Danmu, "✦ 同名同前缀回复");
+        event.username = Some("助手".into());
+        let emphasized = |event: &DanmuEvent, app: &TerminalApp| {
+            event_lines(event, app, app.config.palette, 80)
+                .lines
+                .into_iter()
+                .flat_map(|line| line.spans)
+                .filter(|span| span.style.fg == Some(ASSISTANT_MESSAGE_COLOR))
+                .map(|span| span.content.into_owned())
+                .collect::<Vec<_>>()
+        };
+        for uid in [None, Some("33")] {
+            event.author_id = uid.map(str::to_owned);
+            assert!(emphasized(&event, &app).is_empty());
+        }
+        event.author_id = Some("22".into());
+        for running in [true, false] {
+            app.runner.running = running;
+            assert_eq!(emphasized(&event, &app), ["助手"]);
+        }
+        let body = event_lines(&event, &app, app.config.palette, 80);
+        let body = body
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("同名同前缀回复"))
+            .unwrap();
+        assert_eq!(body.style.fg, Some(app.config.palette.content));
+        assert!(!body.style.add_modifier.contains(Modifier::BOLD));
+
+        app.show_name = false;
+        assert!(emphasized(&event, &app).is_empty());
+        app.account_status = AccountStatus::SignedIn {
+            display_name: "主账号".into(),
+            user_id: "22".into(),
+        };
+        assert!(emphasized(&event, &app).is_empty());
+        app.account_status = AccountStatus::SignedOut;
+        app.assistant_accounts.reuse_main().unwrap();
+        assert!(emphasized(&event, &app).is_empty());
+    }
 
     #[tokio::test]
     async fn stop_flow_requires_selection_and_supports_cancelling_countdown() {
@@ -3996,9 +4980,38 @@ mod tests {
         );
         let (tx, mut rx) = mpsc::channel(8);
         app.command("/obs stop", tx.clone()).await.unwrap();
-        let now = Instant::now();
-        app.handle_stop_key(KeyCode::Up, now);
-        app.handle_stop_key(KeyCode::Enter, now);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(matches!(
+            app.stop_flow,
+            Some(StopFlow::Confirm {
+                stop_selected: false
+            })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx.clone())
+            .await
+            .unwrap();
+        assert!(app.stop_flow.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        app.command("/obs stop", tx.clone()).await.unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), tx.clone())
+            .await
+            .unwrap();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        let Some(StopFlow::Countdown { deadline }) = app.stop_flow else {
+            panic!("countdown expected");
+        };
+        let now = deadline - Duration::from_secs(3);
         app.advance_stop_at(now + Duration::from_millis(2999), &tx);
         assert!(
             tokio::time::timeout(Duration::from_millis(20), listener.accept())
@@ -4076,6 +5089,122 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn microphone_shortcuts_are_idempotent_and_require_remote_confirmation() {
+        use futures_util::SinkExt;
+        use serde_json::{Value, json};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        app.obs = ObsController::new(
+            crate::obs::ObsConfiguration {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                ..Default::default()
+            },
+            temp.path().join("obs.json"),
+        );
+        let muted = Arc::new(AtomicBool::new(false));
+        let ignore_change = Arc::new(AtomicBool::new(false));
+        let remote = muted.clone();
+        let ignore = ignore_change.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(socket).await.unwrap();
+            ws.send(Message::Text(
+                json!({"op":0,"d":{"obsWebSocketVersion":"5.6.0","rpcVersion":1}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(
+                json!({"op":2,"d":{"negotiatedRpcVersion":1}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                if message.is_close() {
+                    break;
+                }
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                let response = match request["d"]["requestType"].as_str().unwrap() {
+                    "GetVersion" => {
+                        json!({"obsVersion":"31.0.0","obsWebSocketVersion":"5.6.0","rpcVersion":1,"availableRequests":[],"supportedImageFormats":[],"platform":"macos","platformDescription":"macOS"})
+                    }
+                    "SetInputMute" => {
+                        if !ignore.load(Ordering::SeqCst) {
+                            remote.store(
+                                request["d"]["requestData"]["inputMuted"].as_bool().unwrap(),
+                                Ordering::SeqCst,
+                            );
+                        }
+                        json!({})
+                    }
+                    "GetInputMute" => json!({"inputMuted":remote.load(Ordering::SeqCst)}),
+                    other => panic!("unexpected OBS operation: {other}"),
+                };
+                let mut reply = json!({"op":7,"d":{
+                    "requestType":request["d"]["requestType"],"requestId":request["d"]["requestId"],
+                    "requestStatus":{"result":true,"code":100}
+                }});
+                if request["d"]["requestType"] != "SetInputMute" {
+                    reply["d"]["responseData"] = response;
+                }
+                ws.send(Message::Text(reply.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let (tx, mut rx) = mpsc::channel(4);
+        app.input = "人工草稿".into();
+        for (command, expected) in [("/mute", true), ("/mute", true), ("/unmute", false)] {
+            app.open_commands();
+            app.handle_paste(command);
+            app.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                tx.clone(),
+            )
+            .await
+            .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.handle_ui_event(result);
+            assert!(
+                matches!(app.notice_level, NoticeLevel::Success),
+                "{}",
+                app.notice
+            );
+            assert_eq!(muted.load(Ordering::SeqCst), expected);
+            assert_eq!(app.input, "人工草稿");
+        }
+        ignore_change.store(true, Ordering::SeqCst);
+        app.command("/mute", tx).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_ui_event(result);
+        assert!(
+            matches!(app.notice_level, NoticeLevel::Error),
+            "{}",
+            app.notice
+        );
+        assert!(!muted.load(Ordering::SeqCst));
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
     fn gift_combo_renders_one_row_without_moving_past_newer_chat() {
         let temp = tempfile::tempdir().unwrap();
@@ -4116,93 +5245,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_animation_respects_two_second_minimum() {
-        assert!(!startup_can_finish(
-            STARTUP_MIN_DURATION - Duration::from_millis(1),
-            true,
-        ));
-        assert!(startup_can_finish(STARTUP_MIN_DURATION, true));
-        assert!(!startup_can_finish(STARTUP_MIN_DURATION, false));
-    }
-
-    #[test]
-    fn startup_animation_shows_checklist_and_completed_state() {
-        let palette = Palette::default();
-        let mut startup = StartupView::new();
-        let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
-        terminal
-            .draw(|frame| {
-                draw_startup(
-                    frame,
-                    palette,
-                    0,
-                    &startup,
-                    &StartupGate::Checking,
-                    Duration::ZERO,
-                    false,
-                )
-            })
-            .unwrap();
-        let first_frame = (0..terminal.backend().buffer().area.height)
-            .map(|y| {
-                (0..terminal.backend().buffer().area.width)
-                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let first_compact = first_frame.replace(' ', "");
-
-        assert!(first_frame.contains("DANMU"));
-        assert!(first_frame.contains("╭────────────────╮"));
-        assert!(first_frame.contains("Elazer"), "{first_frame}");
-        assert!(first_frame.contains("elazer.wang"), "{first_frame}");
-        assert!(first_compact.contains("启动自检"), "{first_frame}");
-        assert!(first_compact.contains("登录状态"), "{first_frame}");
-        assert!(first_compact.contains("OBS连接"), "{first_frame}");
-        assert!(first_compact.contains("检查中"), "{first_frame}");
-
-        startup.apply(StartupUpdate::Account(StartupCheck::Passed(
-            "未登录 · 监看模式",
-        )));
-        startup.apply(StartupUpdate::Local(StartupCheck::Passed("已读取")));
-        startup.apply(StartupUpdate::Room(StartupCheck::Passed("房间可访问")));
-        startup.apply(StartupUpdate::Metrics(StartupCheck::Skipped(
-            "未登录 · 已跳过",
-        )));
-        startup.obs = StartupCheck::Passed("已连接");
-        terminal
-            .draw(|frame| {
-                draw_startup(
-                    frame,
-                    palette,
-                    9,
-                    &startup,
-                    &StartupGate::Ready,
-                    STARTUP_MIN_DURATION,
-                    true,
-                )
-            })
-            .unwrap();
-        let final_frame = (0..terminal.backend().buffer().area.height)
-            .map(|y| {
-                (0..terminal.backend().buffer().area.width)
-                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let final_compact = final_frame.replace(' ', "");
-
-        assert!(final_compact.contains("启动自检完成"), "{final_frame}");
-        assert!(final_compact.contains("未登录·监看模式"), "{final_frame}");
-        assert!(final_compact.contains("房间可访问"), "{final_frame}");
-        assert!(final_compact.contains("OBS连接已连接"), "{final_frame}");
-        assert_ne!(first_frame, final_frame);
-    }
-
-    #[test]
-    fn startup_warning_blocks_and_masks_obs_password() {
+    fn optional_startup_checks_do_not_block_and_password_stays_private() {
         let palette = Palette::default();
         let mut startup = StartupView::new();
         startup.account = StartupCheck::Passed("未登录 · 监看模式");
@@ -4212,36 +5255,12 @@ mod tests {
         startup.local = StartupCheck::Passed("已读取");
         let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
 
-        terminal
-            .draw(|frame| {
-                draw_startup(
-                    frame,
-                    palette,
-                    0,
-                    &startup,
-                    &StartupGate::Blocked,
-                    STARTUP_MIN_DURATION,
-                    true,
-                )
-            })
-            .unwrap();
-        let blocked = (0..terminal.backend().buffer().area.height)
-            .map(|y| {
-                (0..terminal.backend().buffer().area.width)
-                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let blocked_compact = blocked.replace(' ', "");
-
+        assert!(!startup.has_warning());
+        startup.account = StartupCheck::Warning("账号未登录");
+        startup.metrics = StartupCheck::Warning("指标不可用");
+        assert!(!startup.has_warning());
+        startup.room = StartupCheck::Warning("直播间不可访问");
         assert!(startup.has_warning());
-        assert!(!StartupGate::Blocked.can_finish());
-        assert!(
-            blocked_compact.contains("启动已阻断·OBS需要配置"),
-            "{blocked}"
-        );
-        assert!(blocked_compact.contains("Enter配置OBS·S跳过"), "{blocked}");
 
         let password_gate = StartupGate::EnteringObsPassword(EditorInput::from("secret"));
         terminal
@@ -4252,7 +5271,7 @@ mod tests {
                     0,
                     &startup,
                     &password_gate,
-                    STARTUP_MIN_DURATION,
+                    Duration::ZERO,
                     true,
                 )
             })
@@ -4432,10 +5451,7 @@ mod tests {
                     .collect::<String>()
             })
             .collect::<Vec<_>>();
-        let frame_top = lines
-            .iter()
-            .position(|line| line.contains("Ghost Stage"))
-            .unwrap();
+        let frame_top = lines.iter().position(|line| line.starts_with('╭')).unwrap();
         let frame_bottom = lines
             .iter()
             .enumerate()
@@ -4449,326 +5465,6 @@ mod tests {
 
         assert!(notice_row > frame_bottom);
         assert!(!lines[notice_row].contains('│'));
-    }
-
-    #[test]
-    fn live_label_and_red_dot_blink_together_without_a_badge() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut app = test_app(&temp, DanmuSession::new("1"));
-        app.room = Some(RoomSnapshot {
-            room_id: "1".into(),
-            broadcaster_id: "42".into(),
-            broadcaster_name: "host".into(),
-            title: "stream".into(),
-            area: "".into(),
-            live_started_at: None,
-            live_status: RoomLiveStatus::Live,
-        });
-        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
-        for status in [
-            RoomLiveStatus::Live,
-            RoomLiveStatus::Offline,
-            RoomLiveStatus::Rotating,
-        ] {
-            app.room.as_mut().unwrap().live_status = status;
-            let frames = (0..=4)
-                .map(|tick| {
-                    app.animation_tick = tick;
-                    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-                    (0..100)
-                        .map(|x| terminal.backend().buffer()[(x, 0)].clone())
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(frames[0], frames[1]);
-            assert_eq!(frames[2], frames[3]);
-            assert_eq!(frames[0], frames[4]);
-            for row in &frames {
-                let clock = row.iter().position(|cell| cell.symbol() == "◷").unwrap();
-                assert_eq!(row[clock].fg, app.config.palette.content);
-                assert!(
-                    row[clock..]
-                        .iter()
-                        .all(|cell| cell.bg == app.config.palette.background)
-                );
-                assert!(
-                    row[clock..]
-                        .iter()
-                        .map(|cell| cell.symbol())
-                        .collect::<String>()
-                        .contains("--:--:--")
-                );
-            }
-            if status == RoomLiveStatus::Live {
-                let on = &frames[0];
-                let off = &frames[2];
-                let dot = on.iter().position(|cell| cell.symbol() == "●").unwrap();
-                assert_eq!(on[dot].fg, Color::LightRed);
-                assert_eq!(
-                    on[dot..dot + 6]
-                        .iter()
-                        .map(|cell| cell.symbol())
-                        .collect::<String>(),
-                    "● LIVE"
-                );
-                assert!(off[dot..dot + 6].iter().all(|cell| cell.symbol() == " "));
-                assert!(
-                    on[..dot + 7]
-                        .iter()
-                        .chain(&off[..dot + 7])
-                        .all(|cell| cell.bg == app.config.palette.background)
-                );
-                assert_eq!(&on[..dot], &off[..dot]);
-                assert_eq!(&on[dot + 6..], &off[dot + 6..]);
-            } else {
-                assert_eq!(frames[0], frames[2], "non-live statuses must not blink");
-            }
-        }
-    }
-
-    #[test]
-    fn layout_separates_realtime_technical_and_business_status() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut session = DanmuSession::new("1");
-        let mut older = DanmuEvent::new(DanmuEventKind::Danmu, "旧消息");
-        older.username = Some("甲".into());
-        session.ingest(older);
-        let mut newer = DanmuEvent::new(DanmuEventKind::Danmu, "新消息");
-        newer.username = Some("乙".into());
-        session.ingest(newer);
-        let mut app = test_app(&temp, session);
-        app.handle_ui_event(UiEvent::RoomSnapshot(RoomSnapshot {
-            room_id: "1".into(),
-            broadcaster_id: "42".into(),
-            broadcaster_name: "停车拾穗".into(),
-            title: "测试直播标题".into(),
-            area: "知识".into(),
-            live_started_at: Some(Utc::now() - chrono::Duration::hours(1)),
-            live_status: RoomLiveStatus::Live,
-        }));
-        app.live_danmu_count = 7;
-        app.handle_client_event(BilibiliClientEvent::Watched(123));
-        app.handle_client_event(BilibiliClientEvent::Likes(321));
-        app.handle_ui_event(UiEvent::OnlineViewers(Ok(Some(11))));
-        app.account_status = AccountStatus::SignedIn {
-            display_name: "主播".into(),
-            user_id: "42".into(),
-        };
-        app.connection = "已连接".into();
-        app.handle_ui_event(UiEvent::ObsStatus(Ok(ObsStatus {
-            current_scene: "直播".into(),
-            stream: crate::obs::StreamState::Live,
-            microphone: crate::obs::MicrophoneState::Unmuted,
-            compatibility_warning: None,
-        })));
-        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let lines = (0..buffer.area.height)
-            .map(|y| {
-                let mut line = String::new();
-                for x in 0..buffer.area.width {
-                    line.push_str(buffer[(x, y)].symbol());
-                }
-                line
-            })
-            .collect::<Vec<_>>();
-        let normalized = lines
-            .iter()
-            .map(|line| line.replace(' ', ""))
-            .collect::<Vec<_>>();
-        let surface = normalized.join(
-            "
-",
-        );
-        let live_row = normalized
-            .iter()
-            .position(|line| line.contains("●LIVE"))
-            .unwrap();
-        let details_row = normalized
-            .iter()
-            .position(|line| line.contains("OBS"))
-            .unwrap();
-        let business_row = normalized
-            .iter()
-            .position(|line| line.contains("◉123"))
-            .unwrap();
-        let live = &normalized[live_row];
-        let details = &normalized[details_row];
-        let business = &normalized[business_row];
-        assert_eq!(live_row, 0);
-        assert_eq!(details_row, 1);
-        assert!(live.contains("●LIVE测试直播标题"));
-        assert!(live.ends_with(|character: char| character.is_ascii_digit()));
-        assert!(live.contains("◷"));
-        assert!(!live.contains("@停车拾穗"));
-        assert!(details.contains("@停车拾穗"));
-        assert!(details.contains("MIC◉"));
-        assert!(!details.contains("知识"));
-        assert!(!details.contains("测试直播标题"));
-        assert!(business.starts_with("╭──↑"));
-        assert!(business.contains("◉123"));
-        assert!(business.contains("♥321"));
-        assert!(business.contains("▤7"));
-        assert!(business.contains("●11"));
-        assert!(business.ends_with("●11──╮"));
-        assert!(business.find("♥321").unwrap() > business.find("◉123").unwrap());
-        assert!(business.find("▤7").unwrap() > business.find("♥321").unwrap());
-        assert!(business.find("●11").unwrap() > business.find("▤7").unwrap());
-        assert!(!business.contains("看过"));
-        assert!(!business.contains("点赞"));
-        assert!(!business.contains("弹幕"));
-        assert!(!business.contains("在线"));
-        assert!(!business.contains("测试直播标题"));
-        assert!(!business.contains("知识"));
-        assert!(!business.contains("LIVE"));
-        assert!(!business.contains("OBS"));
-        assert!(!business.contains("技术"));
-        assert!(surface.contains("╭──"));
-        assert!(surface.contains("╰─"));
-        assert!(surface.contains("─╯"));
-        assert!(!surface.contains("DANMU"));
-        assert!(!surface.contains("B站"));
-
-        let technical_lines = technical_status_lines(&app, app.config.palette, 120);
-        assert_eq!(line_display_width(&technical_lines[0]), 120);
-        assert!(technical_lines[0].spans[0].content.contains("LIVE"));
-        assert!(
-            technical_lines[0]
-                .spans
-                .last()
-                .unwrap()
-                .content
-                .contains("◷")
-        );
-        assert_eq!(technical_lines.len(), 2);
-        let title_span = technical_lines[0]
-            .spans
-            .iter()
-            .find(|span| span.content == "测试直播标题")
-            .unwrap();
-        assert_eq!(title_span.style.fg, Some(app.config.palette.rank));
-        assert_eq!(title_span.style.bg, None);
-        assert_eq!(line_display_width(&technical_lines[1]), 120);
-        let obs_indicator = &technical_lines[1]
-            .spans
-            .windows(2)
-            .find(|pair| pair[0].content == "OBS ")
-            .unwrap()[1];
-        assert_eq!(obs_indicator.content.chars().count(), 1);
-        assert_eq!(obs_indicator.style.fg, Some(STATUS_GREEN));
-        assert_eq!(obs_indicator.style.bg, None);
-        let mic_indicator = technical_lines[1]
-            .spans
-            .iter()
-            .find(|span| span.content == "◉")
-            .unwrap();
-        assert_eq!(mic_indicator.style.fg, Some(STATUS_RED));
-        assert_eq!(mic_indicator.style.bg, None);
-        app.handle_ui_event(UiEvent::ObsStatus(Err("offline".into())));
-        let disconnected_lines = technical_status_lines(&app, app.config.palette, 120);
-        let disconnected_obs = &disconnected_lines[1]
-            .spans
-            .windows(2)
-            .find(|pair| pair[0].content == "OBS ")
-            .unwrap()[1];
-        assert_eq!(disconnected_obs.content, obs_indicator.content);
-        assert_eq!(disconnected_obs.style.fg, Some(STATUS_RED));
-        assert_eq!(disconnected_obs.style.bg, None);
-        let muted_mic = disconnected_lines[1]
-            .spans
-            .iter()
-            .find(|span| span.content == "○ ")
-            .unwrap();
-        assert_eq!(muted_mic.style.fg, Some(app.config.palette.rank));
-        assert_eq!(muted_mic.style.bg, None);
-        assert!(
-            disconnected_lines[1]
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-                .ends_with("MIC ○ ")
-        );
-        let colored_spans = technical_lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .filter(|span| {
-                span.style
-                    .bg
-                    .is_some_and(|bg| bg != app.config.palette.background)
-            })
-            .collect::<Vec<_>>();
-        let segment_backgrounds = colored_spans
-            .iter()
-            .map(|span| span.style.bg.unwrap())
-            .collect::<std::collections::HashSet<_>>();
-        assert!(segment_backgrounds.contains(&STATUS_GREEN));
-        for span in colored_spans {
-            let background = span.style.bg.unwrap();
-            assert_eq!(
-                span.style.fg,
-                Some(contrast_foreground(background, app.config.palette))
-            );
-        }
-
-        let narrow_lines = technical_status_lines(&app, app.config.palette, 32);
-        assert_eq!(narrow_lines.len(), 2);
-        assert_eq!(line_display_width(&narrow_lines[0]), 32);
-        let narrow_text = narrow_lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert!(!narrow_text.contains("知识"));
-
-        let room_title = input_business_title(&app, app.config.palette, 120);
-        let mut foregrounds = std::collections::HashSet::new();
-        for span in &room_title.spans {
-            let background = span.style.bg.expect("数据分段必须有背景色");
-            let foreground = span.style.fg.expect("数据分段必须有前景色");
-            assert_eq!(background, Color::Black);
-            assert_ne!(foreground, Color::Black);
-            foregrounds.insert(foreground);
-        }
-        assert!(foregrounds.len() >= 3);
-        let delivery_title = delivery_status_title(&app, app.config.palette);
-        assert_eq!(
-            delivery_title.spans[0].style.fg,
-            Some(app.config.palette.success)
-        );
-        assert_eq!(delivery_title.spans[0].content, " ↑ ");
-        assert_eq!(delivery_title.spans[0].style.bg, None);
-        let compact = input_top_line(
-            delivery_status_title(&app, app.config.palette),
-            input_business_title(&app, app.config.palette, 40),
-            40,
-            app.config.palette,
-            None,
-        );
-        let compact_text = compact
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert_eq!(line_display_width(&compact), 40);
-        assert!(compact_text.contains("◉ 123"));
-        assert!(compact_text.contains("♥ 321"));
-        assert!(compact_text.contains("▤ 7"));
-        assert!(!compact_text.contains("在线"));
-        assert!(compact_text.contains("● 11"));
-        assert!(lines.iter().any(|line| line.contains("╭ Ghost Stage ")));
-        assert!(!surface.contains("Questions"));
-        assert!(!surface.contains("待回答"));
-        let older_row = normalized
-            .iter()
-            .position(|line| line.contains("旧消息"))
-            .unwrap();
-        let newer_row = normalized
-            .iter()
-            .position(|line| line.contains("新消息"))
-            .unwrap();
-        assert!(older_row < newer_row);
     }
 
     #[test]
@@ -4960,16 +5656,14 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        let badge = line
-            .spans
-            .iter()
-            .find(|span| span.content.contains("进场"))
-            .unwrap();
-        assert!(text.contains("→ 进场"));
         assert!(text.contains("战区超人 来了"));
         assert!(!text.contains("<%"));
         assert!(!text.contains("%>"));
-        assert_eq!(badge.style.bg, Some(palette.info));
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.style.bg == Some(palette.info))
+        );
         assert_ne!(
             event_color(DanmuEventKind::Enter, palette),
             event_color(DanmuEventKind::Danmu, palette)
@@ -5016,6 +5710,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pin_command_keeps_the_selected_message_when_live_messages_arrive() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = DanmuSession::new("1");
+        let mut question = DanmuEvent::new(DanmuEventKind::Danmu, "需要重点回答的问题");
+        question.username = Some("观众".into());
+        let question_id = question.id.clone();
+        session.ingest(question);
+        let mut app = test_app(&temp, session);
+        let (tx, _rx) = mpsc::channel(1);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT), tx.clone())
+            .await
+            .unwrap();
+        for character in "/pin".chars() {
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                tx.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut incoming = DanmuEvent::new(DanmuEventKind::Danmu, "稍后到达的新消息");
+        incoming.origin = DanmuEventOrigin::Live;
+        app.handle_client_event(BilibiliClientEvent::Danmu(incoming));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.session.featured_event.as_ref().map(|event| &event.id),
+            Some(&question_id)
+        );
+        assert!(app.input.is_empty());
+    }
+
+    #[tokio::test]
+    async fn login_qr_consumes_keys_before_the_underlying_settings_panel() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        let (tx, _rx) = mpsc::channel(1);
+        app.input = "人工草稿".into();
+        app.open_settings().unwrap();
+        let token = uuid::Uuid::new_v4();
+        app.main_login = Some(MainLogin {
+            token,
+            task: tokio::spawn(std::future::pending()),
+        });
+        app.handle_ui_event(UiEvent::LoginQr {
+            token,
+            lines: vec!["QR".into()],
+        });
+        for code in [KeyCode::Enter, KeyCode::Char('x')] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), tx.clone())
+                .await
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx.clone())
+            .await
+            .unwrap();
+        assert!(app.login_qr.is_none());
+        assert!(app.assistant_panel.is_some());
+        let notice = app.notice.clone();
+        app.handle_ui_event(UiEvent::LoginQr {
+            token,
+            lines: vec!["迟到二维码".into()],
+        });
+        app.handle_ui_event(UiEvent::LoginDone {
+            token,
+            account: app.account.staged(),
+            status: AccountStatus::SignedIn {
+                display_name: "迟到账号".into(),
+                user_id: "99".into(),
+            },
+        });
+        assert!(app.login_qr.is_none());
+        assert!(matches!(app.account_status, AccountStatus::SignedOut));
+        assert_eq!(app.notice, notice);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx)
+            .await
+            .unwrap();
+        assert!(app.assistant_panel.is_none());
+        assert_eq!(&*app.input, "人工草稿");
+    }
+
+    #[tokio::test]
     async fn escape_and_selection_behavior_remain_intact() {
         let temp = tempfile::tempdir().unwrap();
         let mut session = DanmuSession::new("1");
@@ -5058,6 +5835,193 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+    #[test]
+    fn successful_delivery_clears_only_transient_delivery_notices() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        app.handle_ui_event(UiEvent::DeliveryNotice("未确认送达".into()));
+        assert!(app.notice_deadline.is_some());
+        app.handle_ui_event(UiEvent::DeliveryCompleted);
+        assert!(app.notice.is_empty());
+        app.handle_ui_event(UiEvent::DeliveryNotice("再次未确认".into()));
+        app.expire_notice_at(Instant::now() + DELIVERY_NOTICE_LIFETIME);
+        assert!(app.notice.is_empty());
+        app.handle_ui_event(UiEvent::error("登录态需处理"));
+        app.handle_ui_event(UiEvent::DeliveryCompleted);
+        assert_eq!(app.notice, "登录态需处理");
+    }
+    #[tokio::test]
+    async fn post_waits_for_echo_matcher_and_fast_echo_confirms_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn response(body: &str) -> String {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let endpoint =
+            url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let (post_seen_tx, mut post_seen_rx) = oneshot::channel();
+        let (respond_tx, respond_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut post_seen_tx = Some(post_seen_tx);
+            let mut respond_rx = Some(respond_rx);
+            for body in [
+                r#"{"code":0,"data":{"isLogin":true,"uname":"用户42","mid":42}}"#,
+                r#"{"code":0,"data":{"mode_info":{"extra":{"content":"极速回声","send_from_me":true}}}}"#,
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&chunk[..count]);
+                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                if request.starts_with("POST ") {
+                    post_seen_tx.take().unwrap().send(()).unwrap();
+                    respond_rx.take().unwrap().await.unwrap();
+                }
+                requests.push(request);
+                socket.write_all(response(body).as_bytes()).await.unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+            requests
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let account_path = temp.path().join("account.json");
+        crate::storage::write_private_atomic(
+            &account_path,
+            &serde_json::to_vec(&serde_json::json!({
+                "cookieHeader":"SESSDATA=fake; bili_jct=fake; DedeUserID=42",
+                "csrf":"fake",
+                "identity":{"SignedIn":{"display_name":"用户42", "user_id":"42"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let account = AccountClient::new(account_path)
+            .unwrap()
+            .with_test_endpoint(endpoint);
+        let (tx, mut ui_rx) = mpsc::channel(8);
+        let transport = TerminalTransport {
+            account: accounts::SendIdentity::manual(account),
+            client: BilibiliClient::new(temp.path().join("live-session.json")).unwrap(),
+            room: "1".into(),
+            tx,
+            job: None,
+            bridge: bridge::Bridge::new(true),
+            queue: SendQueue::default(),
+        };
+        let send = tokio::spawn(async move { transport.send_confirm("极速回声", None).await });
+        let started = tokio::time::timeout(Duration::from_secs(1), ui_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut post_seen_rx)
+                .await
+                .is_err(),
+            "UI尚未注册回声匹配器时不得开始POST"
+        );
+
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        app.handle_ui_event(started);
+        post_seen_rx.await.unwrap();
+        let mut echo = DanmuEvent::new(DanmuEventKind::Danmu, "极速回声");
+        echo.timestamp = Utc::now();
+        echo.username = Some("用户42".into());
+        echo.author_id = Some("42".into());
+        app.ingest_event(echo);
+        respond_tx.send(()).unwrap();
+
+        let delivery = send.await.unwrap();
+        assert_eq!(delivery.outcome, Outcome::Confirmed);
+        assert_eq!(
+            delivery.diagnosis.cause,
+            crate::delivery::Cause::EchoConfirmed
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("POST "))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn late_echo_keeps_its_identity_and_expires_at_the_delivery_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        let submitted = Utc::now();
+        let delivery =
+            PendingDelivery::new("late reply".into(), "host".into(), "42".into(), submitted);
+        let mut boundary = DanmuEvent::new(DanmuEventKind::Danmu, "late reply");
+        boundary.author_id = Some("42".into());
+        boundary.timestamp = submitted + chrono::Duration::seconds(90);
+        assert!(delivery.matches(&boundary));
+        boundary.timestamp += chrono::Duration::milliseconds(1);
+        assert!(!delivery.matches(&boundary));
+        let id = delivery.id.clone();
+        let (tx, mut rx) = oneshot::channel();
+        let (registered_tx, _registered_rx) = oneshot::channel();
+        app.handle_ui_event(UiEvent::DeliveryStarted {
+            delivery,
+            confirmation: tx,
+            registered: registered_tx,
+        });
+        app.handle_ui_event(UiEvent::DeliveryEchoMissing {
+            delivery_ids: vec![id.clone()],
+        });
+        assert_eq!(app.delivery_status, DeliveryStatus::Uncertain);
+        let mut impostor = DanmuEvent::new(DanmuEventKind::Danmu, "late reply");
+        impostor.author_id = Some("43".into());
+        impostor.username = Some("host".into());
+        impostor.timestamp = submitted + chrono::Duration::seconds(30);
+        app.ingest_event(impostor);
+        assert!(rx.try_recv().is_err());
+        let mut echo = DanmuEvent::new(DanmuEventKind::Danmu, "late reply");
+        echo.author_id = Some("42".into());
+        echo.timestamp = submitted + chrono::Duration::seconds(30);
+        app.ingest_event(echo);
+        assert!(rx.try_recv().is_ok());
+        app.handle_ui_event(UiEvent::DeliveryCompleted);
+        assert_eq!(app.delivery_status, DeliveryStatus::Delivered);
+        app.handle_ui_event(UiEvent::DeliveryEchoMissing {
+            delivery_ids: vec![id],
+        });
+        assert_eq!(app.delivery_status, DeliveryStatus::Delivered);
     }
     #[test]
     fn sent_message_accepts_masked_live_echo_and_restores_broadcaster_identity() {
@@ -5114,6 +6078,7 @@ mod tests {
         app.handle_ui_event(UiEvent::DeliveryStarted {
             delivery,
             confirmation: confirmation_tx,
+            registered: oneshot::channel().0,
         });
 
         let mut history = DanmuEvent::new(DanmuEventKind::Danmu, "古天乐，神殿侠侣，应该看过吧");
@@ -5152,17 +6117,12 @@ mod tests {
         app.handle_ui_event(UiEvent::DeliveryStarted {
             delivery,
             confirmation: confirmation_tx,
+            registered: oneshot::channel().0,
         });
         assert_eq!(app.delivery_status, DeliveryStatus::Sending);
         app.handle_ui_event(UiEvent::DeliveryAccepted);
         assert_eq!(app.delivery_status, DeliveryStatus::AwaitingEcho);
         app.animation_tick = 1;
-        assert!(
-            delivery_status_title(&app, app.config.palette)
-                .spans
-                .iter()
-                .any(|span| span.content.contains("⠙"))
-        );
 
         let mut event = DanmuEvent::new(DanmuEventKind::Danmu, "主播消息");
         event.timestamp = submitted_at + chrono::Duration::seconds(1);
@@ -5176,7 +6136,6 @@ mod tests {
             app.session.recent_events[0].username.as_deref(),
             Some("拾穗数据")
         );
-        assert_eq!(app.live_danmu_count, 1);
         assert!(app.last_live_danmu_at.is_some());
         assert_eq!(app.delivery_status, DeliveryStatus::Verifying);
         app.handle_ui_event(UiEvent::DeliveryCompleted);
@@ -5206,10 +6165,12 @@ mod tests {
         app.handle_ui_event(UiEvent::DeliveryStarted {
             delivery: first,
             confirmation: first_tx,
+            registered: oneshot::channel().0,
         });
         app.handle_ui_event(UiEvent::DeliveryStarted {
             delivery: second,
             confirmation: second_tx,
+            registered: oneshot::channel().0,
         });
 
         assert_eq!(app.pending_deliveries.len(), 2);
@@ -5249,12 +6210,7 @@ mod tests {
         });
         assert_eq!(app.delivery_status, DeliveryStatus::Failed);
         assert!(app.notice.contains("请手动重发这条消息"));
-        assert!(
-            delivery_status_title(&app, app.config.palette)
-                .spans
-                .iter()
-                .any(|span| span.content.contains('×'))
-        );
+
         let rejection_deadline = app.notice_deadline.expect("发送失败提醒应自动消失");
         app.expire_notice_at(rejection_deadline);
         assert!(app.notice.is_empty());
@@ -5271,6 +6227,7 @@ mod tests {
         app.handle_ui_event(UiEvent::DeliveryStarted {
             delivery,
             confirmation,
+            registered: oneshot::channel().0,
         });
         app.handle_ui_event(UiEvent::DeliveryHistory { events: Vec::new() });
         assert_eq!(app.delivery_status, DeliveryStatus::Verifying);
@@ -5279,12 +6236,7 @@ mod tests {
         });
         assert_eq!(app.delivery_status, DeliveryStatus::Uncertain);
         assert!(app.notice.contains("待确认消息"));
-        assert!(
-            delivery_status_title(&app, app.config.palette)
-                .spans
-                .iter()
-                .any(|span| span.content.contains('?'))
-        );
+
         let timeout_deadline = app.notice_deadline.expect("未确认提醒应自动消失");
         app.expire_notice_at(timeout_deadline);
         assert!(app.notice.is_empty());
@@ -5406,7 +6358,7 @@ mod tests {
         }
         let mut app = test_app(&temp, session);
         let (tx, _rx) = mpsc::channel(1);
-        app.command("/history 60", tx.clone()).await.unwrap();
+        app.config.history_idle_seconds = 60;
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: 4,
@@ -5436,7 +6388,7 @@ mod tests {
         assert_eq!(app.unread_live_count, 0);
         assert_eq!(&*app.input, "x");
 
-        app.command("/history off", tx.clone()).await.unwrap();
+        app.config.history_idle_seconds = 0;
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: 4,
@@ -5494,85 +6446,196 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enter_executes_the_highlighted_command_without_tab_completion() {
+    async fn chinese_archive_search_completes_without_execution() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let (tx, _rx) = mpsc::channel(1);
-        app.input = "/lay".into();
-
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx)
-            .await
-            .unwrap();
-
-        assert!(app.layout_chat);
-        assert!(app.input.is_empty());
-    }
-
-    #[tokio::test]
-    async fn theme_command_opens_choices_and_enter_selects_one() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut app = test_app(&temp, DanmuSession::new("1"));
-        let (tx, _rx) = mpsc::channel(1);
-        app.input = "/theme".into();
-        let choices = slash_suggestions(&app.input, &app.config.themes);
-        assert_eq!(choices.len(), 5);
-        assert!(matches!(
-            choices[0],
-            SlashSuggestion::Theme {
-                id: "shisui",
-                current: true,
-                ..
-            }
-        ));
-        assert_eq!(choices[1].completion(), "/theme catppuccin-mocha");
-        drop(choices);
-
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), tx.clone())
-            .await
-            .unwrap();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx)
-            .await
-            .unwrap();
-
-        assert_eq!(app.config.theme_name, "catppuccin-mocha");
-        assert!(app.input.is_empty());
-    }
-
-    #[tokio::test]
-    async fn slash_palette_filters_and_completes_commands() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut app = test_app(&temp, DanmuSession::new("1"));
-        let (tx, _rx) = mpsc::channel(1);
-
-        app.input = "/obs sc".into();
-        app.slash_selection = 0;
+        app.input = "/搜索".into();
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), tx)
             .await
             .unwrap();
-        assert_eq!(app.input, "/obs scene ");
-        assert!(slash_suggestions("/question", &app.config.themes).is_empty());
+        assert_eq!(app.input.trim(), "/find");
     }
 
     #[tokio::test]
-    async fn theme_command_switches_palette_and_persists_selection() {
+    async fn paste_stays_in_draft_and_cannot_cross_modal_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        app.handle_paste("/quit\r\n/obs start\t\u{3}\u{10}");
+        assert_eq!(app.input, "/quit /obs start ");
+        assert!(!app.quit_requested);
+        assert!(app.stop_flow.is_none());
+        assert!(app.pending_deliveries.is_empty());
+
+        app.input = "保留人工草稿".into();
+        app.stop_flow = Some(StopFlow::Confirm {
+            stop_selected: true,
+        });
+        app.handle_paste("\r\n/quit\u{1b}");
+        assert!(matches!(
+            app.stop_flow,
+            Some(StopFlow::Confirm {
+                stop_selected: true
+            })
+        ));
+        assert_eq!(app.input, "保留人工草稿");
+        app.stop_flow = None;
+        app.login_qr = Some(vec!["QR".into()]);
+        app.handle_paste("/quit\r");
+        assert_eq!(app.input, "保留人工草稿");
+        assert!(app.login_qr.is_some());
+        app.login_qr = None;
+        app.selection_active = true;
+        app.handle_paste("不应编辑回复对象下的草稿\n");
+        assert_eq!(app.input, "保留人工草稿");
+    }
+
+    #[tokio::test]
+    async fn secret_paste_stays_hidden_and_bypasses_slash_completion() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let (tx, _rx) = mpsc::channel(1);
+        app.secret_mode = true;
+        app.handle_paste("/obs config password\r\nsecret-marker\u{3}");
+        let secret = app.input.to_string();
+        assert_eq!(secret, "/obs config password secret-marker");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), tx.clone())
+            .await
+            .unwrap();
+        assert_eq!(app.input, secret.as_str());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let visible = format!("{:?}", terminal.backend().buffer());
+        assert!(!visible.contains("secret-marker"));
+        assert!(!visible.contains("/obs config password"));
+        assert!(!app.notice.contains("secret-marker"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx)
+            .await
+            .unwrap();
+        assert!(!app.secret_mode);
+        assert!(app.input.is_empty());
+        assert!(app.session.recent_events.is_empty());
+    }
 
-        assert!(!slash_suggestions("/theme", &app.config.themes).is_empty());
-        app.command("/theme tokyo-night", tx.clone()).await.unwrap();
-        assert_eq!(app.config.theme_name, "tokyo-night");
-        assert_eq!(app.config.palette.background, Color::Rgb(26, 27, 38));
-        assert_eq!(
-            crate::theme::ThemeCatalog::load(temp.path().join("themes.json"))
-                .unwrap()
-                .selected(),
-            "tokyo-night"
+    #[tokio::test]
+    async fn command_search_restores_cursor_and_never_sends_query_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        let (tx, mut rx) = mpsc::channel(8);
+        app.input = "草稿甲🙂乙".into();
+        app.input.set_cursor(3);
+        app.selection_active = true;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        app.handle_paste("没有匹配的中文搜索");
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(app.command_search_draft.is_some());
+        assert_eq!(app.delivery_status, DeliveryStatus::Idle);
+        assert!(rx.try_recv().is_err());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!app.runner.running);
+        assert!(!app.bridge.sending_enabled());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx.clone())
+            .await
+            .unwrap();
+        assert_eq!(app.input, "草稿甲🙂乙");
+        assert_eq!(app.input.cursor(), 3);
+        assert!(app.selection_active);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        app.handle_paste("/ai materials");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx)
+            .await
+            .unwrap();
+        assert!(app.assistant_panel.is_some());
+        assert!(app.command_search_draft.is_none());
+        assert_eq!(app.input, "草稿甲🙂乙");
+        assert_eq!(app.input.cursor(), 3);
+        assert_eq!(app.delivery_status, DeliveryStatus::Idle);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn command_search_obs_submenu_and_password_preserve_the_original_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        let (tx, _rx) = mpsc::channel(8);
+        app.input = "未完成的人工回复".into();
+        app.input.set_cursor(2);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        app.input.replace("/obs".into());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.input, "/obs ");
+        assert!(app.command_search_draft.is_some());
+        app.input.replace("/obs config password".into());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(app.secret_mode);
+        assert!(app.input.is_empty());
+        app.handle_paste("secret");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx)
+            .await
+            .unwrap();
+        assert_eq!(app.input, "未完成的人工回复");
+        assert_eq!(app.input.cursor(), 2);
+        assert!(!app.secret_mode);
+    }
+
+    #[test]
+    fn optional_ai_commands_stay_out_of_the_idle_palette() {
+        let idle = command_suggestions("", false);
+        assert!(idle.iter().any(|spec| spec.completion == "/settings"));
+        assert!(idle.iter().any(|spec| spec.completion == "/diag"));
+        assert!(!idle.iter().any(|spec| ai_command(spec)));
+
+        let explicit = command_suggestions("/ai", false);
+        assert!(explicit.iter().any(|spec| spec.completion == "/ai"));
+
+        let active = command_suggestions("", true);
+        assert!(active.iter().any(|spec| spec.completion == "/review"));
+        assert!(!active.iter().any(|spec| spec.completion.contains(' ')));
+        assert!(
+            command_suggestions("模型", false)
+                .iter()
+                .any(|spec| spec.completion == "/ai model")
         );
-
-        app.command("/theme", tx).await.unwrap();
-        assert!(app.notice.contains("当前主题：tokyo-night"));
-        assert!(app.notice.contains("themes.json"));
+        assert!(
+            command_suggestions("静音", false)
+                .iter()
+                .any(|spec| spec.completion == "/mute")
+        );
     }
 
     #[test]
@@ -5601,16 +6664,21 @@ mod tests {
         app.handle_ui_event(UiEvent::ObsStatus(Ok(ObsStatus {
             current_scene: "直播".into(),
             stream: crate::obs::StreamState::Live,
-            microphone: crate::obs::MicrophoneState::Unmuted,
+            microphone: crate::obs::MicrophoneState::Muted,
             compatibility_warning: None,
         })));
         assert!(app.obs_status.is_some());
         assert!(app.obs_error.is_none());
+        assert_eq!(app.runner.microphone_context()["state"], "muted");
 
         app.handle_ui_event(UiEvent::ObsStatus(Err("OBS WebSocket 连接失败".into())));
         assert!(app.obs_status.is_none());
         assert_eq!(app.obs_error.as_deref(), Some("OBS WebSocket 连接失败"));
         assert!(app.obs_checked_at.is_some());
+        let disconnected = app.runner.microphone_context();
+        assert_eq!(disconnected["state"], "unknown");
+        assert_eq!(disconnected["freshness"], "unavailable");
+        assert!(disconnected["age_ms"].is_null());
 
         let mut terminal = Terminal::new(TestBackend::new(120, 2)).unwrap();
         let palette = app.config.palette;
@@ -5621,9 +6689,20 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
             .collect::<String>()
             .replace(' ', "");
-        assert!(rendered.contains("◉--"), "{rendered}");
-        assert!(rendered.contains("●--"), "{rendered}");
+
         assert!(!rendered.contains("OBS"), "{rendered}");
+
+        app.handle_ui_event(UiEvent::ObsStatus(Ok(ObsStatus {
+            current_scene: "直播".into(),
+            stream: crate::obs::StreamState::Live,
+            microphone: MicrophoneState::Unmuted,
+            compatibility_warning: None,
+        })));
+        assert_eq!(app.runner.microphone_context()["state"], "unmuted");
+        assert_eq!(
+            app.runner.microphone_context()["speech_activity"],
+            "unknown"
+        );
     }
 
     #[test]
@@ -5653,36 +6732,6 @@ mod tests {
     }
 
     #[test]
-    fn room_snapshot_preserves_all_three_bilibili_live_states() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut app = test_app(&temp, DanmuSession::new("1"));
-        app.handle_ui_event(UiEvent::RoomSnapshot(RoomSnapshot {
-            room_id: "1".into(),
-            broadcaster_id: "42".into(),
-            broadcaster_name: "停车拾穗".into(),
-            title: "测试直播".into(),
-            area: "知识".into(),
-            live_started_at: Some(Utc::now() - chrono::Duration::hours(1)),
-            live_status: RoomLiveStatus::Live,
-        }));
-
-        assert_eq!(room_live_label(app.room.as_ref().unwrap()), "● LIVE");
-        assert!(app.room_updated_at.is_some());
-
-        app.handle_ui_event(UiEvent::RoomSnapshot(RoomSnapshot {
-            live_status: RoomLiveStatus::Rotating,
-            ..app.room.clone().unwrap()
-        }));
-        assert_eq!(room_live_label(app.room.as_ref().unwrap()), "◉ ROTATING");
-
-        app.handle_ui_event(UiEvent::RoomSnapshot(RoomSnapshot {
-            live_status: RoomLiveStatus::Offline,
-            ..app.room.clone().unwrap()
-        }));
-        assert_eq!(room_live_label(app.room.as_ref().unwrap()), "○ OFFLINE");
-    }
-
-    #[test]
     fn official_custom_emote_metadata_is_visible_in_text_terminals() {
         let mut event = DanmuEvent::new(DanmuEventKind::Danmu, "你好[主播表情]");
         event.emotes.push(crate::domain::DanmuEmote {
@@ -5698,26 +6747,8 @@ mod tests {
         assert_eq!(map_bili_emotes("[花] [委屈]"), "🌸 🥺");
     }
 
-    #[test]
-    fn danmu_content_wraps_to_the_available_terminal_width() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut app = test_app(&temp, DanmuSession::new("1"));
-        app.show_name = false;
-        let event = DanmuEvent::new(DanmuEventKind::Danmu, "abcdefghij");
-
-        let rendered = event_lines(&event, &app, app.config.palette, 6);
-        let content = rendered
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert_eq!(rendered.height(), 2);
-        assert_eq!(content, "abcdefghij");
-    }
-
-    #[test]
-    fn mouse_wheel_scrolls_one_message_without_selecting_a_reply_target() {
+    #[tokio::test]
+    async fn mouse_and_arrow_history_navigation_preserve_the_draft() {
         let temp = tempfile::tempdir().unwrap();
         let mut session = DanmuSession::new("1");
         for index in 0..8 {
@@ -5776,6 +6807,23 @@ mod tests {
         }
         assert_eq!(app.scroll_offset, 0);
         assert_eq!(app.unread_live_count, 0);
+        app.input = "草稿🙂保留".into();
+        app.input.set_cursor(2);
+        let (tx, _rx) = mpsc::channel(1);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), tx.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            app.session.recent_events[app.scroll_offset].content,
+            "消息 7"
+        );
+        assert!(!app.selection_active);
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), tx)
+            .await
+            .unwrap();
+        assert_eq!(app.scroll_offset, 0);
+        assert_eq!(app.input, "草稿🙂保留");
+        assert_eq!(app.input.cursor(), 2);
     }
 
     #[test]
@@ -5790,14 +6838,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keyboard_palette_restores_unicode_draft_and_direct_page_closes_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        let (tx, mut rx) = mpsc::channel(8);
+        app.input = "甲🙂乙".into();
+        app.input.set_cursor(1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        app.handle_paste("模型");
+        let index = app
+            .command_suggestions()
+            .iter()
+            .position(|s| s.completion == "/ai model")
+            .unwrap();
+        for _ in 0..index {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), tx.clone())
+                .await
+                .unwrap();
+        }
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.input, "甲🙂乙");
+        assert_eq!(app.input.cursor(), 1);
+        assert!(app.assistant_panel.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx.clone())
+            .await
+            .unwrap();
+        assert!(app.assistant_panel.is_none());
+        app.command("/ai model", tx.clone()).await.unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx)
+            .await
+            .unwrap();
+        assert!(app.assistant_panel.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn palette_opens_optional_argument_editor_and_preserves_unicode_parameters() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        app.open_commands();
+        let (tx, _rx) = mpsc::channel(1);
+        app.input.replace("/scene".into());
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), tx.clone())
+            .await
+            .unwrap();
+        assert!(
+            app.assistant_panel.is_none(),
+            "Tab must not activate the editor"
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            app.assistant_panel
+                .as_ref()
+                .is_some_and(assistant::Panel::is_editing)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx.clone())
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx)
+            .await
+            .unwrap();
+        app.open_commands();
+        app.input.replace("/find 档案 甲".into());
+        // Exact typed arguments use the existing raw-command route, not completion replacement.
+        assert!(
+            matches!(app.handle_slash_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), SlashKeyAction::Submit(raw) if raw == "/find 档案 甲")
+        );
+    }
+
+    #[tokio::test]
     async fn slash_obs_reports_progress_and_quit_exits() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let (tx, _rx) = mpsc::channel(4);
 
         app.command("/obs", tx.clone()).await.unwrap();
-        assert_eq!(app.notice, "正在检查 OBS 连接…");
+        assert!(matches!(app.notice_level, NoticeLevel::Progress));
         app.command("/quit", tx).await.unwrap();
         assert!(app.quit_requested);
+    }
+
+    #[tokio::test]
+    async fn explicit_display_setting_persists_even_when_runtime_override_already_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        app.config.save_value("show_time", true.into()).unwrap();
+        app.show_time = false;
+        let (tx, _rx) = mpsc::channel(1);
+        app.command("/display time off", tx).await.unwrap();
+        let saved: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&app.config.config_path).unwrap()).unwrap();
+        assert_eq!(saved["show_time"].as_bool(), Some(false));
     }
 }

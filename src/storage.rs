@@ -41,6 +41,29 @@ impl StoragePaths {
     }
 }
 
+/// Replace a private file only after the complete contents are durable. The temporary file
+/// lives beside the destination, so rename is atomic and a failed write preserves the old file.
+pub(crate) fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = path.parent().context("私有文件没有父目录")?;
+    std::fs::create_dir_all(parent).context("创建私有文件目录失败")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).context("创建私有暂存文件失败")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.write_all(bytes).context("写入私有文件失败")?;
+    temporary.as_file().sync_all().context("同步私有文件失败")?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .context("原子替换私有文件失败")?;
+    Ok(())
+}
+
 fn support_directory() -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {

@@ -185,7 +185,7 @@ h1 span { display: block; color: var(--info); text-shadow: 3px 3px 0 #0e7490; }
 @media (max-width: 760px) {
   .app-shell { overflow: visible; }
   .topbar { position: fixed; height: 60px; padding: 0 1rem; }
-  .topbar nav a:not(.icon-link) { display: none; }
+  .topbar nav a:not(.icon-link):not(.guide-link) { display: none; }
   .main-frame { display: block; width: calc(100vw - 28px); min-height: 0; margin: 60px auto 0; padding: 22px 0 32px; }
   .hero-head { display: block; }
   .hero-brand { display: block; }
@@ -243,6 +243,11 @@ h1 span { display: block; color: var(--info); text-shadow: 3px 3px 0 #0e7490; }
   .author-site { grid-column: 1 / -1; margin: 0; text-align: center; }
   .footer-meta { min-width: 0; justify-items: start; padding: .9rem 1rem; border-top: 1px solid var(--frame-dim); border-left: 0; }
   .footer-recording,.footer-platforms { display: none; }
+}
+
+@media (max-width: 400px) {
+  .platform-item { grid-template-columns: minmax(0,1fr) 5px; }
+  .platform-item > strong { grid-column: 1 / -1; width: 30px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

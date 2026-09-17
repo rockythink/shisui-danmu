@@ -1,6 +1,6 @@
 use crate::theme::{Palette, ThemeCatalog};
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -8,43 +8,89 @@ use std::path::PathBuf;
 #[command(
     name = "danmu",
     version,
-    about = "面向知识型主播的 B 站弹幕与直播监控工作台"
+    about = "面向知识型主播的 B 站弹幕与直播监控工作台",
+    after_help = "常用：danmu 123456　进入直播间\n      danmu --login　登录弹幕台主账号（与浏览器登录分开）\n\n进入后输入 /settings 修改长期偏好，/help 查看操作。开关值 true 表示开启，false 表示关闭。显示与阅读参数仅覆盖本次启动；登录与 OBS 向导会保存配置。"
 )]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+    /// 私有本地实例目录；Agent/MCP连接此处的现用实例
+    #[arg(long, global = true)]
+    pub instance: Option<PathBuf>,
     /// 无网络回放JSON数组；不读取账号/OBS/默认配置，不安装或连接直播
     #[arg(long, value_name = "JSON路径")]
     pub replay: Option<PathBuf>,
+    /// 要查看的直播间房间号，例如 danmu 123456
     #[arg(value_name = "房间号")]
     pub positional_room: Option<String>,
+    /// 指定房间号，优先于位置参数和已保存配置
     #[arg(short, long, value_name = "房间号")]
     pub room: Option<String>,
-    #[arg(short = 'l', long, value_parser = parse_bool)]
+    /// 列表元信息与正文同行；长正文仍可换行（本次有效）
+    #[arg(short = 'l', long, value_parser = clap::builder::BoolishValueParser::new(), value_name = "true|false")]
     pub single_line: Option<bool>,
-    #[arg(short = 's', long, value_parser = parse_bool)]
+    /// 显示每条弹幕的时间；建议开启以区分旧消息（本次有效）
+    #[arg(short = 's', long, value_parser = clap::builder::BoolishValueParser::new(), value_name = "true|false")]
     pub show_time: Option<bool>,
-    #[arg(long, value_parser = parse_bool)]
+    /// 显示发言者昵称；建议开启以辨认对话对象（本次有效）
+    #[arg(long, value_parser = clap::builder::BoolishValueParser::new(), value_name = "true|false")]
     pub show_name: Option<bool>,
+    /// 本次隐藏昵称，优先于 --show-name
     #[arg(long)]
     pub hide_name: bool,
     /// 浏览历史空闲多少秒后返回实时；0 表示仅手动返回
     #[arg(long, value_name = "秒数")]
     pub history_idle_seconds: Option<u32>,
+    /// 使用指定的 TOML 配置文件
     #[arg(short, long, value_name = "路径")]
     pub config: Option<PathBuf>,
+    /// 本次使用的主题；长期主题请在 /settings 选择
     #[arg(long, value_name = "主题名")]
     pub theme: Option<String>,
+    /// 扫码登录并保存弹幕台主账号，不修改浏览器登录
     #[arg(long)]
     pub login: bool,
+    /// 退出弹幕台主账号；不退出浏览器账号
     #[arg(long)]
     pub logout: bool,
+    /// 交互配置 OBS 连接与麦克风；密码隐藏输入并单独保存
     #[arg(long)]
     pub configure_obs: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// 显式准备私有适配器；不启动助手、不修改原生配置或登录
+    Setup {
+        #[command(subcommand)]
+        adapter: SetupAdapter,
+    },
+    /// 无房间隔离终端，仅人工输入及LocalTransport；必须指定新建私有实例目录
+    Local {
+        /// 启动即打开助手设置面板；不启动模型或开启发送
+        #[arg(long)]
+        assistant: bool,
+    },
+    /// 连接已运行实例，执行status/messages/report/reply/result；参数为JSON对象
+    Agent {
+        operation: String,
+        #[arg(default_value = "{}")]
+        json: String,
+    },
+    /// stdio MCP；不启动TUI，不登录、不读取平台凭据
+    Mcp,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SetupAdapter {
+    /// 私有安装已核定的 pi-acp@0.0.33；需要 Node.js 20+ 与 npm
+    Pi,
 }
 
 #[derive(Debug, Clone)]
 pub struct TerminalConfig {
     pub config_path: PathBuf,
-    pub autoreply: crate::autoreply::Config,
+    pub instance: Option<PathBuf>,
     pub history_idle_seconds: u32,
     pub room_id: String,
     pub single_line: bool,
@@ -58,8 +104,6 @@ pub struct TerminalConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
-    #[serde(default)]
-    autoreply: crate::autoreply::Config,
     history_idle_seconds: Option<u32>,
     #[serde(alias = "roomID", alias = "roomid")]
     room_id: Option<String>,
@@ -77,12 +121,8 @@ struct ConfigFile {
 
 impl TerminalConfig {
     pub fn load(cli: &Cli, default_path: PathBuf, themes_path: PathBuf) -> Result<Self> {
-        let codex_home = default_path
-            .parent()
-            .context("应用配置目录无效")?
-            .join("codex-subscription");
         let path = cli.config.clone().unwrap_or(default_path);
-        let mut file: ConfigFile = match std::fs::read_to_string(&path) {
+        let file: ConfigFile = match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text)
                 .with_context(|| format!("配置文件格式错误：{}", path.display()))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => ConfigFile::default(),
@@ -104,10 +144,10 @@ impl TerminalConfig {
         let themes = ThemeCatalog::load(themes_path)?;
         let requested_theme = cli.theme.as_deref().unwrap_or(themes.selected());
         let (theme_name, palette) = themes.resolve(requested_theme)?;
-        file.autoreply.codex.home = codex_home;
+
         Ok(Self {
             config_path: path,
-            autoreply: file.autoreply,
+            instance: cli.instance.clone(),
             history_idle_seconds: cli
                 .history_idle_seconds
                 .or(file.history_idle_seconds)
@@ -128,39 +168,70 @@ impl TerminalConfig {
             themes,
         })
     }
-    pub fn save_autoreply(&self, config: &crate::autoreply::Config) -> Result<()> {
-        let mut document: toml::Value = match std::fs::read_to_string(&self.config_path) {
-            Ok(text) => toml::from_str(&text).context("配置格式错误；未覆盖")?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                toml::Value::Table(Default::default())
-            }
-            Err(e) => return Err(e.into()),
+    pub(crate) fn save_value(&self, key: &str, mut value: toml_edit::Value) -> Result<()> {
+        use std::io::Write;
+        let text = match std::fs::read_to_string(&self.config_path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error).context("读取TUI配置失败"),
         };
-        document
-            .as_table_mut()
-            .context("配置根节点必须为表")?
-            .insert("autoreply".into(), toml::Value::try_from(config)?);
-        let parent = self.config_path.parent().context("配置目录无效")?;
+        let _: ConfigFile = toml::from_str(&text).context("TUI配置无效，未覆盖原文件")?;
+        let mut document = text.parse::<toml_edit::DocumentMut>()?;
+        document.remove("assistant_card");
+        let aliases: &[&str] = match key {
+            "chat_layout" => &["chatLayout", "chatlayout"],
+            "show_name" => &["showName", "showname"],
+            "show_time" => &["showTime", "showtime"],
+            _ => &[],
+        };
+        let target = if document.contains_key(key) {
+            key
+        } else {
+            aliases
+                .iter()
+                .copied()
+                .find(|alias| document.contains_key(alias))
+                .unwrap_or(key)
+        };
+        if let Some(previous) = document.get(target).and_then(toml_edit::Item::as_value) {
+            *value.decor_mut() = previous.decor().clone();
+        }
+        document[target] = toml_edit::Item::Value(value);
+        let parent = self.config_path.parent().context("TUI配置缺少父目录")?;
         std::fs::create_dir_all(parent)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
-        std::io::Write::write_all(&mut file, toml::to_string_pretty(&document)?.as_bytes())?;
+        file.write_all(document.to_string().as_bytes())?;
         file.as_file().sync_all()?;
         file.persist(&self.config_path)?;
         Ok(())
     }
 }
 
-fn parse_bool(value: &str) -> std::result::Result<bool, String> {
-    Ok(!matches!(
-        value.to_ascii_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn invalid_switch_spelling_is_not_silently_enabled() {
+        let cli = Cli::try_parse_from([
+            "danmu",
+            "123",
+            "--show-name",
+            "off",
+            "--show-time",
+            "yes",
+            "--single-line",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(
+            (cli.show_name, cli.show_time, cli.single_line),
+            (Some(false), Some(true), Some(false))
+        );
+        let error = Cli::try_parse_from(["danmu", "123", "--show-name", "flase"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
 
     #[test]
     fn creates_and_uses_the_default_theme_catalog() {
@@ -218,5 +289,41 @@ timecolor = '#112233'
         assert!(!config.show_name);
         assert_eq!(config.theme_name, "shisui");
         assert_eq!(config.palette, Palette::default());
+    }
+
+    #[test]
+    fn ui_preferences_reopen_without_losing_user_comments_or_unknown_sections() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# user notes\nroomid = '456'\nshowname = true # keep this\n[custom]\nvalue = 'mine'\n",
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from(["danmu"]).unwrap();
+        let themes = root.path().join("themes.json");
+        let config = TerminalConfig::load(&cli, path.clone(), themes.clone()).unwrap();
+        for (key, value) in [
+            ("show_name", false),
+            ("show_time", false),
+            ("chat_layout", true),
+        ] {
+            config.save_value(key, value.into()).unwrap();
+        }
+        config
+            .save_value("history_idle_seconds", 123_i64.into())
+            .unwrap();
+        let reopened = TerminalConfig::load(&cli, path.clone(), themes).unwrap();
+        assert!(!reopened.show_name && !reopened.show_time && reopened.chat_layout);
+        assert_eq!(reopened.history_idle_seconds, 123);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# user notes") && saved.contains("# keep this"));
+        assert_eq!(
+            toml::from_str::<toml::Value>(&saved).unwrap()["custom"]["value"].as_str(),
+            Some("mine")
+        );
+        std::fs::write(&path, "room_id = [broken").unwrap();
+        assert!(config.save_value("show_name", true.into()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "room_id = [broken");
     }
 }

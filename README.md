@@ -1,19 +1,19 @@
 <p align="center">
-  <a href="https://danmu.elazer.wang">
-    <img src="website/public/logo-pixel.svg" alt="DANMU 官方 Logo" width="96" height="96">
+  <a href="https://danmu.elazer.wang/">
+    <img src="https://raw.githubusercontent.com/rockythink/shisui-danmu/main/website/public/logo-pixel.svg" alt="DANMU 官方 Logo" width="96" height="96">
   </a>
 </p>
 
 <h1 align="center">DANMU</h1>
 
 <p align="center">
-  <strong>为知识型主播收束弹幕、问题与现场控制。</strong><br>
-  一块安静、快速、可恢复的直播互动终端。
+  <strong>面向知识型主播的免费开源弹幕与提问工作台。</strong><br>
+  在终端里看互动、找问题、审核助手回复，保留每场记录。
 </p>
 
 <p align="center">
-  <a href="https://danmu.elazer.wang"><strong>官方网站 · danmu.elazer.wang</strong></a>
-  &nbsp;·&nbsp;
+  <a href="https://danmu.elazer.wang/">官方网站</a> ·
+  <a href="https://danmu.elazer.wang/guide/"><strong>使用手册</strong></a> ·
   <a href="https://github.com/rockythink/shisui-danmu/releases/latest">下载最新版</a>
 </p>
 
@@ -21,412 +21,51 @@
   <a href="https://github.com/rockythink/shisui-danmu/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/rockythink/shisui-danmu/ci.yml?style=flat-square&label=build&colorA=111827&colorB=4ADE80" alt="Build"></a>
   <a href="https://github.com/rockythink/shisui-danmu/releases/latest"><img src="https://img.shields.io/github/v/release/rockythink/shisui-danmu?style=flat-square&colorA=111827&colorB=22D3EE" alt="Release"></a>
   <a href="https://github.com/rockythink/shisui-danmu/blob/main/LICENSE"><img src="https://img.shields.io/github/license/rockythink/shisui-danmu?style=flat-square&colorA=111827&colorB=F472B6" alt="License"></a>
-  <img src="https://img.shields.io/badge/Rust-1.89%2B-F8FAFC?style=flat-square&colorA=111827&logo=rust&logoColor=white" alt="Rust 1.89+">
-  <img src="https://img.shields.io/badge/OBS_WebSocket-v5-FACC15?style=flat-square&colorA=111827" alt="OBS WebSocket v5">
 </p>
 
-<p align="center">
-  macOS · Linux · Windows &nbsp;|&nbsp; Bilibili &nbsp;|&nbsp; Ratatui &nbsp;|&nbsp; MPL-2.0
-</p>
+<p align="center">macOS · Linux · Windows | Bilibili | Ratatui | MPL-2.0</p>
 
----
-
-**DANMU** 是面向知识型主播的免费开源弹幕与提问工作台。它把 B 站的历史弹幕、实时互动、重点问题、发送状态和有限 OBS 控制放进同一个终端界面，让主播少盯几个窗口，多留一点注意力给正在讲的内容。
-
-它不是播放器，也不是另一套 OBS。它只解决直播时最容易失控的那一段：**看见互动、辨认问题、快速回应、保留现场。**
-
-## main 待人工核验：应用内AI候选回复（尚未发布）
-
-- 首次关闭AI总开关且使用建议模式。TUI内可发起独立ChatGPT订阅登录、选择账号可用文本模型及该模型支持的思考强度；保留独立API-key接入，不自动付费回退。
-- 人工弹幕按40个Unicode字素分段；AI每段的`✦`及昵称也计入40，必要时最多三段。上一段确认回流后才发下一段，不确定或失败立即停止。
-- 新事件异步生成，统一发送队列；场次消息持久去重、主播抢答/草稿/弹窗/换场/下播取消，频率与预算受限，搜索独立配置。
-- 已执行本地协议回归、无账号隔离运行时握手及无网络TUI回放。真实ChatGPT登录、订阅权益/推理和外部搜索仍需用户验证；不要把本节当已发布功能或所有账号可用的保证。
-
-## v0.4.5 更新：历史浏览状态与返回方式
-
-- 历史模式使用高对比底色提示和醒目边框，持续显示返回按键、新消息数量与可选倒计时。
-- 默认仅手动返回；输入 `/history 60` 后，空闲 60 秒自动恢复实时跟随，也可随时按 Esc 返回。
-- Esc 只取消当前操作或返回实时，连续按键不会退出；退出统一使用 Ctrl+C 或 `/quit`。
-
-完整说明与安装包见 [v0.4.5 Release](https://github.com/rockythink/shisui-danmu/releases/tag/v0.4.5)。更新后重新启动 TUI。
-
-### v0.4.4：历史逐条滚动，停播连续确认
-
-- **历史不再整页跳动**：每个滚轮事件移动一条消息；从回复选择接续当前位置，新消息到达时保留阅读锚点，`End` 返回实时。
-- **OBS 状态更明确**：连接状态统一为单个 `●`，绿色表示已连接，红色表示未连接。
-- **停播连续确认**：`/obs stop` 打开弹窗，默认选中“返回”；方向键确认后显示 3 秒倒计时，Esc 可取消，不再输入 `/obs confirm` 或 `/obs cancel`。
-
-历史说明见 [v0.4.4 Release](https://github.com/rockythink/shisui-danmu/releases/tag/v0.4.4)。
-
-### v0.4.3：互动可读，正文不动
-
-- 进场、点赞移到弹幕框底边，不挤动正文，也不占用弹幕历史缓存。
-- 提示姓名至少稳定展示 2 秒，同批合并，进场优先；重复互动仅按可靠用户 ID 合并。
-- 只保留当前批次与下一批摘要，不积压点名队列；历史浏览和回复选择保持稳定。
-
-历史说明见 [v0.4.3 Release](https://github.com/rockythink/shisui-danmu/releases/tag/v0.4.3)。
-
-## 真实运行录屏
+DANMU 把 B 站历史弹幕、实时互动、重点问题、发送状态和有限 OBS 控制放在同一个终端里。它不是播放器，也不是完整直播画布或另一套 OBS。
 
 <p align="center">
   <a href="https://danmu.elazer.wang/danmu-product-demo.mp4">
-    <img src="assets/danmu-product-demo.gif" alt="DANMU 真实运行录屏：启动、实时弹幕与终端交互，完整 56 秒" width="100%">
+    <img src="https://raw.githubusercontent.com/rockythink/shisui-danmu/main/assets/danmu-product-demo.gif" alt="DANMU 基础功能实录：启动、实时弹幕与终端交互" width="100%">
   </a>
 </p>
 
-录屏在 README 内自动循环播放；点击画面可观看清晰版 MP4。
+这是基础功能实录，**不代表已经展示 v0.5.0 的 AI 助手流程**。点击画面观看完整 MP4。
 
-<p align="center">
-  <a href="https://danmu.elazer.wang"><strong>访问 DANMU 官网</strong></a>
-  &nbsp;·&nbsp;
-  <a href="https://danmu.elazer.wang/danmu-product-demo.mp4"><strong>观看完整 MP4（56 秒）</strong></a>
-</p>
+## v0.5.0 变化
 
-## 为什么做 DANMU
+- **本机 ACP 助手**：接入用户自己的原生 AI 工具，打开面板、连接模型、启动值班与允许公开发送分别控制。Pi 提供显式准备命令 `danmu setup pi`，不代装原生 Pi、不登录、不启动推理。
+- **工作区与历史**：可编辑人设资料、按房间历史索引、跨场检索和维护副本；旧消息标记为 `↶`，不会重新进入 AI 队列。后台加载不阻塞主界面，修复先备份，不删除原始 Journal。
+- **统一设置与账号**：`/settings` 汇集五类设置；主账号与独立助手号分开管理、分开发送队列，独立号失效不回退主号。审核与编辑保留人工草稿。
+- **候选安全与发送诊断**：未知或重复本批目标整批拒绝，随后继续处理新消息；真实连接、协议、身份和磁盘错误仍明确暴露。发送未确认不自动补发。
+- **低成本合批与轮次诊断**：普通空白、纯笑声和平台已识别纯表情可跳过；连续空轮后普通消息按 5–10 秒合批，点名不等合批但仍受单飞与授权限制。`/diag` 区分零候选、原生无正文、待审、拒绝和真正错误。
+- **官网使用手册**：用 Astro Starlight 承载完整操作文档，提供章节导航与搜索；README 保持为产品入口。
 
-知识型直播的难点通常不是“弹幕不够多”，而是信息密度太高：问题夹在闲聊里，历史接口与实时 WebSocket 偶尔漏包，主播还要同时确认推流、场景和麦克风状态。
+从 0.4.5 升级请沿用原安装渠道，运行 `danmu --version` 确认 `0.5.0`，再自行重启所有旧 TUI 实例。无需删除历史库。历史版本说明见 [Releases](https://github.com/rockythink/shisui-danmu/releases)。
 
-DANMU 把这些信号压缩成一块可扫读的终端界面：
+## 安装与首次启动
 
-- **启动过程有反馈**：终端首帧出现后立即播放 DANMU Logo 动效，B 站客户端初始化、本地会话恢复与各项网络检查在动画期间并发执行；动画至少展示两秒，并展示作者 Elazer 与 `elazer.wang`；任一检查失败都会阻断启动，可选择重试、直接配置 OBS 密码或按 `S` 明确跳过；可随时按 `Ctrl+C` 退出；
-- **不漏重要互动**：历史窗口与实时流合并、去重，断线自动重连；
-- **问题留在眼前**：键盘选中弹幕、插入回复对象、设置重点消息；
-- **发送结果可确认**：长弹幕按 Unicode 字素安全分段，并等待主播身份回流；
-- **现场状态可感知**：直播状态、开播时长、看过、点赞、弹幕与在线人数分层显示；
-- **OBS 只做必要的事**：场景、推流、静音和单路麦克风电平，不复制完整控制台；
-- **结束后还有记录**：每场直播写入独立 Journal，可搜索并导出快照。
+任选一种渠道，安装后的命令都叫 `danmu`：
 
-## 快速开始
-
-### 1. 安装
-
-任选一种渠道；安装后的命令都叫 `danmu`。
-
-| 渠道 | 命令 | 适用环境 |
+| 渠道 | 安装命令 | 适用环境 |
 | --- | --- | --- |
-| npm | `npm install -g danmu-tui` | 已安装 Node.js 18+ |
-| Bun | `bun install -g danmu-tui` | 已安装 Bun |
+| npm | `npm install -g danmu-tui` | Node.js 18+ |
+| Bun | `bun install -g danmu-tui` | Bun |
 | Homebrew | `brew install rockythink/tap/danmu` | macOS、Linux |
-| Cargo | `cargo install shisui-danmu --locked` | 已安装 Rust 1.89+ |
+| Cargo | `cargo install shisui-danmu --locked` | Rust 1.89+ |
 | 安装脚本 | 见下方 | macOS、Linux、Windows Git Bash |
-| 手动下载 | [GitHub Releases](https://github.com/rockythink/shisui-danmu/releases/latest) | 全平台 |
-
-产品名统一为 **DANMU**。为保持已有仓库链接和本地数据目录兼容，GitHub 仓库与 Cargo 包继续使用 `shisui-danmu`，npm 包使用 `danmu-tui`；所有渠道安装后的可执行命令均为 `danmu`。
-
-npm 与 Bun 安装的是同一份 Rust 原生程序，不是 JavaScript 重写；包内不运行 `postinstall` 下载脚本。无需全局安装也可以直接执行：
-
-```bash
-npx danmu-tui <房间号>
-bunx danmu-tui <房间号>
-```
-
-无 Node、Bun、Homebrew 或 Rust 环境时，使用安装脚本：
+| 预编译包 | [GitHub Releases](https://github.com/rockythink/shisui-danmu/releases/latest) | 下列五种平台构建 |
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rockythink/shisui-danmu/main/script/install_release.sh | bash
 ```
 
-脚本会识别操作系统与 CPU 架构，下载对应 GitHub Release，验证 SHA-256，并安装到 `~/.local/bin/danmu`。Windows 也可以下载 `shisui-danmu-windows-x86_64.zip`，校验同名 `.sha256` 后将 `danmu.exe` 放入 `PATH`。
+脚本按平台下载 Release、校验 SHA-256，默认安装到 `~/.local/bin/danmu`。npm/Bun 包同样运行 Rust 原生程序，不是 JavaScript 重写，也不通过 `postinstall` 下载二进制。
 
-### 2. 进入直播间
-
-```bash
-danmu <房间号>
-```
-
-也可以显式传参：
-
-```bash
-danmu --room <房间号>
-```
-
-公开监看不需要登录。启动后按 `/` 打开命令面板，`↑/↓` 选择，`Enter` 执行。
-
-### 3. 登录并发送弹幕（可选）
-
-```bash
-danmu --login
-```
-
-使用哔哩哔哩客户端扫码。登录成功后重新运行 `danmu <房间号>`，直接在底部输入框发送弹幕。
-
-```bash
-danmu --logout
-```
-
-`--logout` 只清除 DANMU 自己的 B 站登录态，不读取浏览器 Cookie，也不与其他应用共享凭据。
-
-## 界面读法
-
-| 区域 | 内容 |
-| --- | --- |
-| 顶部第一行 | `LIVE / OFFLINE / ROTATING`、直播标题、已开播时长 |
-| 顶部第二行 | 主播身份、OBS 连接、麦克风静音状态 |
-| Ghost Stage | 历史与实时事件合并后的主信息流；重点消息显示在标题上 |
-| 临时互动提示 | 进场、点赞显示在 Ghost Stage 底边，姓名至少稳定展示 2 秒；同批最多展示 3 个完整名字，进场优先，空间足够时附加点赞摘要。进场批次最长展示 5 秒、点赞 3 秒；只保留当前批次和下一批摘要，不积压播报，也不挤动正文或占用弹幕历史缓存；关闭姓名显示同时隐藏提示中的名字 |
-| 通知区 | 登录、发送、重连、OBS 操作的进度、错误与可执行提示 |
-| 输入框顶栏 | 发送状态、业务计数，以及空间允许时的麦克风电平 |
-| 输入框 | Unicode 字素级编辑；最多四行，光标始终保持可见 |
-
-底栏计数使用明确的数据口径：
-
-| 符号 | 含义 | 来源 |
-| --- | --- | --- |
-| `◉` | 累计看过 | `WATCHED_CHANGE.data.num` |
-| `♥` | 累计点赞 | `LIKE_INFO_V3_UPDATE.data.click_count` |
-| `▤` | 本次运行收到的实时弹幕数 | 本地会话计数 |
-| `●` | 当前在线人数 | 登录后读取 `getOnlineRank.data.onlineNum` |
-
-`MIC` 电平来自 OBS WebSocket v5 的 `InputVolumeMeters` 事件：约 50 ms 接收一次，在 Adapter 内聚合为 10 Hz；上升立即响应，回落平滑。界面空间不足时先缩短电平条，再隐藏数值，极窄或 OBS 断连时完全隐藏。
-
-## 键盘与命令
-
-### 高频操作
-
-| 操作 | 按键 |
-| --- | --- |
-| 打开命令面板 | `/` |
-| 切换信息流 / 聊天布局 | `Tab` |
-| 浏览历史 | 鼠标滚轮，每次移动一条消息，不整页跳动 |
-| 回到最新消息并恢复跟随 | `Esc` / `End`，或向下滚回最新一条 |
-| 选择回复对象 | `Shift+↑/↓` |
-| 插入 `@用户名` | 选择后按 `Enter` |
-| 取消选择或当前操作（不退出程序） | `Esc` |
-| 安全退出 | `Ctrl+C` 或 `/quit` |
-| 行首 / 行尾 | `Home` / `End`，或 `Ctrl+A/E` |
-| 删除到行首 / 删除前一个词 | `Ctrl+U/W` |
-
-### TUI 命令
-
-| 命令 | 作用 |
-| --- | --- |
-| `/help` | 显示命令面板操作提示 |
-| `/login` · `/logout` | 扫码登录或清除独立登录态 |
-| `/layout` | 切换信息流与聊天布局 |
-| `/history [秒数\|off]` | 查看或设置本次会话的空闲自动返回；`off` 或 `0` 仅手动返回 |
-| `/theme` | 打开主题选择；`/theme reload` 热加载自定义主题 |
-| `/names show\|hide` | 显示或隐藏用户名 |
-| `/time show\|hide` | 显示或隐藏消息时间 |
-| `/feature` | 将当前选中消息设为重点 |
-| `/archive [关键词]` | 搜索历史会话 |
-| `/obs` · `/obs status` | 检查或查看 OBS 状态 |
-| `/obs mute\|unmute` | 静音或取消静音所配置的麦克风 |
-| `/obs scene [名称]` | 列出或切换场景 |
-| `/obs config mic [名称]` | 列出或选择单路麦克风输入 |
-| `/obs start` | 开始推流 |
-| `/obs config password` | 隐藏输入并更新 TUI 私有 OBS 密码文件 |
-| `/obs stop` | 打开停播确认弹窗，默认选中“返回”；按 ↑ 选中“确认”并按 Enter，倒计时 3 秒后停止推流；确认与倒计时期间可按 Esc 返回 |
-| `/quit` | 安全退出并写入会话状态 |
-
-## OBS 接入
-
-DANMU 使用 OBS 28+ 内置的 WebSocket v5，**不依赖 `obs-cli`、Python 或额外桥接进程**。
-
-1. 在 OBS 中打开 **工具 → WebSocket 服务器设置**；
-2. 启用 WebSocket 服务器，记下端口；如启用了身份验证，同时准备密码；
-3. 运行配置向导：
-
-   ```bash
-   danmu --configure-obs
-   ```
-
-4. 依次填写主机、端口、默认直播场景、麦克风输入名和密码；
-5. 进入 TUI 后运行 `/obs status` 验证连接。
-
-启动自检发现 OBS 缺少密码时会停留在检查界面：按 `Enter` 直接隐藏输入密码并重新检查，或按 `S` 跳过本次故障继续进入弹幕台。其他网络检查失败时，`Enter` 表示重试。
-
-OBS 密码不会写入系统“密码”/钥匙串或 `obs-control.json`。配置向导或 TUI 中的 `/obs config password` 会把密码写入 DANMU 私有的 `obs-password` 文件；macOS/Linux 权限固定为 `0600`。
-
-一次性运行仍可使用 `OBS_API_PASSWORD` 环境变量覆盖本地密码。不使用 OBS 身份验证则无需设置。主机、端口、场景与输入名写入 DANMU 独立配置；停止推流始终需要二次确认。
-
-## 配置与主题
-
-### 启动参数
-
-```text
-danmu [房间号]
-      [--room <房间号>]
-      [--single-line <true|false>]
-      [--show-time <true|false>]
-      [--show-name <true|false> | --hide-name]
-      [--theme <主题名>]
-      [--config <路径>]
-```
-
-运行 `danmu --help` 查看完整参数。
-
-### TOML 配置
-
-```toml
-room_id = "123456"
-single_line = true
-chat_layout = false
-show_time = true
-show_name = true
-history_idle_seconds = 0 # 0：仅手动返回；例如 60：空闲 60 秒后自动返回
-```
-
-CLI 参数优先于 TOML。可通过 `--config <路径>` 使用指定配置文件。
-
-### AI连接与回复设置
-
-在输入栏执行 `/ai settings` 打开设置面板，Esc关闭，PageUp/PageDown滚动。账号授权与B站登录完全分离。
-
-| 操作 | TUI命令 |
-| --- | --- |
-| 官方ChatGPT订阅登录 | `/ai login`（打开官方浏览器授权；180秒超时） |
-| 取消登录／退出账号 | `/ai cancel-login` / `/ai logout` |
-| 恢复账号状态／刷新模型 | `/ai status` / `/ai models` |
-| 选择连接 | `/ai provider chatgpt` / `/ai provider api`，切换后总开关关闭 |
-| 选择实际模型 | `/ai model <列表中的模型ID>` |
-| 设置实际支持的思考强度 | `/ai effort <该模型列出的值>`；模型变更会校验并显示适用默认值 |
-| 独立启停 | `/ai enable` / `/ai disable`，启用不会改成自动模式 |
-| 三种模式 | `/ai suggest` / `/ai approve-mode` / `/ai auto` |
-| 批准／丢弃／立即暂停 | F7 / F8 / Ctrl-P，或 `/ai approve` / `/ai discard` / `/ai pause` |
-| 安全暂停后恢复发送队列 | `/ai resume-send`，回到建议模式，不自动启用总开关 |
-
-建议模式只展示候选；人工批准模式允许F7发送；自动模式只发送通过本地规则确认的低风险互动，模型生成的技术回答仍需人工核验。草稿、设置或其他弹窗优先于候选发送。关闭总开关会取消生成/检索与尚未提交的自动发送；已经交给平台的请求不会假称撤回，继续记录结果。
-
-**订阅运行时**：目前固定支持官方 `codex-cli 0.147.0`（app-server仍属实验协议）。应用检查版本，不安装或更新Codex，不维护fork。先自行确认 `codex --version`。TUI通过stdio启动专用进程；认证、配置及会话位于应用配置目录的`codex-subscription/`，不读取其他Agent的auth文件或环境密钥，不使用系统钥匙串。登录URL来自官方managed login；只有完成通知加account/read确认才算成功。官方OAuth的本机回调由Codex管理，应用不开放app-server网络监听端口。
-
-安全边界由固定版本的空执行环境`environments: []`、禁用shell/多智能体/插件/应用/hooks/代码模式/图片工具/内置搜索、空动态工具与能力根、独立空工作目录共同约束；运行时返回配置须匹配，任何工具请求或执行事件均拒绝并终止。不是仅靠提示词、只读sandbox或approval never。参考[官方app-server](https://developers.openai.com/codex/app-server)及[认证说明](https://developers.openai.com/codex/auth)。账号只使用其合法Codex权益，不等于通用Platform API余额或所有ChatGPT模型权限；权益/过期/限额异常暂停，不换账号、不回退API。面板只显示服务端已报告的额度和重置时间，未报告即未知。
-
-设置原子保存到当前`--config`文件或默认`config.toml`，保留其他TOML字段。首次配置等价于：
-
-```toml
-[autoreply]
-enabled = false
-provider = "chatgpt"
-mode = "suggest"
-```
-
-API模式保留`[autoreply.model]`的`id`、`endpoint.url`（完整OpenAI-compatible chat completions HTTPS端点）、`endpoint.key_env`（显式`DANMU_`专用环境变量名）及可选`request_cost_ceiling`。端点与密钥须由使用者自行核实；Luna仅早期候选，不是必需依赖。密钥值不得写入仓库。API适配器未声明reasoning参数支持时，`/ai effort`明确拒绝，不假装生效。
-
-受控搜索单独配置`[autoreply.search]`：公共HTTPS服务端点及专用凭据、官方域名列表`official_domains`、批准的`topics`（每项含`id`与公共`query`）。模型只能选择主题ID，不能生成URL或任意查询。服务接收`query/limit/timezone/prefer_domains`，返回`conflict`和最多4项`sources`；每项含`title/url/excerpt/published_at/retrieved_at`，时间须带时区。禁止直访观众链接、本机/内网/文件URL、重定向及DNS重绑定；网页始终不可信，来源不足、冲突或过期留主播。未配置搜索不阻塞订阅登录及本地互动。
-
-每场默认最多12次模型请求、3次搜索；并发1，单人60秒、全局10秒，候选45秒过期。输入/输出、传输大小/耗时与缓存TTL受限；`request_token_ceiling`与`token_budget`是保守预留及观测停止阈值，订阅服务并无本客户端可设置的硬生成token上限，回报可能滞后，不能保证实际用量绝不超过预留。取消不返还未知消耗；如设置货币预算却没有可核算请求上界，则暂停而非报0元。订阅不虚报精确货币费用。
-
-无网络回放（不读取B站账号/OBS/默认配置，不连接直播，不发送公开弹幕）：
-
-```bash
-cargo run --locked -- --replay tests/fixtures/autoreply-safe.json
-cargo run --locked -- --replay tests/fixtures/ai-settings-off.json
-```
-
-本轮只交付main供用户自行拉取、构建、安装和人工核验；不生成tag/release。真实浏览器登录、订阅候选推理、账号模型可用性及外部搜索尚未由维护者执行。
-
-### 历史浏览与实时跟随
-
-上滚或选择回复对象后，消息区底部固定显示高对比提示：**浏览历史 · 已暂停跟随 · Esc 返回实时**。新消息仍然接收，并显示新增数量；启用自动返回时显示剩余秒数。窄屏保留状态与返回按键。
-
-- **仅手动（默认）**：`/history off`；按 Esc、End 或向下滚回最新一条恢复跟随。
-- **手动与自动并用**：`/history 60`；按键、滚轮等操作重新计时，消息到达不重置计时。空闲达到 60 秒后返回最新，不清除输入草稿。
-- 登录二维码、密码输入或停播弹窗期间暂停自动返回，关闭后重新计算空闲时间；Esc 优先取消当前操作，再返回实时。
-- `/history` 查看当前设置；命令修改仅对本次会话生效。要持久生效，在 TOML 中设置 `history_idle_seconds = 60`；启动时可用 `--history-idle-seconds 60` 覆盖，传 `0` 关闭。
-
-Esc 不再退出整个 TUI；使用 **Ctrl+C** 或 **/quit** 安全退出。
-
-### True Color 主题
-
-内置四套深色主题：
-
-- `shisui`
-- `catppuccin-mocha`
-- `tokyo-night`
-- `gruvbox-dark`
-
-```text
-/theme
-/theme tokyo-night
-/theme reload
-```
-
-首次运行会生成 `themes.json`。输入 `/theme` 可查看当前实际路径。复制现有主题对象并修改 ID、`label` 与十个 `#RRGGBB` 语义色，即可创建自定义主题；保存后执行 `/theme reload`，不必重启。
-
-## 数据、凭据与恢复
-
-DANMU 使用独立命名空间，不读取商业 GUI、浏览器或其他直播工具的数据：
-
-- B 站 Cookie / CSRF：独立 `BilibiliAccount/session.json`，Unix 权限 `0600`；
-- OBS 密码：独立 `obs-password` 文件，Unix 权限 `0600`；可由 `OBS_API_PASSWORD` 临时覆盖；不使用系统钥匙串；
-- OBS 非敏感配置：独立 `obs-control.json`；
-- 主题与启动配置：平台配置目录中的 `shisui-danmu/`；
-- 会话记录：每场直播一个目录，持续追加 `journal.jsonl`；
-- 正常结束：额外生成 `snapshot.json` 与 `summary.md`；
-- 异常退出：下次进入同一房间时恢复未结束会话。
-
-Cookie、CSRF 和原始 B 站 payload 不进入领域事件或会话导出。
-
-## 架构
-
-```mermaid
-graph LR
-    B[Bilibili Adapter] --> D[Platform-neutral Domain]
-    O[OBS WebSocket Adapter] --> T[Ratatui Terminal]
-    D --> T
-    D --> J[JSONL Session Journal]
-    C[CLI / TOML / Theme Catalog] --> T
-```
-
-- `src/bilibili/`：房间解析、历史补偿、WebSocket、账号与发送；
-- `src/domain/`：标准事件、会话、指标、去重与问题分类；
-- `src/obs.rs`、`src/obs/`：有限 OBS 控制与电平聚合；
-- `src/terminal/`：Ratatui 渲染、输入、二维码与电平表；
-- `src/persistence.rs`：追加式 Journal、恢复、搜索和导出。
-
-平台协议只存在于 Adapter。领域 Module 不依赖 B 站原始字段。
-
-## 能力边界
-
-DANMU 有意保持克制：
-
-**包含**：公开房间监看、历史与实时事件去重、自动重连、登录后发送、重点互动、会话归档、True Color 主题、有限 OBS 控制、单路麦克风电平。
-
-**不包含**：播放器、完整直播画布、音频混音台、录制与 Replay Buffer、OBS 场景编辑器、商业 GUI。
-
-完整行为基线见 [终端舞台功能矩阵](docs/terminal-feature-matrix.md)。
-
-## 从源码构建
-
-需要 Rust 1.89 或更高版本：
-
-```bash
-git clone https://github.com/rockythink/shisui-danmu.git
-cd shisui-danmu
-cargo build --release --locked
-```
-
-安装到 `~/.local/bin/danmu`：
-
-```bash
-./script/install_cli.sh
-```
-
-或使用 Cargo：
-
-```bash
-cargo install --locked --path .
-```
-
-## 开发与验证
-
-```bash
-./script/verify.sh
-```
-
-完整门禁包含：
-
-- `cargo fmt --check`
-- 严格 `clippy`
-- 全目标测试
-- Release 构建
-- CLI 冒烟
-
-GitHub Actions 在 macOS、Linux、Windows 上执行对应 Rust 门禁。提交前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
-
-## Release 资产
-
-| 平台 | 文件 |
+| 平台 | Release 文件 |
 | --- | --- |
 | macOS Apple Silicon | `shisui-danmu-macos-aarch64.tar.gz` |
 | macOS Intel | `shisui-danmu-macos-x86_64.tar.gz` |
@@ -434,23 +73,157 @@ GitHub Actions 在 macOS、Linux、Windows 上执行对应 Rust 门禁。提交�
 | Linux aarch64 | `shisui-danmu-linux-aarch64.tar.gz` |
 | Windows x86_64 | `shisui-danmu-windows-x86_64.zip` |
 
-指定版本或安装目录：
+每个压缩包都有同名 `.sha256`。以上是**基础 TUI** 的构建范围；内置 ACP Runner 要求 Unix，部分宿主还有更窄的平台限制，不宣传 Windows 内置 AI 可用。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rockythink/shisui-danmu/main/script/install_release.sh | \
-  DANMU_VERSION=v0.4.5 DANMU_INSTALL_DIR="$HOME/bin" bash
+danmu --version
+danmu <房间号>
 ```
 
-卸载：
+公开监看无需登录。需要人工发送时，登录的是 DANMU，而不是浏览器：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rockythink/shisui-danmu/main/script/install_release.sh | bash -s -- --uninstall
+danmu --login
+danmu <房间号>
 ```
 
-卸载只删除可执行文件，不删除配置、系统凭据或会话日志。
+用哔哩哔哩客户端扫码；进入后在输入框写正文，按 Enter 发送，粘贴只插入内容。`danmu --logout` 只退出 DANMU 主账号。发送区的 `?` 表示送达未确认，不应当作确定失败自动重发。
 
-## License、商标与安全
+升级、PATH、启动自检及各渠道细节见 [安装与升级](https://danmu.elazer.wang/guide/#安装与升级)。
 
-源代码按 [Mozilla Public License 2.0](LICENSE) 发布，第三方组件见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。MPL-2.0 不授予 **DANMU** 名称、Logo、App 图标或其他品牌资产的商标许可，详见 [TRADEMARKS.md](TRADEMARKS.md)。
+## 高频操作
 
-安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。不要在公开 Issue 中提交 B 站 Cookie、CSRF token、OBS 密码、系统凭据存储内容或本机会话日志。
+| 操作 | 入口 |
+| --- | --- |
+| 搜索指令，返回时保留草稿与光标 | Ctrl+O 或 `/commands` |
+| 设置与操作总菜单 | `/settings` |
+| 切换消息布局 | Tab |
+| 浏览历史 / 选择回复对象 | ↑↓ / Shift+↑↓ |
+| 插入选中对象的 @ | 选择后 Enter |
+| 取消当前操作 / 返回实时 | Esc；浏览或选择状态下 End 也返回实时 |
+| 助手运行面板 / 候选审核 | Ctrl+G 或 `/ai` / `/review` |
+| 暂停助手与撤销发送许可 | Ctrl+P 或 `/pause` |
+| 重点消息 / 搜索归档 | `/pin` / `/find [关键词]` |
+| 诊断与上轮摘要 | `/diag`，F1 或 `?` 展开详情 |
+| 安全退出 | Ctrl+C 或 `/quit` |
+
+正常编辑输入时 End 是行尾。主界面可原生拖选文字，用终端复制快捷键复制；macOS 的 ⌘C 是复制，Ctrl+C 是退出。
+
+OBS 从 `danmu --configure-obs` 或 `/settings obs` 配置。`/obs start` 会真的开始推流；`/obs stop` 需要确认，随后 3 秒内可按 Esc 取消。退出 DANMU 不会停止 OBS 推流。
+
+## AI 与平台边界
+
+**程序开源免费，不等于外部模型免费。** 原生宿主的安装、登录、订阅、模型费用和搜索额度由用户及对应服务管理。
+
+1. 在 `/settings` → AI助手 → 模型选择已安装、已认证的宿主；连接/同步只读取模型与思考档位，不开始值班。
+2. `/ai start` 开始处理新消息；先用 `/review` 阅读候选，完整看过后 Shift+Enter 批准。编辑中的 Enter 只保存，不发送。
+3. 自动发送必须由本人明确授权。保存过的自动偏好，仅在同房间、同发送 UID 且启动恢复检查通过时续用；暂停、身份或房间变化、身份失效会撤权。批量批准当前候选不授权未来候选。
+
+Unix 用户接入官方 Node 版 Pi 前，先自行安装并认证 Pi，再执行：
+
+```bash
+danmu setup pi
+```
+
+这只准备应用私有的 `pi-acp@0.0.33`，需要 Node.js 20+ 与 npm；重复执行复用已准备适配器，不加载用户全局扩展，不替换不可用模型或思考档位。完整流程见 [Pi 接入示例](https://danmu.elazer.wang/guide/#pi接入示例)。
+
+当前适配列表为 OMP、Gemini、Claude Code、Codex、OpenCode、Pi、Amp、GitHub Copilot CLI、DeepSeek Harness。**适配实现或隔离验证不等于九种宿主、所有真实模型均已验收。** 具体版本与限制见[开发接入向导](https://github.com/rockythink/shisui-danmu/blob/main/docs/agent-onboarding.md#九宿主接入与认证边界)。
+
+平台目前只接入 B 站。模型不能授权发送、操作电脑或自报送达；联网默认关闭，开启也仅准入搜索。麦克风状态不是语音内容识别。连续空轮合批不承诺固定省费比例、永不漏答或永不报错。
+
+## 文档
+
+- **[官网使用手册](https://danmu.elazer.wang/guide/)**：安装、设置、OBS、AI、审核、账号、成本、数据与排错。
+- [故障排查](https://danmu.elazer.wang/guide/#故障排查)：先看诊断、保留草稿和原始历史，不靠删库或重放旧消息解决问题。
+- [命令参考](https://danmu.elazer.wang/guide/#命令参考与进一步阅读)：完整 CLI、TUI 与高级隔离入口。
+- [开发接入向导](https://github.com/rockythink/shisui-danmu/blob/main/docs/agent-onboarding.md)、[功能矩阵](https://github.com/rockythink/shisui-danmu/blob/main/docs/terminal-feature-matrix.md)：实现契约与验证边界，不代替用户手册。
+
+用户手册只维护在官网的 Starlight 内容目录，随源码版本管理，不另维护一份 GitHub 操作手册。
+
+## 高级集成
+
+<details>
+<summary>外部 Agent、CLI/MCP 契约与隔离运行</summary>
+
+### 连接已有实例
+
+外部 Agent 与 TUI 连接同一运行实例，不另启动 TUI、不读取平台凭据。用户须显式提供绝对私有目录：
+
+```bash
+danmu --instance /绝对私有实例目录 <房间号>
+```
+
+另一个终端或宿主连接该实例：
+
+```bash
+danmu --instance /绝对私有实例目录 agent status '{}'
+danmu --instance /绝对私有实例目录 mcp
+```
+
+MCP 入口由宿主以 stdio 启动，stdout 只输出 JSON-RPC。没有 `--instance` 时基础 TUI 仍可使用，但不向外部 Agent 开放端点。
+
+### 共用业务契约
+
+CLI：`danmu --instance DIR agent 操作 'JSON对象'`。MCP 工具名为 `danmu_操作`，宿主可能增加服务器名前缀。
+
+| 操作 | 参数与结果 |
+| --- | --- |
+| `status` | 返回本场 `session`、`active`、`available`、`sending_enabled`、最新 `cursor`；不授权 |
+| `messages` | `session`、`cursor`、`limit`（1..200，默认 50）、`wait_ms`（0..25000）；返回到达顺序的稳定消息 ID、消费 `cursor`、`latest_cursor`、`oldest_cursor` 及 `gap`。空页是正常超时，不自动标黄 |
+| `report` | `session`、`caller`、`request_id`、`message_id`、`state`（`processing` / `finished` / `failed`）；不能自报 confirmed |
+| `reply` | `session`、`caller`、`request_id`、原 `message_id`、`text`、`candidate`；`candidate=true` 等待 TUI 确认；受理不代表发送 |
+| `result` | `session`、`caller`、`request_id`；查询 `awaiting_approval` / `accepted` / `sending` / `confirmed` / `uncertain` / `rejected` / `cancelled` |
+
+完整流程见[共享 danmu-duty Skill](https://github.com/rockythink/shisui-danmu/blob/main/agent-package/skills/danmu-duty/SKILL.md)。每场保留 512 项增量事件、4096 项幂等操作；超出窗口明确 `gap`，幂等记录满则拒绝新请求而非驱逐旧记录。同一操作重传必须保持 `caller`、`request_id` 与参数不变；不同调用者可合法回复同一原消息。
+
+每次启动或新场都有独立随机 `session`；旧请求不跨场补发，预载历史不充当增量游标。外部工具不能开自动许可；生产启动恢复只采用本人先前保存、范围仍匹配且核验通过的授权，工具重连本身不恢复权限。
+
+Unix 实例目录 0700、描述文件 0600；端点只绑定 127.0.0.1 随机端口，使用实例私有随机 token 与独占目录锁。同一系统用户不是抵御恶意本机代码的 OS 沙箱，不向不可信进程共享实例目录。
+
+### MCP 取消语义
+
+每连接最多 16 个未回收工具调用，完成后回收容量。`notifications/cancelled` 按当前连接的 JSON-RPC `requestId` 取消尚未完成的 `danmu_messages` 有限等待，释放读取连接，不再发送该取消请求的响应。未知或已完成 ID 忽略；完成早于取消时，允许已经发出的一次响应。
+
+取消通知不撤销已提交回复，不开关发送许可。按 [MCP 取消规范](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation)，客户端应停止等待被取消 ID，而不是继续等待正常空页。发送结果不确定时查询原请求，不使用新 ID 猜测重发。
+
+Runner 持有时 `status.driver=runner`。外部读/查保留，同一内置调用者 `danmu-assistant` 的 `report/reply` 返回 `runner_active`；其他独立调用者仍受原权限控制。不要换调用者绕过同一助手互斥；切换前由用户停止旧外部值班，DANMU 不抢停外部 Agent。
+
+### 外部配置生成器
+
+```text
+python3 script/agent_config.py --host HOST --binary /绝对路径/danmu --instance /绝对私有实例目录
+```
+
+生成器只打印配置，不安装、不写宿主设置、不启动宿主。`HOST` 可选 `omp`、`claude`、`codex`、`opencode`、`gemini`、`cursor`、`vscode`、`amp`、`pi`；这是外部接入格式列表，不等同于内置 Runner 宿主列表。Amp 使用 `amp.mcpServers`；Pi 只输出明确标记的 CLI 示例，不安装 MCP 扩展。用户负责合并配置、信任服务器与限制宿主自身的其他能力。
+
+### 无房间隔离示例
+
+```bash
+INSTANCE="$(mktemp -d /tmp/danmu-agent.XXXXXX)"
+danmu --instance "$INSTANCE" local --assistant
+```
+
+`local` 要求全新的空私有目录，只使用人工输入与 LocalTransport，不读取生产配置、不登录、不连接真实房间或 OBS。`--assistant` 只打开面板，不启动模型或授权。
+
+在这个隔离 TUI 内可输入 `/event 观众甲 怎样理解增量游标？`，用 `/local confirmed|uncertain|rejected` 选择本地传输结果，用 `/session end|new` 演练场次切换。这些是本地 TUI 命令，不是外部 CLI/MCP 控制口；外部五操作不能启动 Runner、注入事件或批准发送。
+
+工具/本地入口不能混用房间、登录、OBS、回放或生产配置参数。`setup pi` 独立执行，不接受 `--instance` 等 TUI 参数。退出只移除该实例端点并释放锁，保留记录；本地自动许可不保存为真实房间授权。
+
+</details>
+
+## 开发、贡献与许可
+
+需要 Rust 1.89+；网站构建使用 Node.js 24。
+
+```bash
+git clone https://github.com/rockythink/shisui-danmu.git
+cd shisui-danmu
+./script/verify.sh
+./script/install_cli.sh
+```
+
+`verify.sh` 执行格式检查、严格 Clippy、全目标测试、Release 构建及 CLI 冒烟。CI 在 macOS、Linux、Windows 执行 Rust 门禁，并构建官网。平台协议留在 Adapter，领域模块不直接依赖 B 站协议字段。贡献前阅读 [CONTRIBUTING.md](https://github.com/rockythink/shisui-danmu/blob/main/CONTRIBUTING.md)。
+
+源代码采用 [MPL-2.0](https://github.com/rockythink/shisui-danmu/blob/main/LICENSE)，第三方说明见 [THIRD_PARTY_NOTICES.md](https://github.com/rockythink/shisui-danmu/blob/main/THIRD_PARTY_NOTICES.md)。开源许可不授予 DANMU 名称、Logo 或其他品牌资产的商标许可，详见 [TRADEMARKS.md](https://github.com/rockythink/shisui-danmu/blob/main/TRADEMARKS.md)。
+
+安全问题按 [SECURITY.md](https://github.com/rockythink/shisui-danmu/blob/main/SECURITY.md) 私下报告。不要在公开 Issue 中提交 Cookie、CSRF token、OBS 密码、模型认证、Bridge token 或含个人信息的历史记录。

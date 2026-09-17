@@ -1,10 +1,16 @@
-pub mod autoreply;
 pub mod bilibili;
+pub mod bridge;
 pub mod config;
 pub mod delivery;
 pub mod domain;
+pub(crate) mod history;
+pub(crate) mod history_repair;
 pub mod obs;
 pub mod persistence;
+pub(crate) mod runner;
+pub mod setup;
 pub mod storage;
 pub mod terminal;
 pub mod theme;
+pub(crate) mod workspace;
+pub(crate) mod workspace_config;

@@ -1,0 +1,64 @@
+@import "@fontsource/silkscreen/400.css";
+@import "@fontsource/silkscreen/700.css";
+
+:root {
+  --sl-font: "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
+  --sl-font-mono: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  --sl-color-accent-low: #063b4b;
+  --sl-color-accent: #22d3ee;
+  --sl-color-accent-high: #cffafe;
+  --sl-color-white: #f1f5f9;
+  --sl-color-gray-1: #d8e0ea;
+  --sl-color-gray-2: #a8b4c4;
+  --sl-color-gray-3: #64748b;
+  --sl-color-gray-4: #334155;
+  --sl-color-gray-5: #1e293b;
+  --sl-color-gray-6: #101720;
+  --sl-color-black: #070a0f;
+  --sl-content-width: 75ch;
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-low: #cffafe;
+  --sl-color-accent: #0e7490;
+  --sl-color-accent-high: #083344;
+  --sl-color-white: #070a0f;
+  --sl-color-gray-1: #1e293b;
+  --sl-color-gray-2: #334155;
+  --sl-color-gray-3: #64748b;
+  --sl-color-gray-4: #94a3b8;
+  --sl-color-gray-5: #d8e0ea;
+  --sl-color-gray-6: #edf3f8;
+  --sl-color-black: #f8fafc;
+}
+
+body {
+  background-image:
+    linear-gradient(rgb(51 65 85 / 8%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(51 65 85 / 8%) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+header.header {
+  border-bottom: 2px solid var(--sl-color-gray-5);
+  background: color-mix(in srgb, var(--sl-color-black) 94%, transparent);
+}
+
+.site-title {
+  font-family: "Silkscreen", monospace;
+  letter-spacing: 0.08em;
+}
+
+.sl-markdown-content {
+  font-size: 1.125rem;
+  line-height: 1.75;
+}
+
+.sl-markdown-content :is(h2, h3, h4, h5, h6) {
+  scroll-margin-top: 5rem;
+}
+
+.sl-markdown-content :is(pre, table) {
+  max-width: 100%;
+}
+

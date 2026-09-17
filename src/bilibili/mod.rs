@@ -3,8 +3,8 @@ mod packet;
 mod parser;
 
 pub use client::{
-    AccountClient, AccountStatus, BilibiliClient, BilibiliClientEvent, LoginChallenge, LoginPoll,
-    RoomLiveStatus, RoomSnapshot,
+    AccountClient, AccountStatus, BilibiliClient, BilibiliClientEvent, DanmuResponse,
+    LoginChallenge, LoginPoll, PublicProfile, RoomLiveStatus, RoomSnapshot, RoomUpdateReceipt,
 };
 pub use packet::{Packet, PacketError, encode_packet, parse_packets};
 pub use parser::parse_command;
@@ -172,19 +172,19 @@ pub(crate) fn masked_name_matches(lhs: &str, rhs: &str) -> bool {
 
 pub fn kind_label(kind: DanmuEventKind) -> &'static str {
     match kind {
-        DanmuEventKind::Danmu => "弹幕",
-        DanmuEventKind::Gift => "礼物",
-        DanmuEventKind::GuardEvent => "大航海",
-        DanmuEventKind::Superchat => "醒目留言",
-        DanmuEventKind::Enter => "进场",
-        DanmuEventKind::Like => "点赞",
-        DanmuEventKind::Follow => "关注",
-        DanmuEventKind::Share => "分享",
+        DanmuEventKind::Danmu => "CHAT",
+        DanmuEventKind::Gift => "GIFT",
+        DanmuEventKind::GuardEvent => "GUARD",
+        DanmuEventKind::Superchat => "SC",
+        DanmuEventKind::Enter => "JOIN",
+        DanmuEventKind::Like => "LIKE",
+        DanmuEventKind::Follow => "FOLLOW",
+        DanmuEventKind::Share => "SHARE",
         DanmuEventKind::Pk => "PK",
-        DanmuEventKind::Lottery => "抽奖",
-        DanmuEventKind::Moderation => "管理",
-        DanmuEventKind::RoomStatus => "直播间",
-        DanmuEventKind::System => "系统",
+        DanmuEventKind::Lottery => "DRAW",
+        DanmuEventKind::Moderation => "MOD",
+        DanmuEventKind::RoomStatus => "ROOM",
+        DanmuEventKind::System => "SYS",
     }
 }
 

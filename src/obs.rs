@@ -8,7 +8,9 @@ use meter::{LevelSmoother, SILENCE_DB, peak_db};
 use obws::{Client, client::ConnectConfig, events::Event, requests::EventSubscription};
 use serde::{Deserialize, Serialize};
 use std::{
+    net::{IpAddr, Ipv6Addr},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -156,17 +158,33 @@ impl ObsController {
     }
 
     pub async fn update_configuration(&self, configuration: ObsConfiguration) -> Result<()> {
-        configuration.save(&self.configuration_path)?;
+        let _connect_guard = self.connect_lock.lock().await;
         let mut state = self.state.lock().await;
+        configuration.save(&self.configuration_path)?;
         state.configuration = configuration;
         state.client = None;
         Ok(())
     }
 
     pub async fn set_password(&self, password: &str) -> Result<()> {
+        let _connect_guard = self.connect_lock.lock().await;
         save_obs_password(&self.configuration_path, password)?;
         self.state.lock().await.client = None;
         Ok(())
+    }
+
+    pub async fn set_host(&self, host: String) -> Result<()> {
+        let host = normalize_obs_host(&host)?;
+        self.update_configuration_field(|configuration| configuration.host = host)
+            .await
+    }
+
+    pub async fn set_port(&self, port: u16) -> Result<()> {
+        if port == 0 {
+            bail!("OBS WebSocket 端口必须大于 0");
+        }
+        self.update_configuration_field(|configuration| configuration.port = port)
+            .await
     }
 
     pub async fn set_microphone_name(&self, name: String) -> Result<()> {
@@ -181,9 +199,8 @@ impl ObsController {
                 inputs.join("、")
             );
         }
-        let mut configuration = self.configuration().await;
-        configuration.microphone_input_name = name;
-        self.update_configuration(configuration).await
+        self.update_configuration_field(|configuration| configuration.microphone_input_name = name)
+            .await
     }
 
     pub async fn fetch_status(&self) -> Result<ObsStatus> {
@@ -383,8 +400,24 @@ impl ObsController {
         self.configuration().await.microphone_input_name
     }
 
-    async fn configuration(&self) -> ObsConfiguration {
+    pub(crate) async fn configuration(&self) -> ObsConfiguration {
         self.state.lock().await.configuration.clone()
+    }
+    async fn update_configuration_field(
+        &self,
+        update: impl FnOnce(&mut ObsConfiguration),
+    ) -> Result<()> {
+        let _connect_guard = self.connect_lock.lock().await;
+        let mut state = self.state.lock().await;
+        let mut configuration = state.configuration.clone();
+        update(&mut configuration);
+        if configuration == state.configuration {
+            return Ok(());
+        }
+        configuration.save(&self.configuration_path)?;
+        state.configuration = configuration;
+        state.client = None;
+        Ok(())
     }
 
     async fn client(&self) -> Result<Arc<Client>> {
@@ -475,6 +508,43 @@ impl ObsController {
         bail!("无法确认 OBS 推流状态，请立即到 OBS 核对")
     }
 }
+fn normalize_obs_host(host: &str) -> Result<String> {
+    let host = host.trim();
+    if host.is_empty() {
+        bail!("OBS WebSocket 主机不能为空");
+    }
+    if host.contains("://")
+        || host.contains(['/', '?', '#', '@'])
+        || host.chars().any(char::is_whitespace)
+    {
+        bail!("OBS WebSocket 主机只填写主机名或 IP，协议和端口需分开设置");
+    }
+
+    if let Ok(address) = IpAddr::from_str(host) {
+        return Ok(match address {
+            IpAddr::V4(address) => address.to_string(),
+            IpAddr::V6(address) => format!("[{address}]"),
+        });
+    }
+    if let Some(address) = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        return Ipv6Addr::from_str(address)
+            .map(|address| format!("[{address}]"))
+            .map_err(|_| anyhow!("OBS WebSocket IPv6 地址格式错误"));
+    }
+    if host.contains([':', '[', ']']) {
+        bail!("OBS WebSocket 主机只填写主机名或 IP，端口需分开设置");
+    }
+
+    match url::Host::parse(host).context("OBS WebSocket 主机格式错误")? {
+        url::Host::Domain(domain) if !domain.is_empty() => Ok(domain),
+        url::Host::Ipv4(address) => Ok(address.to_string()),
+        url::Host::Ipv6(address) => Ok(format!("[{address}]")),
+        _ => bail!("OBS WebSocket 主机格式错误"),
+    }
+}
 
 async fn wait_for_stop(stop: &mut watch::Receiver<bool>, duration: Duration) -> bool {
     tokio::select! {
@@ -485,6 +555,63 @@ async fn wait_for_stop(stop: &mut watch::Receiver<bool>, duration: Duration) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::SinkExt;
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    fn spawn_fake_obs(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({"op": 0, "d": {"obsWebSocketVersion": "5.6.0", "rpcVersion": 1}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let identify: Value =
+                serde_json::from_str(websocket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(identify["op"], 1);
+            websocket
+                .send(Message::Text(
+                    json!({"op": 2, "d": {"negotiatedRpcVersion": 1}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            let request: Value =
+                serde_json::from_str(websocket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(request["d"]["requestType"], "GetVersion");
+            websocket
+                .send(Message::Text(
+                    json!({"op": 7, "d": {
+                        "requestType": "GetVersion",
+                        "requestId": request["d"]["requestId"],
+                        "requestStatus": {"result": true, "code": 100},
+                        "responseData": {
+                            "obsVersion": "31.0.0",
+                            "obsWebSocketVersion": "5.6.0",
+                            "rpcVersion": 1,
+                            "availableRequests": [],
+                            "supportedImageFormats": [],
+                            "platform": "macos",
+                            "platformDescription": "macOS"
+                        }
+                    }})
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        })
+    }
 
     #[test]
     fn defaults_to_the_standard_obs_websocket_endpoint() {
@@ -549,5 +676,124 @@ mod tests {
                 0o600,
             );
         }
+    }
+    #[test]
+    fn host_validation_matches_obws_host_and_port_contract() {
+        assert_eq!(normalize_obs_host(" localhost ").unwrap(), "localhost");
+        assert_eq!(normalize_obs_host("127.0.0.1").unwrap(), "127.0.0.1");
+        assert_eq!(normalize_obs_host("::1").unwrap(), "[::1]");
+        assert_eq!(normalize_obs_host("[::1]").unwrap(), "[::1]");
+        assert!(normalize_obs_host("http://localhost").is_err());
+        assert!(normalize_obs_host("localhost:4455").is_err());
+        assert!(normalize_obs_host("localhost/path").is_err());
+    }
+
+    #[tokio::test]
+    async fn setting_port_discards_cached_client_and_connects_new_endpoint() {
+        let old_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let new_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_port = old_listener.local_addr().unwrap().port();
+        let new_port = new_listener.local_addr().unwrap().port();
+        let old_server = spawn_fake_obs(old_listener);
+        let new_server = spawn_fake_obs(new_listener);
+        let temp = tempfile::tempdir().unwrap();
+        let configuration_path = temp.path().join("obs.json");
+        let controller = ObsController::new(
+            ObsConfiguration {
+                host: "127.0.0.1".into(),
+                port: old_port,
+                microphone_input_name: "主播麦克风".into(),
+                default_live_scene: "直播".into(),
+            },
+            configuration_path.clone(),
+        );
+
+        save_obs_password(&configuration_path, "secret-value").unwrap();
+        controller.client().await.unwrap();
+        old_server.await.unwrap();
+        controller.set_port(new_port).await.unwrap();
+        controller.client().await.unwrap();
+        new_server.await.unwrap();
+        controller.set_host(" LOCALHOST ".into()).await.unwrap();
+
+        let saved = ObsConfiguration::load(&configuration_path).unwrap();
+        assert_eq!(saved.port, new_port);
+        assert_eq!(saved.host, "localhost");
+        assert_eq!(saved.microphone_input_name, "主播麦克风");
+        assert_eq!(saved.default_live_scene, "直播");
+        assert_eq!(
+            load_obs_password(&configuration_path).unwrap().as_deref(),
+            Some("secret-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_endpoint_updates_do_not_lose_each_other() {
+        let temp = tempfile::tempdir().unwrap();
+        let configuration_path = temp.path().join("obs.json");
+        let controller = ObsController::new(
+            ObsConfiguration {
+                microphone_input_name: "主播麦克风".into(),
+                default_live_scene: "直播".into(),
+                ..ObsConfiguration::default()
+            },
+            configuration_path.clone(),
+        );
+
+        let (host_result, port_result) = tokio::join!(
+            controller.set_host("127.0.0.1".into()),
+            controller.set_port(4456),
+        );
+        host_result.unwrap();
+        port_result.unwrap();
+
+        assert_eq!(
+            ObsConfiguration::load(&configuration_path).unwrap(),
+            ObsConfiguration {
+                host: "127.0.0.1".into(),
+                port: 4456,
+                microphone_input_name: "主播麦克风".into(),
+                default_live_scene: "直播".into(),
+            }
+        );
+    }
+    #[tokio::test]
+    async fn endpoint_validation_and_save_failure_preserve_configuration_password_and_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = spawn_fake_obs(listener);
+        let temp = tempfile::tempdir().unwrap();
+        let configuration_path = temp.path().join("obs.json");
+        let original = ObsConfiguration {
+            host: "127.0.0.1".into(),
+            port,
+            microphone_input_name: "主播麦克风".into(),
+            default_live_scene: "直播".into(),
+        };
+        original.save(&configuration_path).unwrap();
+        save_obs_password(&configuration_path, "secret-value").unwrap();
+        let controller = ObsController::new(original.clone(), configuration_path.clone());
+        let cached = controller.client().await.unwrap();
+        server.await.unwrap();
+
+        assert!(
+            controller
+                .set_host("http://localhost".into())
+                .await
+                .is_err()
+        );
+        assert!(controller.set_port(0).await.is_err());
+        assert_eq!(controller.configuration().await, original);
+        assert!(Arc::ptr_eq(&cached, &controller.client().await.unwrap()));
+
+        std::fs::remove_file(&configuration_path).unwrap();
+        std::fs::create_dir(&configuration_path).unwrap();
+        assert!(controller.set_host("localhost".into()).await.is_err());
+        assert_eq!(controller.configuration().await, original);
+        assert!(Arc::ptr_eq(&cached, &controller.client().await.unwrap()));
+        assert_eq!(
+            load_obs_password(&configuration_path).unwrap().as_deref(),
+            Some("secret-value")
+        );
     }
 }

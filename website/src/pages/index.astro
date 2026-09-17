@@ -43,6 +43,16 @@ const featureRows = [
     title: "直播结束，上下文不会清零",
     description: "每场互动持续写入独立 Journal；支持恢复未结束会话、搜索归档并导出现场快照。",
   },
+  {
+    number: "06",
+    title: "本机 AI 助手，先审核再发送",
+    description: "接入用户已安装并认证的宿主，候选回复默认先进入审核；基础 TUI 免费，模型调用费用由所选服务决定。内置 ACP Runner 目前仅支持 Unix。",
+  },
+  {
+    number: "07",
+    title: "少空转，也看得见为什么",
+    description: "连续空回复会短时合批，减少无效调用；轮次诊断区分等待、零候选、原生无正文与真实错误。",
+  },
 ];
 
 ---
@@ -58,7 +68,7 @@ const featureRows = [
         <span>DANMU</span>
       </a>
       <nav aria-label="主要导航">
-        <a href="https://github.com/rockythink/shisui-danmu#快速开始" target="_blank" rel="noreferrer">DOCS</a>
+        <a class="guide-link" href="/guide/">GUIDE</a>
         <a href="https://github.com/rockythink/shisui-danmu/releases/latest" target="_blank" rel="noreferrer">RELEASES</a>
         <a href="#features">FEATURES</a>
         <a class="icon-link" href="https://github.com/rockythink/shisui-danmu" target="_blank" rel="noreferrer" aria-label="GitHub">
@@ -109,7 +119,7 @@ const featureRows = [
             ))}
           </div>
         </div>
-        <a class="github-cta" href="https://github.com/rockythink/shisui-danmu" target="_blank" rel="noreferrer"><span>查看源码</span><strong>GitHub ↗</strong></a>
+        <a class="github-cta" href="/guide/"><span>完整安装与升级说明</span><strong>使用手册 →</strong></a>
         <div class="copy-status" data-copy-status aria-live="polite"></div>
       </section>
 
@@ -138,7 +148,7 @@ const featureRows = [
         </div>
 
         <div class="stage-caption">
-          <span>B站直播间完整实机录屏 · 无模拟画面</span>
+          <span>B站直播间基础功能实录 · 不代表已展示 v0.5.0 AI 助手流程</span>
           <a href="/danmu-product-demo.mp4" download>下载视频 ↓</a>
         </div>
       </section>
@@ -151,7 +161,7 @@ const featureRows = [
           <div class="install-guide" aria-label="快速开始">
             <div><span>01</span><p><b>进入 B站直播间</b><code>danmu &lt;房间号&gt;</code></p></div>
             <div><span>02</span><p><b>登录（可选）</b><code>danmu --login</code></p></div>
-            <div><span>03</span><p><b>打开命令面板</b><code>按下 /</code></p></div>
+            <div><span>03</span><p><b>打开统一设置</b><code>/settings</code></p></div>
           </div>
           <div class="install-platforms">
             <span><i></i>macOS</span><span><i></i>Linux</span><span><i></i>Windows</span>
@@ -201,6 +211,7 @@ const featureRows = [
       </div>
       <div class="footer-meta">
         <a href="https://github.com/rockythink/shisui-danmu" target="_blank" rel="noreferrer"><span>◆</span> MPL-2.0 · OPEN SOURCE</a>
+        <a class="guide-link" href="/guide/">使用手册</a>
         <a class="footer-recording" href="/danmu-product-demo.mp4" target="_blank" rel="noreferrer">观看实机录屏</a>
         <span class="footer-platforms">MACOS · LINUX · WINDOWS</span>
       </div>

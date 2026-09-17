@@ -12,9 +12,9 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tokio::sync::{OnceCell, mpsc, watch};
 use tokio_tungstenite::{
@@ -26,6 +26,14 @@ use uuid::Uuid;
 
 const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 const HISTORY_RECONCILIATION_INTERVAL_SECONDS: u64 = 5;
+const PUBLIC_PROFILE_ENDPOINT: &str = "https://api.bilibili.com/x/web-interface/card";
+const PUBLIC_PROFILE_TTL: Duration = Duration::from_secs(15 * 60);
+const PUBLIC_PROFILE_ERROR_TTL: Duration = Duration::from_secs(60);
+const PUBLIC_PROFILE_CACHE_LIMIT: usize = 64;
+const PUBLIC_PROFILE_RESPONSE_LIMIT: usize = 64 * 1024;
+const PUBLIC_PROFILE_DESCRIPTION_LIMIT: usize = 512;
+const ROOM_TITLE_LIMIT: usize = 40;
+const ROOM_COVER_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BilibiliClientEvent {
@@ -138,9 +146,82 @@ impl DeviceIdentity {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicProfile {
+    pub user_id: String,
+    pub description: String,
+    pub source_url: String,
+}
+
+fn public_profile_user_id(value: &str) -> Result<u64> {
+    if value.is_empty() || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("无效的主播 UID");
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| anyhow!("无效的主播 UID"))
+}
+
+fn public_profile_from_response(
+    value: &Value,
+    requested_user_id: u64,
+) -> Result<Option<PublicProfile>> {
+    let code = value
+        .get("code")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow!("主页简介响应缺少状态码"))?;
+    if code != 0 {
+        bail!("主页简介暂不可用（B 站错误码 {code}）");
+    }
+    let card = value
+        .pointer("/data/card")
+        .ok_or_else(|| anyhow!("主页简介响应缺少用户资料"))?;
+    let returned_user_id = match card.get("mid") {
+        Some(Value::String(id)) => public_profile_user_id(id)?,
+        Some(id) => id
+            .as_u64()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| anyhow!("主页简介来源 UID 无效"))?,
+        None => bail!("主页简介响应缺少来源 UID"),
+    };
+    if returned_user_id != requested_user_id {
+        bail!("主页简介来源与主播 UID 不一致");
+    }
+    let sign = card
+        .get("sign")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("主页简介响应缺少签名"))?;
+    let mut description: String = sign
+        .chars()
+        .filter(|ch| {
+            !ch.is_control() && !matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .skip_while(|ch| ch.is_whitespace())
+        .take(PUBLIC_PROFILE_DESCRIPTION_LIMIT)
+        .collect();
+    description.truncate(description.trim_end().len());
+    if description.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PublicProfile {
+        user_id: requested_user_id.to_string(),
+        description,
+        source_url: format!("https://space.bilibili.com/{requested_user_id}"),
+    }))
+}
+
+struct CachedPublicProfile {
+    expires_at: Instant,
+    result: std::result::Result<Option<PublicProfile>, String>,
+}
+
 #[derive(Clone)]
 pub struct BilibiliClient {
     http: reqwest::Client,
+    public_http: reqwest::Client,
+    public_profiles: Arc<Mutex<BTreeMap<u64, CachedPublicProfile>>>,
     device_identity: Arc<OnceCell<Option<DeviceIdentity>>>,
     session_path: PathBuf,
 }
@@ -152,11 +233,104 @@ impl BilibiliClient {
             .cookie_store(true)
             .timeout(Duration::from_secs(12))
             .build()?;
+        // Public requests must never inherit the live client's cookie jar.
+        let public_http = reqwest::Client::builder()
+            .user_agent(USER_AGENT_VALUE)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(8))
+            .build()?;
         Ok(Self {
             http,
+            public_http,
+            public_profiles: Arc::new(Mutex::new(BTreeMap::new())),
             device_identity: Arc::new(OnceCell::new()),
             session_path,
         })
+    }
+
+    pub async fn broadcaster_profile(&self, broadcaster_id: &str) -> Result<Option<PublicProfile>> {
+        self.broadcaster_profile_at(broadcaster_id, PUBLIC_PROFILE_ENDPOINT, Instant::now())
+            .await
+    }
+
+    async fn broadcaster_profile_at(
+        &self,
+        broadcaster_id: &str,
+        endpoint: &str,
+        now: Instant,
+    ) -> Result<Option<PublicProfile>> {
+        let user_id = public_profile_user_id(broadcaster_id)?;
+        {
+            let mut cache = self
+                .public_profiles
+                .lock()
+                .map_err(|_| anyhow!("主页简介缓存不可用"))?;
+            cache.retain(|_, entry| entry.expires_at > now);
+            if let Some(entry) = cache.get(&user_id) {
+                return entry.result.clone().map_err(anyhow::Error::msg);
+            }
+        }
+
+        let result = self.fetch_public_profile(user_id, endpoint).await;
+        let ttl = if result.is_ok() {
+            PUBLIC_PROFILE_TTL
+        } else {
+            PUBLIC_PROFILE_ERROR_TTL
+        };
+        let mut cache = self
+            .public_profiles
+            .lock()
+            .map_err(|_| anyhow!("主页简介缓存不可用"))?;
+        if cache.len() >= PUBLIC_PROFILE_CACHE_LIMIT
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(id, _)| *id)
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            user_id,
+            CachedPublicProfile {
+                expires_at: now + ttl,
+                result: result
+                    .as_ref()
+                    .map(Clone::clone)
+                    .map_err(|error| error.to_string()),
+            },
+        );
+        result
+    }
+
+    async fn fetch_public_profile(
+        &self,
+        user_id: u64,
+        endpoint: &str,
+    ) -> Result<Option<PublicProfile>> {
+        // The public card's sign is the homepage signature; description is unrelated.
+        // https://github.com/pskdje/bilibili-API-collect/blob/main/docs/user/info.md#用户名片信息
+        let mut response = self
+            .public_http
+            .get(endpoint)
+            .query(&[("mid", user_id)])
+            .header(ACCEPT, "application/json")
+            .send()
+            .await?
+            .error_for_status()?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > PUBLIC_PROFILE_RESPONSE_LIMIT as u64)
+        {
+            bail!("主页简介响应过大");
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if chunk.len() > PUBLIC_PROFILE_RESPONSE_LIMIT - body.len() {
+                bail!("主页简介响应过大");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        public_profile_from_response(&serde_json::from_slice(&body)?, user_id)
     }
 
     async fn device_identity(&self) -> Option<DeviceIdentity> {
@@ -566,13 +740,58 @@ fn realtime_frame_payload(message: &Message) -> Option<&[u8]> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccountStatus {
     SignedOut,
     SignedIn {
         display_name: String,
         user_id: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoomUpdateReceipt {
+    Applied {
+        canonical_room_id: String,
+    },
+    Pending {
+        canonical_room_id: String,
+        reason: Option<String>,
+    },
+    Rejected {
+        canonical_room_id: String,
+        reason: String,
+    },
+    Unknown {
+        canonical_room_id: String,
+        status: Option<i64>,
+        reason: Option<String>,
+    },
+}
+
+impl std::fmt::Display for RoomUpdateReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Applied { .. } => formatter.write_str("已更新"),
+            Self::Pending { reason, .. } => match reason.as_deref() {
+                Some(reason) => write!(formatter, "已提交审核：{reason}"),
+                None => formatter.write_str("已提交审核"),
+            },
+            Self::Rejected { reason, .. } => write!(formatter, "审核未通过：{reason}"),
+            Self::Unknown { status, reason, .. } => {
+                formatter.write_str("请求已受理，状态未知（")?;
+                match status {
+                    Some(status) => write!(formatter, "{status}"),
+                    None => formatter.write_str("未知"),
+                }?;
+                formatter.write_str("）")?;
+                if let Some(reason) = reason {
+                    write!(formatter, "：{reason}")?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -594,12 +813,27 @@ pub enum LoginPoll {
 struct Credential {
     cookie_header: String,
     csrf: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<AccountStatus>,
+}
+
+#[derive(Clone)]
+enum AccountStorage {
+    File(PathBuf),
+    Memory(Arc<Mutex<Option<Credential>>>),
 }
 
 #[derive(Clone)]
 pub struct AccountClient {
     http: reqwest::Client,
-    session_path: PathBuf,
+    storage: AccountStorage,
+    #[cfg(test)]
+    test_endpoint: Option<Url>,
+}
+impl std::fmt::Debug for AccountClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountClient").finish_non_exhaustive()
+    }
 }
 
 impl AccountClient {
@@ -609,14 +843,92 @@ impl AccountClient {
                 .user_agent(USER_AGENT_VALUE)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
-            session_path,
+            storage: AccountStorage::File(session_path),
+            #[cfg(test)]
+            test_endpoint: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_endpoint(mut self, endpoint: Url) -> Self {
+        self.test_endpoint = Some(endpoint);
+        self
+    }
+
+    fn endpoint(&self, endpoint: &'static str) -> std::borrow::Cow<'static, str> {
+        #[cfg(test)]
+        if let Some(base) = &self.test_endpoint {
+            let original = Url::parse(endpoint).expect("static account endpoint");
+            return base
+                .join(original.path())
+                .expect("test endpoint path")
+                .to_string()
+                .into();
+        }
+        endpoint.into()
+    }
+
+    pub(crate) fn session_path(&self) -> Option<&std::path::Path> {
+        match &self.storage {
+            AccountStorage::File(path) => Some(path),
+            AccountStorage::Memory(_) => None,
+        }
+    }
+
+    /// QR credentials remain in memory until the human confirms the displayed identity.
+    pub(crate) fn staged(&self) -> Self {
+        Self {
+            http: self.http.clone(),
+            storage: AccountStorage::Memory(Arc::default()),
+            #[cfg(test)]
+            test_endpoint: self.test_endpoint.clone(),
+        }
+    }
+
+    /// Pin before verification so replacing a session file cannot change the POST identity.
+    pub(crate) fn snapshot(&self) -> Result<Self> {
+        Ok(Self {
+            http: self.http.clone(),
+            storage: AccountStorage::Memory(Arc::new(Mutex::new(self.load_credential()?))),
+            #[cfg(test)]
+            test_endpoint: self.test_endpoint.clone(),
+        })
+    }
+
+    pub(crate) fn persist_to(&self, path: PathBuf) -> Result<Self> {
+        let credential = self.load_credential()?.context("没有可保存的登录态")?;
+        let account = Self {
+            http: self.http.clone(),
+            storage: AccountStorage::File(path),
+            #[cfg(test)]
+            test_endpoint: self.test_endpoint.clone(),
+        };
+        account.save_credential(&credential)?;
+        Ok(account)
+    }
+
+    pub(crate) fn cached_status(&self) -> Result<AccountStatus> {
+        let Some(credential) = self.load_credential()? else {
+            return Ok(AccountStatus::SignedOut);
+        };
+        Ok(credential.identity.unwrap_or_else(|| {
+            match cookie_value(&credential.cookie_header, "DedeUserID") {
+                Some(user_id) => AccountStatus::SignedIn {
+                    display_name: "已保存账号（待验证）".into(),
+                    user_id: user_id.into(),
+                },
+                None => AccountStatus::SignedOut,
+            }
+        }))
     }
 
     pub async fn login_challenge(&self) -> Result<LoginChallenge> {
         let value: Value = self
             .http
-            .get("https://passport.bilibili.com/x/passport-login/web/qrcode/generate")
+            .get(
+                self.endpoint("https://passport.bilibili.com/x/passport-login/web/qrcode/generate")
+                    .as_ref(),
+            )
             .send()
             .await?
             .error_for_status()?
@@ -641,7 +953,10 @@ impl AccountClient {
     pub async fn poll_login(&self, key: &str) -> Result<LoginPoll> {
         let response = self
             .http
-            .get("https://passport.bilibili.com/x/passport-login/web/qrcode/poll")
+            .get(
+                self.endpoint("https://passport.bilibili.com/x/passport-login/web/qrcode/poll")
+                    .as_ref(),
+            )
             .query(&[("qrcode_key", key)])
             .send()
             .await?
@@ -664,10 +979,15 @@ impl AccountClient {
             86090 => Ok(LoginPoll::Scanned),
             86038 => Ok(LoginPoll::Expired),
             0 => {
-                let credential = credential_from_cookies(&cookies)
+                let mut credential = credential_from_cookies(&cookies)
                     .ok_or_else(|| anyhow!("B 站登录成功但未返回完整凭据"))?;
+                let status = self.status_with_credential(&credential).await?;
+                if !matches!(status, AccountStatus::SignedIn { .. }) {
+                    bail!("登录态验证失败；原账号未更改");
+                }
+                credential.identity = Some(status.clone());
                 self.save_credential(&credential)?;
-                Ok(LoginPoll::SignedIn(self.status().await?))
+                Ok(LoginPoll::SignedIn(status))
             }
             code => bail!("B 站登录失败（{code}）"),
         }
@@ -751,9 +1071,16 @@ impl AccountClient {
         let Some(credential) = self.load_credential()? else {
             return Ok(AccountStatus::SignedOut);
         };
+        self.status_with_credential(&credential).await
+    }
+
+    async fn status_with_credential(&self, credential: &Credential) -> Result<AccountStatus> {
         let value: Value = self
             .http
-            .get("https://api.bilibili.com/x/web-interface/nav")
+            .get(
+                self.endpoint("https://api.bilibili.com/x/web-interface/nav")
+                    .as_ref(),
+            )
             .header(COOKIE, &credential.cookie_header)
             .header(REFERER, "https://www.bilibili.com")
             .send()
@@ -781,11 +1108,222 @@ impl AccountClient {
     }
 
     pub fn sign_out(&self) -> Result<()> {
-        match std::fs::remove_file(&self.session_path) {
+        let AccountStorage::File(path) = &self.storage else {
+            if let AccountStorage::Memory(credential) = &self.storage {
+                *credential.lock().map_err(|_| anyhow!("登录态锁不可用"))? = None;
+            }
+            return Ok(());
+        };
+        match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+
+    pub async fn update_room_title(&self, room_id: &str, title: &str) -> Result<RoomUpdateReceipt> {
+        let title = title.trim();
+        let length = unicode_segmentation::UnicodeSegmentation::graphemes(title, true).count();
+        if title.is_empty() {
+            bail!("直播间标题不能为空");
+        }
+        if length > ROOM_TITLE_LIMIT {
+            bail!("直播间标题不能超过 {ROOM_TITLE_LIMIT} 个字");
+        }
+
+        let pinned = self.snapshot()?;
+        let canonical_room_id = pinned.verify_room_owner(room_id).await?;
+        let credential = pinned
+            .load_credential()?
+            .ok_or_else(|| anyhow!("还没有 B 站登录态"))?;
+        let value: Value = pinned
+            .http
+            .post(
+                pinned
+                    .endpoint("https://api.live.bilibili.com/room/v1/Room/update")
+                    .as_ref(),
+            )
+            .header(ORIGIN, "https://live.bilibili.com")
+            .header(
+                REFERER,
+                format!("https://live.bilibili.com/{canonical_room_id}"),
+            )
+            .header(COOKIE, &credential.cookie_header)
+            .form(&[
+                ("room_id", canonical_room_id.as_str()),
+                ("title", title),
+                ("platform", "web"),
+                ("csrf", credential.csrf.as_str()),
+                ("csrf_token", credential.csrf.as_str()),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        ensure_code_zero(&value, "更新直播间标题失败")?;
+        room_update_receipt(&value, canonical_room_id)
+    }
+
+    pub async fn update_room_cover(&self, room_id: &str, path: &Path) -> Result<RoomUpdateReceipt> {
+        use std::io::Read as _;
+
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("无法读取封面：{}", path.display()))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            bail!("封面路径不是文件");
+        }
+        if metadata.len() == 0 {
+            bail!("封面文件为空");
+        }
+        if metadata.len() > ROOM_COVER_LIMIT_BYTES {
+            bail!("封面不能超过 2 MiB");
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.by_ref()
+            .take(ROOM_COVER_LIMIT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > ROOM_COVER_LIMIT_BYTES {
+            bail!("封面不能超过 2 MiB");
+        }
+        let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "image/png"
+        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            "image/jpeg"
+        } else {
+            bail!("封面只支持 PNG 或 JPEG 图片");
+        };
+
+        let pinned = self.snapshot()?;
+        let canonical_room_id = pinned.verify_room_owner(room_id).await?;
+        let credential = pinned
+            .load_credential()?
+            .ok_or_else(|| anyhow!("还没有 B 站登录态"))?;
+        let file_name =
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(if mime == "image/png" {
+                    "cover.png"
+                } else {
+                    "cover.jpg"
+                });
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(file_name.to_owned())
+            .mime_str(mime)?;
+        let upload: Value = pinned
+            .http
+            .post(
+                pinned
+                    .endpoint("https://api.bilibili.com/x/upload/web/image")
+                    .as_ref(),
+            )
+            .header(ORIGIN, "https://live.bilibili.com")
+            .header(
+                REFERER,
+                format!("https://live.bilibili.com/{canonical_room_id}"),
+            )
+            .header(COOKIE, &credential.cookie_header)
+            .query(&[("csrf", credential.csrf.as_str())])
+            .multipart(
+                reqwest::multipart::Form::new()
+                    .text("bucket", "live")
+                    .text("dir", "new_room_cover")
+                    .part("file", part),
+            )
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        ensure_code_zero(&upload, "上传直播间封面失败")?;
+        let location = upload
+            .pointer("/data/location")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("B 站未返回封面地址"))?;
+        let location_url = Url::parse(location).context("B 站返回了无效封面地址")?;
+        let trusted_host = location_url
+            .host_str()
+            .is_some_and(|host| host == "hdslb.com" || host.ends_with(".hdslb.com"));
+        if location_url.scheme() != "https" || !trusted_host {
+            bail!("B 站返回了不受信任的封面地址");
+        }
+
+        let value: Value = pinned
+            .http
+            .post(
+                pinned
+                    .endpoint("https://api.live.bilibili.com/xlive/app-blink/v1/preLive/UpdatePreLiveInfo")
+                    .as_ref(),
+            )
+            .header(ORIGIN, "https://live.bilibili.com")
+            .header(REFERER, format!("https://live.bilibili.com/{canonical_room_id}"))
+            .header(COOKIE, &credential.cookie_header)
+            .form(&[
+                ("platform", "web"),
+                ("mobi_app", "web"),
+                ("build", "1"),
+                ("room_id", canonical_room_id.as_str()),
+                ("cover", location),
+                ("coverVertical", ""),
+                ("liveDirectionType", "1"),
+                ("visit_id", ""),
+                ("csrf", credential.csrf.as_str()),
+                ("csrf_token", credential.csrf.as_str()),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        ensure_code_zero(&value, "更新直播间封面失败")?;
+        room_update_receipt(&value, canonical_room_id)
+    }
+
+    async fn verify_room_owner(&self, room_id: &str) -> Result<String> {
+        let requested_room_id = room_id
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow!("直播间号无效"))?
+            .to_string();
+        let credential = self
+            .load_credential()?
+            .ok_or_else(|| anyhow!("还没有 B 站登录态"))?;
+        let account_id = match self.status_with_credential(&credential).await? {
+            AccountStatus::SignedIn { user_id, .. } => user_id,
+            AccountStatus::SignedOut => bail!("B 站登录态已失效"),
+        };
+        let value: Value = self
+            .http
+            .get(
+                self.endpoint("https://api.live.bilibili.com/room/v1/Room/room_init")
+                    .as_ref(),
+            )
+            .header(COOKIE, &credential.cookie_header)
+            .header(
+                REFERER,
+                format!("https://live.bilibili.com/{requested_room_id}"),
+            )
+            .query(&[("id", requested_room_id.as_str())])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        ensure_code_zero(&value, "核验直播间归属失败")?;
+        let canonical_room_id = string_value(value.pointer("/data/room_id"))
+            .filter(|value| value != "0")
+            .ok_or_else(|| anyhow!("B 站未返回有效直播间号"))?;
+        let broadcaster_id = string_value(value.pointer("/data/uid"))
+            .filter(|value| value != "0")
+            .ok_or_else(|| anyhow!("B 站未返回直播间主播账号"))?;
+        if broadcaster_id != account_id {
+            bail!("当前 B 站账号不是该直播间主播，未执行修改");
+        }
+        Ok(canonical_room_id)
     }
 
     pub async fn send_danmu(
@@ -793,7 +1331,8 @@ impl AccountClient {
         message: &str,
         room_id: &str,
         reply_to: Option<&str>,
-    ) -> Result<()> {
+        authorized: impl Fn() -> bool + Send,
+    ) -> Result<Option<DanmuResponse>> {
         let credential = self
             .load_credential()?
             .ok_or_else(|| anyhow!("还没有 B 站登录态"))?;
@@ -825,46 +1364,98 @@ impl AccountClient {
             ("csrf", &credential.csrf),
             ("csrf_token", &credential.csrf),
         ];
-        let value: Value = self
+        let request = self
             .http
-            .post("https://api.live.bilibili.com/msg/send")
+            .post(
+                self.endpoint("https://api.live.bilibili.com/msg/send")
+                    .as_ref(),
+            )
             .header(ORIGIN, "https://live.bilibili.com")
             .header(REFERER, format!("https://live.bilibili.com/{room_id}"))
             .header(COOKIE, &credential.cookie_header)
-            .form(&form)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        ensure_danmu_accepted(&value, message)
+            .form(&form);
+        if !authorized() {
+            return Ok(None);
+        }
+        // No await separates the final authorization check from starting this pinned POST.
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            return Ok(Some(DanmuResponse::UncertainResponse {
+                authentication_failed: matches!(response.status().as_u16(), 401 | 403),
+                detail: format!(
+                    "HTTP {}响应已收到，但业务结果不明；不自动重发",
+                    response.status()
+                ),
+            }));
+        }
+        let value = match response.json::<Value>().await {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Some(DanmuResponse::UncertainResponse {
+                    authentication_failed: false,
+                    detail: format!(
+                        "已收到响应头，响应体读取或解析失败：{error}；结果未知，不自动重发"
+                    ),
+                }));
+            }
+        };
+        Ok(Some(classify_danmu_response(&value, message)))
     }
 
     fn load_credential(&self) -> Result<Option<Credential>> {
-        load_credential(&self.session_path)
+        match &self.storage {
+            AccountStorage::File(path) => load_credential(path),
+            AccountStorage::Memory(value) => {
+                Ok(value.lock().map_err(|_| anyhow!("登录态锁不可用"))?.clone())
+            }
+        }
     }
 
     fn save_credential(&self, credential: &Credential) -> Result<()> {
-        if let Some(parent) = self.session_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        match &self.storage {
+            AccountStorage::File(path) => {
+                crate::storage::write_private_atomic(path, &serde_json::to_vec_pretty(credential)?)
+            }
+            AccountStorage::Memory(value) => {
+                *value.lock().map_err(|_| anyhow!("登录态锁不可用"))? = Some(credential.clone());
+                Ok(())
+            }
         }
-        let data = serde_json::to_vec_pretty(credential)?;
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&self.session_path)?;
-            file.write_all(&data)?;
-        }
-        #[cfg(not(unix))]
-        std::fs::write(&self.session_path, data)?;
-        Ok(())
     }
+}
+
+fn room_update_receipt(value: &Value, canonical_room_id: String) -> Result<RoomUpdateReceipt> {
+    let audit = value.pointer("/data/audit_info");
+    let status = audit
+        .and_then(|value| value.get("audit_title_status"))
+        .and_then(Value::as_i64);
+    let reason = audit
+        .and_then(|value| value.get("audit_title_reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let rejected = reason.as_deref().is_some_and(|reason| {
+        ["拒绝", "驳回", "不通过", "未通过"]
+            .iter()
+            .any(|word| reason.contains(word))
+    });
+    Ok(match (status, rejected) {
+        (_, true) => RoomUpdateReceipt::Rejected {
+            canonical_room_id,
+            reason: reason.expect("rejected receipt has a reason"),
+        },
+        (Some(0), false) => RoomUpdateReceipt::Applied { canonical_room_id },
+        (Some(status), false) if status > 0 => RoomUpdateReceipt::Pending {
+            canonical_room_id,
+            reason,
+        },
+        (status, false) => RoomUpdateReceipt::Unknown {
+            canonical_room_id,
+            status,
+            reason,
+        },
+    })
 }
 
 fn load_credential(path: &PathBuf) -> Result<Option<Credential>> {
@@ -973,6 +1564,7 @@ fn credential_from_cookies(headers: &[String]) -> Option<Credential> {
     Some(Credential {
         cookie_header: pairs.join("; "),
         csrf,
+        identity: None,
     })
 }
 
@@ -1089,28 +1681,76 @@ fn online_viewer_count_from_response(value: &Value) -> Result<u64> {
         .and_then(Value::as_u64)
         .ok_or_else(|| anyhow!("B 站未返回有效在线人数"))
 }
-fn ensure_danmu_accepted(value: &Value, requested_message: &str) -> Result<()> {
-    ensure_code_zero(value, "发送弹幕失败")?;
-    let extra = value
-        .pointer("/data/mode_info/extra")
-        .ok_or_else(|| anyhow!("B 站未返回弹幕发送凭据，消息可能被风控拦截"))?;
-    let proof = match extra {
-        Value::String(value) => serde_json::from_str::<Value>(value)
-            .map_err(|error| anyhow!("B 站弹幕发送凭据格式无效：{error}"))?,
-        Value::Object(_) => extra.clone(),
-        _ => bail!("B 站未返回弹幕发送凭据，消息可能被风控拦截"),
+#[derive(Debug)]
+pub enum DanmuResponse {
+    UncertainResponse {
+        detail: String,
+        authentication_failed: bool,
+    },
+    Responded {
+        proof: bool,
+        detail: String,
+    },
+    ContentRejected {
+        code: i64,
+        message: String,
+    },
+    Rejected {
+        code: i64,
+        message: String,
+    },
+}
+fn classify_danmu_response(value: &Value, requested_message: &str) -> DanmuResponse {
+    let Some(code) = value.get("code").and_then(Value::as_i64) else {
+        return DanmuResponse::UncertainResponse {
+            authentication_failed: false,
+            detail: "响应已收到但缺少业务状态码；结果未知，不自动重发".into(),
+        };
     };
-    if proof.get("send_from_me").and_then(Value::as_bool) != Some(true) {
-        bail!("B 站未确认该弹幕由当前账号发出");
-    }
-    let accepted_content = proof
-        .get("content")
+    let message = value
+        .get("message")
+        .or_else(|| value.get("msg"))
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("B 站弹幕发送凭据缺少消息内容"))?;
-    if accepted_content != requested_message {
-        bail!("B 站返回的弹幕内容与请求不一致");
+        .unwrap_or("");
+    // Only explicit content evidence in the decoded platform response, never network error text.
+    let content_rejection = ["屏蔽词", "敏感词", "内容违规", "内容被拒绝"]
+        .iter()
+        .any(|word| message.contains(word));
+    if content_rejection {
+        return DanmuResponse::ContentRejected {
+            code,
+            message: message.into(),
+        };
     }
-    Ok(())
+    if code != 0 {
+        return DanmuResponse::Rejected {
+            code,
+            message: message.into(),
+        };
+    }
+    let extra = value.pointer("/data/mode_info/extra");
+    let decoded = extra
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let proof = decoded.as_ref().or(extra);
+    let detail = match proof {
+        Some(proof) if proof.get("send_from_me").and_then(Value::as_bool) != Some(true) => {
+            "响应已收到，凭据未确认当前账号"
+        }
+        Some(proof) if proof.get("content").and_then(Value::as_str) != Some(requested_message) => {
+            "响应已收到，凭据内容与请求不一致或缺失"
+        }
+        Some(_) => "响应已收到，发送凭据匹配；仍须真实回显",
+        None => "响应已收到，无发送凭据；仍等待真实回显",
+    };
+    let accepted = proof.is_some_and(|p| {
+        p.get("send_from_me").and_then(Value::as_bool) == Some(true)
+            && p.get("content").and_then(Value::as_str) == Some(requested_message)
+    });
+    DanmuResponse::Responded {
+        proof: accepted,
+        detail: detail.into(),
+    }
 }
 
 fn ensure_code_zero(value: &Value, fallback: &str) -> Result<()> {
@@ -1188,6 +1828,670 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use crate::bilibili::parser::SEND_GIFT_V2_FIXTURE;
+
+    async fn account_server(responses: Vec<String>) -> (Url, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0; 1024];
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    assert!(count > 0 && request.len() + count <= 16384);
+                    request.extend_from_slice(&bytes[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&request[..end]);
+                        let length = header
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (base, task)
+    }
+
+    fn account_poll_response() -> String {
+        let body = r#"{"code":0,"data":{"code":0}}"#;
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: SESSDATA=assistant-secret; Path=/\r\nSet-Cookie: bili_jct=assistant-csrf; Path=/\r\nSet-Cookie: DedeUserID=22; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn account_fixture(uid: &str) -> Credential {
+        Credential {
+            cookie_header: format!("SESSDATA=secret-{uid}; bili_jct=csrf-{uid}; DedeUserID={uid}"),
+            csrf: format!("csrf-{uid}"),
+            identity: Some(AccountStatus::SignedIn {
+                display_name: format!("用户{uid}"),
+                user_id: uid.into(),
+            }),
+        }
+    }
+
+    fn room_nav_response(uid: u64) -> String {
+        public_profile_http_response(&format!(
+            r#"{{"code":0,"data":{{"isLogin":true,"uname":"用户{uid}","mid":{uid}}}}}"#
+        ))
+    }
+
+    fn room_owner_response(room_id: u64, uid: u64) -> String {
+        public_profile_http_response(&format!(
+            r#"{{"code":0,"data":{{"room_id":{room_id},"uid":{uid}}}}}"#
+        ))
+    }
+
+    fn room_editor(base: Url, path: PathBuf) -> AccountClient {
+        let mut account = AccountClient::new(path).unwrap();
+        account.test_endpoint = Some(base);
+        account.save_credential(&account_fixture("11")).unwrap();
+        account
+    }
+
+    fn write_test_cover(path: &Path) {
+        std::fs::write(path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+    }
+
+    #[test]
+    fn room_update_receipts_never_claim_unknown_or_rejected_applied() {
+        let unknown = room_update_receipt(&json!({"code": 0, "data": {}}), "9".into()).unwrap();
+        assert!(matches!(
+            unknown,
+            RoomUpdateReceipt::Unknown { status: None, .. }
+        ));
+        let rejected = room_update_receipt(
+            &json!({"code": 0, "data": {"audit_info": {
+                "audit_title_status": 1,
+                "audit_title_reason": "内容审核不通过"
+            }}}),
+            "9".into(),
+        )
+        .unwrap();
+        assert!(
+            matches!(rejected, RoomUpdateReceipt::Rejected { reason, .. } if reason == "内容审核不通过")
+        );
+    }
+
+    #[tokio::test]
+    async fn room_ownership_check_prevents_any_write() {
+        let (base, server) =
+            account_server(vec![room_nav_response(11), room_owner_response(9001, 22)]).await;
+        let temp = tempfile::tempdir().unwrap();
+        let account = room_editor(base, temp.path().join("account.json"));
+
+        let error = account
+            .update_room_title("123", "新标题")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("不是该直播间主播"));
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
+        assert!(requests[1].starts_with("GET /room/v1/Room/room_init?id=123 "));
+    }
+
+    #[tokio::test]
+    async fn room_title_update_uses_canonical_room_csrf_cookie_and_form_encoding() {
+        let (base, server) = account_server(vec![
+            room_nav_response(11),
+            room_owner_response(9001, 11),
+            public_profile_http_response(
+                r#"{"code":0,"data":{"audit_info":{"audit_title_status":0,"audit_title_reason":""}}}"#,
+            ),
+        ])
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let account = room_editor(base, temp.path().join("account.json"));
+
+        let receipt = account.update_room_title("123", "甲 &乙").await.unwrap();
+        assert_eq!(
+            receipt,
+            RoomUpdateReceipt::Applied {
+                canonical_room_id: "9001".into()
+            }
+        );
+        let requests = server.await.unwrap();
+        let write = &requests[2];
+        assert!(write.starts_with("POST /room/v1/Room/update "));
+        assert!(
+            write
+                .to_ascii_lowercase()
+                .contains("cookie: sessdata=secret-11; bili_jct=csrf-11; dedeuserid=11")
+        );
+        assert!(write.contains("room_id=9001"));
+        assert!(write.contains("title=%E7%94%B2+%26%E4%B9%99"));
+        assert!(write.contains("csrf=csrf-11"));
+        assert!(write.contains("csrf_token=csrf-11"));
+    }
+
+    #[tokio::test]
+    async fn room_cover_rejects_invalid_file_before_network() {
+        let (base, server) = account_server(Vec::new()).await;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cover.txt");
+        std::fs::write(&path, b"not an image").unwrap();
+        let account = room_editor(base, temp.path().join("account.json"));
+
+        let error = account.update_room_cover("123", &path).await.unwrap_err();
+        assert!(error.to_string().contains("PNG 或 JPEG"));
+        let oversized = temp.path().join("oversized.png");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(ROOM_COVER_LIMIT_BYTES + 1).unwrap();
+        let error = account
+            .update_room_cover("123", &oversized)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("2 MiB"));
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn room_cover_upload_failure_does_not_attempt_update() {
+        let (base, server) = account_server(vec![
+            room_nav_response(11),
+            room_owner_response(9001, 11),
+            public_profile_http_response(r#"{"code":1001,"message":"上传被拒绝"}"#),
+        ])
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cover.png");
+        write_test_cover(&path);
+        let account = room_editor(base, temp.path().join("account.json"));
+
+        let error = account.update_room_cover("123", &path).await.unwrap_err();
+        assert!(error.to_string().contains("上传被拒绝"));
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].starts_with("POST /x/upload/web/image?csrf=csrf-11 "));
+        assert!(requests[2].contains("name=\"bucket\""));
+        assert!(requests[2].contains("name=\"dir\""));
+        assert!(requests[2].contains("name=\"file\"; filename=\"cover.png\""));
+        assert!(requests[2].contains("Content-Type: image/png"));
+    }
+
+    #[tokio::test]
+    async fn room_cover_update_failure_propagates_after_upload() {
+        let (base, server) = account_server(vec![
+            room_nav_response(11),
+            room_owner_response(9001, 11),
+            public_profile_http_response(
+                r#"{"code":0,"data":{"location":"https://i0.hdslb.com/bfs/live/cover.png"}}"#,
+            ),
+            public_profile_http_response(r#"{"code":100402,"message":"图片地址不合法"}"#),
+        ])
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cover.png");
+        write_test_cover(&path);
+        let account = room_editor(base, temp.path().join("account.json"));
+
+        let error = account.update_room_cover("123", &path).await.unwrap_err();
+        assert!(error.to_string().contains("图片地址不合法"));
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[3].starts_with("POST /xlive/app-blink/v1/preLive/UpdatePreLiveInfo "));
+    }
+
+    #[tokio::test]
+    async fn room_cover_success_reports_pending_audit_truthfully() {
+        let (base, server) = account_server(vec![
+            room_nav_response(11),
+            room_owner_response(9001, 11),
+            public_profile_http_response(
+                r#"{"code":0,"data":{"location":"https://i0.hdslb.com/bfs/live/cover.png"}}"#,
+            ),
+            public_profile_http_response(
+                r#"{"code":0,"data":{"audit_info":{"audit_title_status":2,"audit_title_reason":"先发后审"}}}"#,
+            ),
+        ])
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cover.png");
+        write_test_cover(&path);
+        let account = room_editor(base, temp.path().join("account.json"));
+
+        let receipt = account.update_room_cover("123", &path).await.unwrap();
+        assert_eq!(
+            receipt,
+            RoomUpdateReceipt::Pending {
+                canonical_room_id: "9001".into(),
+                reason: Some("先发后审".into())
+            }
+        );
+        let requests = server.await.unwrap();
+        let update = &requests[3];
+        assert!(update.contains("room_id=9001"));
+        assert!(update.contains("cover=https%3A%2F%2Fi0.hdslb.com%2Fbfs%2Flive%2Fcover.png"));
+        assert!(update.contains("csrf=csrf-11"));
+        assert!(update.contains("csrf_token=csrf-11"));
+    }
+
+    #[tokio::test]
+    async fn account_isolation_real_qr_preflight_and_pinned_post() {
+        let (base, server) = account_server(vec![
+            public_profile_http_response(r#"{"code":0,"data":{"qrcode_key":"qr-token","url":"https://passport.bilibili.com/qr-test"}}"#),
+            account_poll_response(),
+            public_profile_http_response(r#"{"code":0,"data":{"isLogin":true,"uname":"助手测试","mid":22}}"#),
+            public_profile_http_response(r#"{"code":0,"message":""}"#),
+        ]).await;
+        let temp = tempfile::tempdir().unwrap();
+        let main_path = temp.path().join("main.json");
+        let mut main = AccountClient::new(main_path.clone()).unwrap();
+        main.test_endpoint = Some(base);
+        main.save_credential(&account_fixture("11")).unwrap();
+        let original = std::fs::read(&main_path).unwrap();
+        let staged = main.staged();
+        let challenge = staged.login_challenge().await.unwrap();
+        assert_eq!(challenge.key, "qr-token");
+        let login = staged.poll_login(&challenge.key).await.unwrap();
+        assert!(
+            matches!(login, LoginPoll::SignedIn(AccountStatus::SignedIn { user_id, .. }) if user_id == "22")
+        );
+        assert_eq!(std::fs::read(&main_path).unwrap(), original);
+        let independent = staged
+            .persist_to(temp.path().join("independent.json"))
+            .unwrap();
+        let pinned = independent.snapshot().unwrap();
+        // Neither replacement nor logout changes the identity pinned before the POST.
+        independent.save_credential(&account_fixture("33")).unwrap();
+        independent.sign_out().unwrap();
+        assert!(
+            pinned
+                .send_danmu("不应发送", "1", None, || false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            pinned
+                .send_danmu("隔离测试", "1", Some("44"), || true)
+                .await
+                .unwrap(),
+            Some(DanmuResponse::Responded { .. })
+        ));
+        let requests = server.await.unwrap();
+        assert!(requests[0].starts_with("GET /x/passport-login/web/qrcode/generate "));
+        assert!(
+            requests[1].starts_with("GET /x/passport-login/web/qrcode/poll?qrcode_key=qr-token ")
+        );
+        assert!(
+            !requests[0].to_lowercase().contains("cookie:")
+                && !requests[1].to_lowercase().contains("cookie:")
+        );
+        assert!(requests[2].contains("SESSDATA=assistant-secret"));
+        let post = &requests[3];
+        assert!(post.starts_with("POST /msg/send "));
+        assert!(
+            post.contains("SESSDATA=assistant-secret")
+                && post.contains("csrf=assistant-csrf")
+                && post.contains("reply_mid=44")
+        );
+        assert!(!post.contains("secret-11") && !post.contains("secret-33"));
+        assert_eq!(std::fs::read(&main_path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn account_isolation_failed_login_keeps_original_file() {
+        let (base, server) = account_server(vec![
+            account_poll_response(),
+            public_profile_http_response(r#"{"code":-101,"data":{"isLogin":false}}"#),
+        ])
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("account.json");
+        let mut account = AccountClient::new(path.clone()).unwrap();
+        account.test_endpoint = Some(base);
+        account.save_credential(&account_fixture("11")).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(account.poll_login("failed").await.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn account_isolation_post_authentication_loss_is_uncertain_and_revocable() {
+        let (base, server) = account_server(vec![
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        ])
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let mut account = AccountClient::new(temp.path().join("account.json")).unwrap();
+        account.test_endpoint = Some(base);
+        account.save_credential(&account_fixture("22")).unwrap();
+        assert!(matches!(
+            account
+                .send_danmu("鉴权边界", "1", None, || true)
+                .await
+                .unwrap(),
+            Some(DanmuResponse::UncertainResponse {
+                authentication_failed: true,
+                ..
+            })
+        ));
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    fn public_profile_card(uid: u64, sign: &str) -> String {
+        json!({"code": 0, "data": {"card": {"mid": uid.to_string(), "sign": sign}}}).to_string()
+    }
+
+    fn public_profile_http_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn public_profile_server(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}/card", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 1024];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0 && request.len() + count <= 8192);
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(!request.to_ascii_lowercase().contains("\r\ncookie:"));
+                assert!(!request.to_ascii_lowercase().contains("\r\nauthorization:"));
+                requests.push(request.lines().next().unwrap().to_owned());
+                // A size-limited consumer may close before consuming the whole body.
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    fn public_profile_test_client() -> BilibiliClient {
+        let mut client =
+            BilibiliClient::new(PathBuf::from("/nonexistent/public-profile-session")).unwrap();
+        client.public_http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        client
+    }
+
+    #[test]
+    fn public_profile_parses_signature_with_verified_source_and_safe_text() {
+        let value = json!({"code": 0, "data": {"card": {
+            "mid": "42", "sign": " \u{1b}知识\n分享\u{202e} \t", "description": "不应读取的字段"
+        }}});
+        assert_eq!(
+            public_profile_from_response(&value, 42).unwrap(),
+            Some(PublicProfile {
+                user_id: "42".into(),
+                description: "知识分享".into(),
+                source_url: "https://space.bilibili.com/42".into(),
+            })
+        );
+        let long = json!({"code": 0, "data": {"card": {"mid": 42, "sign": "知".repeat(513)}}});
+        assert_eq!(
+            public_profile_from_response(&long, 42)
+                .unwrap()
+                .unwrap()
+                .description,
+            "知".repeat(512)
+        );
+        let empty = json!({"code": 0, "data": {"card": {"mid": "42", "sign": " \n\u{0}\u{202e}"}}});
+        assert_eq!(public_profile_from_response(&empty, 42).unwrap(), None);
+    }
+
+    #[test]
+    fn public_profile_rejects_unverified_or_malformed_sources() {
+        for invalid in [
+            "",
+            "0",
+            "-42",
+            "+42",
+            "42/other",
+            " 42",
+            "４２",
+            "18446744073709551616",
+        ] {
+            assert!(public_profile_user_id(invalid).is_err(), "{invalid:?}");
+        }
+        for value in [
+            json!({"code": -412}),
+            json!({"data": {"card": {"mid": "42", "sign": "简介"}}}),
+            json!({"code": 0, "data": null}),
+            json!({"code": 0, "data": {"card": {"sign": "简介"}}}),
+            json!({"code": 0, "data": {"card": {"mid": "43", "sign": "简介"}}}),
+            json!({"code": 0, "data": {"card": {"mid": "42", "sign": null}}}),
+        ] {
+            assert!(public_profile_from_response(&value, 42).is_err(), "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_profile_cache_shares_clones_isolates_uids_and_expires() {
+        let bodies = [
+            public_profile_card(42, "甲"),
+            public_profile_card(43, "乙"),
+            public_profile_card(42, "更新"),
+        ];
+        let (url, server) = public_profile_server(
+            bodies
+                .iter()
+                .map(|body| public_profile_http_response(body))
+                .collect(),
+        )
+        .await;
+        let client = public_profile_test_client();
+        let clone = client.clone();
+        let now = Instant::now();
+        let first = client
+            .broadcaster_profile_at("42", &url, now)
+            .await
+            .unwrap();
+        let second = clone
+            .broadcaster_profile_at("43", &url, now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.description, "乙");
+        assert_eq!(second.source_url, "https://space.bilibili.com/43");
+        assert_eq!(
+            clone
+                .broadcaster_profile_at(
+                    "00042",
+                    &url,
+                    now + PUBLIC_PROFILE_TTL - Duration::from_nanos(1)
+                )
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            client
+                .broadcaster_profile_at("42", &url, now + PUBLIC_PROFILE_TTL)
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            "更新"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            [
+                "GET /card?mid=42 HTTP/1.1",
+                "GET /card?mid=43 HTTP/1.1",
+                "GET /card?mid=42 HTTP/1.1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn public_profile_caches_errors_and_empty_profiles_with_separate_ttls() {
+        let bodies = [
+            json!({"code": -412}).to_string(),
+            public_profile_card(42, ""),
+            public_profile_card(42, "恢复"),
+        ];
+        let (url, server) = public_profile_server(
+            bodies
+                .iter()
+                .map(|body| public_profile_http_response(body))
+                .collect(),
+        )
+        .await;
+        let client = public_profile_test_client();
+        let now = Instant::now();
+        assert!(
+            client
+                .broadcaster_profile_at("42", &url, now)
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .clone()
+                .broadcaster_profile_at(
+                    "42",
+                    &url,
+                    now + PUBLIC_PROFILE_ERROR_TTL - Duration::from_nanos(1)
+                )
+                .await
+                .is_err()
+        );
+        let recovered = now + PUBLIC_PROFILE_ERROR_TTL;
+        assert_eq!(
+            client
+                .broadcaster_profile_at("42", &url, recovered)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            client
+                .broadcaster_profile_at(
+                    "42",
+                    &url,
+                    recovered + PUBLIC_PROFILE_TTL - Duration::from_nanos(1)
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            client
+                .broadcaster_profile_at("42", &url, recovered + PUBLIC_PROFILE_TTL)
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            "恢复"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            vec!["GET /card?mid=42 HTTP/1.1"; 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn public_profile_cache_evicts_when_bounded_capacity_is_reached() {
+        let responses = (1..=PUBLIC_PROFILE_CACHE_LIMIT + 1)
+            .map(|uid| public_profile_http_response(&public_profile_card(uid as u64, "初始")))
+            .chain(std::iter::once(public_profile_http_response(
+                &public_profile_card(1, "重新请求"),
+            )))
+            .collect();
+        let (url, server) = public_profile_server(responses).await;
+        let client = public_profile_test_client();
+        let now = Instant::now();
+        for uid in 1..=PUBLIC_PROFILE_CACHE_LIMIT + 1 {
+            assert_eq!(
+                client
+                    .broadcaster_profile_at(&uid.to_string(), &url, now)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .description,
+                "初始"
+            );
+        }
+        assert_eq!(
+            client
+                .broadcaster_profile_at("1", &url, now)
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            "重新请求"
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_profile_rejects_oversized_http_bodies_and_redirects() {
+        let oversized = "x".repeat(PUBLIC_PROFILE_RESPONSE_LIMIT + 1);
+        let responses = vec![
+            public_profile_http_response(&oversized),
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{oversized}\r\n0\r\n\r\n", oversized.len()),
+            "HTTP/1.1 302 Found\r\nLocation: https://space.bilibili.com/42\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+        ];
+        let (url, server) = public_profile_server(responses).await;
+        let client = public_profile_test_client();
+        for uid in ["42", "43", "44"] {
+            assert!(
+                client
+                    .broadcaster_profile_at(uid, &url, Instant::now())
+                    .await
+                    .is_err()
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn treats_tls_unexpected_eof_as_a_recoverable_disconnect() {
@@ -1305,6 +2609,7 @@ mod tests {
         let credential = Credential {
             cookie_header: "SESSDATA=secret; bili_jct=csrf; DedeUserID=42".into(),
             csrf: "csrf".into(),
+            identity: None,
         };
         let cookie_header = realtime_cookie_header(Some(&credential), Some(&identity)).unwrap();
         let payload = realtime_auth_payload(392612, "token", Some(&credential), Some(&identity));
@@ -1489,49 +2794,37 @@ mod tests {
         assert!(error.to_string().contains("未知直播状态"));
     }
     #[test]
-    fn danmu_send_requires_server_delivery_proof() {
-        let error = ensure_danmu_accepted(
-            &json!({"code": 0, "message": "0", "data": null}),
-            "测试弹幕",
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("未返回弹幕发送凭据"));
+    fn danmu_response_without_or_mismatched_proof_still_waits_for_echo() {
+        for response in [
+            json!({"code":0,"data":null}),
+            json!({"code":0,"data":{"mode_info":{"extra":"{\"content\":\"other\",\"send_from_me\":true}"}}}),
+        ] {
+            assert!(matches!(
+                classify_danmu_response(&response, "正文"),
+                DanmuResponse::Responded { proof: false, .. }
+            ));
+        }
+        assert!(matches!(
+            classify_danmu_response(
+                &json!({"code":0,"data":{"mode_info":{"extra":{"content":"正文","send_from_me":true}}}}),
+                "正文"
+            ),
+            DanmuResponse::Responded { proof: true, .. }
+        ));
     }
-
     #[test]
-    fn danmu_send_accepts_matching_server_delivery_proof() {
-        let response = json!({
-            "code": 0,
-            "message": "0",
-            "data": {
-                "mode_info": {
-                    "extra": serde_json::to_string(&json!({
-                        "content": "测试弹幕",
-                        "send_from_me": true,
-                        "is_audited": false,
-                        "id_str": "123"
-                    }))
-                    .unwrap()
-                }
-            }
-        });
-
-        ensure_danmu_accepted(&response, "测试弹幕").unwrap();
-    }
-
-    #[test]
-    fn danmu_send_rejects_mismatched_delivery_proof() {
-        let response = json!({
-            "code": 0,
-            "data": {
-                "mode_info": {
-                    "extra": "{\"content\":\"另一条弹幕\",\"send_from_me\":true}"
-                }
-            }
-        });
-
-        let error = ensure_danmu_accepted(&response, "测试弹幕").unwrap_err();
-        assert!(error.to_string().contains("内容与请求不一致"));
+    fn only_platform_content_evidence_is_repairable_rejection() {
+        assert!(matches!(
+            classify_danmu_response(&json!({"code":100,"message":"内容违规"}), "正文"),
+            DanmuResponse::ContentRejected { code: 100, .. }
+        ));
+        assert!(matches!(
+            classify_danmu_response(&json!({"code":-101,"message":"账号未登录"}), "正文"),
+            DanmuResponse::Rejected { code: -101, .. }
+        ));
+        assert!(matches!(
+            classify_danmu_response(&json!({"message":"敏感词"}), "正文"),
+            DanmuResponse::UncertainResponse { .. }
+        ));
     }
 }
