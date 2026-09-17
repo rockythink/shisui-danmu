@@ -1299,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_copy_ignores_a_concurrently_appended_partial_tail_and_rejects_rewrites() {
+    fn workspace_copy_ignores_a_partial_tail_and_rejects_rewrites() {
         let root = tempfile::tempdir().unwrap();
         let private = root.path().join("private");
         let journal = SessionJournal::new(private.clone());
@@ -1317,25 +1317,12 @@ mod tests {
         .unwrap();
         let midpoint = record.len() / 2;
         let mut file = OpenOptions::new().append(true).open(&source).unwrap();
-        file.lock_exclusive().unwrap();
         file.write_all(&record[..midpoint]).unwrap();
         file.sync_data().unwrap();
 
         let workspace = root.path().join("workspace");
-        let background_private = private.clone();
-        let background_workspace = workspace.clone();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            sender
-                .send(
-                    SessionJournal::new(background_private)
-                        .bind_workspace(&background_workspace, "123"),
-                )
-                .unwrap();
-        });
-        receiver
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("workspace copy must not wait for the source file lock")
+        SessionJournal::new(private)
+            .bind_workspace(&workspace, "123")
             .unwrap();
         let target = workspace
             .join(".danmu/sessions")
@@ -1346,7 +1333,6 @@ mod tests {
         file.write_all(&record[midpoint..]).unwrap();
         file.write_all(b"\n").unwrap();
         file.sync_data().unwrap();
-        FileExt::unlock(&file).unwrap();
         journal.bind_workspace(&workspace, "123").unwrap();
         journal.snapshot(&session).unwrap();
         assert_eq!(
@@ -1368,6 +1354,73 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), original_target);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn workspace_copy_does_not_wait_for_an_advisory_source_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        let journal = SessionJournal::new(private.clone());
+        let session = DanmuSession::new("123");
+        journal.start(&session).unwrap();
+        let source = journal.session_directory(&session.id).join("journal.jsonl");
+        let locked = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        locked.lock_exclusive().unwrap();
+
+        let workspace = root.path().join("workspace");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sender
+                .send(SessionJournal::new(private).bind_workspace(&workspace, "123"))
+                .unwrap();
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("workspace copy waited for an advisory source lock");
+        FileExt::unlock(&locked).unwrap();
+        result.unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_copy_propagates_a_mandatory_source_lock_and_recovers() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        let journal = SessionJournal::new(private.clone());
+        let session = DanmuSession::new("123");
+        journal.start(&session).unwrap();
+        let source = journal.session_directory(&session.id).join("journal.jsonl");
+        let locked = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        locked.lock_exclusive().unwrap();
+
+        let workspace = root.path().join("workspace");
+        let error = SessionJournal::new(private.clone())
+            .bind_workspace(&workspace, "123")
+            .unwrap_err();
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+
+        FileExt::unlock(&locked).unwrap();
+        SessionJournal::new(private)
+            .bind_workspace(&workspace, "123")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(
+                workspace
+                    .join(".danmu/sessions")
+                    .join(&session.id)
+                    .join("journal.jsonl")
+            )
+            .unwrap(),
+            std::fs::read(source).unwrap()
+        );
+    }
     #[test]
     fn same_archive_migration_through_a_path_alias_never_locks_itself() {
         let root = tempfile::tempdir().unwrap();

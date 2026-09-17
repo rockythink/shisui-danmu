@@ -1970,8 +1970,9 @@ fn room_context_settings_migrate_format_two_without_restoring_a_topic() {
     let root = tempfile::tempdir().unwrap();
     let cfg = root.path().join("config.toml");
     let path = root.path().join("assistant.json");
+    let binary = root.path().join("custom/omp");
     let previous = json!({
-        "format":2, "host":"omp", "binary":"/opt/omp", "name":"自定义名字",
+        "format":2, "host":"omp", "binary":binary, "name":"自定义名字",
         "preferences":"长期偏好", "topic":"昨日主题", "automatic":true,
         "source":{"kind":"omp_profile","value":"writer"}
     })
@@ -1982,7 +1983,7 @@ fn room_context_settings_migrate_format_two_without_restoring_a_topic() {
     assert!(r.load_error.is_none());
     assert!(r.has_saved_settings());
     assert_eq!(r.effective_topic(), "");
-    assert_eq!(r.settings.binary, PathBuf::from("/opt/omp"));
+    assert_eq!(r.settings.binary, binary);
     assert_eq!(r.settings.name, "自定义名字");
     assert_eq!(r.settings.preferences, "长期偏好");
     assert_eq!(r.settings.source, Source::OmpProfile("writer".into()));

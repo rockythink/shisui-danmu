@@ -2746,17 +2746,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         let mut s = app.runner.settings.clone();
-        s.binary = "/private/custom/omp".into();
+        let binary = root.path().join("custom/omp");
+        s.binary = binary.clone();
         s.source = Source::OmpProfile("live".into());
         app.runner.save(s, &app.bridge, false).unwrap();
         let mut p = Panel::new();
         p.discovered = Host::ALL.into_iter().map(Host::discovery).collect();
         app.apply_assistant_row(Row::Host(Host::Omp), &mut p)
             .unwrap();
-        assert_eq!(
-            app.runner.settings.binary,
-            std::path::PathBuf::from("/private/custom/omp")
-        );
+        assert_eq!(app.runner.settings.binary, binary);
         assert!(matches!(&app.runner.settings.source,Source::OmpProfile(v) if v=="live"));
     }
     #[test]

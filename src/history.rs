@@ -705,6 +705,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn journal_import_does_not_wait_for_the_source_file_lock() {
         use std::{sync::mpsc, time::Duration};
@@ -740,6 +741,39 @@ mod tests {
         let result = result.expect("journal import waited for an advisory source lock");
         result.unwrap();
         importer.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn journal_import_propagates_a_mandatory_source_lock_and_recovers() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path().join("journal.jsonl");
+        std::fs::write(
+            &journal,
+            format!(
+                "{}\n{}\n",
+                json!({"kind":"sessionStarted","payload":{"roomId":"123"}}),
+                json!({"kind":"eventReceived","payload":event("saved", "host", 1, "锁后恢复导入")})
+            ),
+        )
+        .unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&journal)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&locked).unwrap();
+
+        let history = History::open(root.path(), "123").unwrap();
+        let error = history.import_journal(&journal).unwrap_err();
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+
+        fs2::FileExt::unlock(&locked).unwrap();
+        history.import_journal(&journal).unwrap();
+        let hits = history
+            .search(["锁后恢复"].into_iter(), "", &[], 4096)
+            .unwrap();
+        assert!(hits.iter().any(|hit| hit["id"] == "saved"));
     }
     #[test]
     fn reopened_history_keeps_room_and_uid_boundaries_and_retrieves_nearby_host_context() {

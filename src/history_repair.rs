@@ -154,6 +154,7 @@ pub(crate) fn repair_exports(private_root: &Path, workspace: &Path) -> Result<Re
     let backup = managed.join(format!("history-repair-{}", uuid::Uuid::new_v4()));
     check_path(&backup)?;
     std::fs::create_dir(&backup).context("创建历史维修备份目录失败")?;
+    #[cfg(unix)]
     sync_directory(&managed)?;
 
     for candidate in &candidates {
@@ -164,6 +165,7 @@ pub(crate) fn repair_exports(private_root: &Path, workspace: &Path) -> Result<Re
             )
         })?;
     }
+    #[cfg(unix)]
     sync_directory(&backup)?;
 
     Ok(RepairReport {
@@ -403,8 +405,10 @@ fn replace_one(candidate: &Candidate, backup_root: &Path) -> Result<()> {
     let backup_path =
         session_backup.join(candidate.target.file_name().context("导出文件缺少名称")?);
     write_new_atomic(&backup_path, &target_bytes)?;
+    #[cfg(unix)]
     sync_directory(&session_backup)?;
     crate::storage::write_private_atomic(&candidate.target, &source_bytes)?;
+    #[cfg(unix)]
     sync_directory(candidate.target.parent().context("导出文件缺少父目录")?)?;
     ensure!(
         JournalStamp::read(&source_journal)? == *source_stamp
@@ -466,6 +470,9 @@ fn write_new_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// Unix additionally syncs directory metadata. Windows keeps the file sync before
+// atomic publication above; it does not expose an equivalent directory fsync.
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
