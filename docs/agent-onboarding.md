@@ -7,9 +7,12 @@
 - 对应 [GitHub issue #1](https://github.com/rockythink/shisui-danmu/issues/1)：v0.5.0 Windows 启动报错 `Initial console modes not set`。源码定位到未开启鼠标捕获就执行关闭；Crossterm 0.29 的 Windows 后端此时尚未保存原始模式。该后端还明确拒绝 Kitty 键盘增强命令，不能只修鼠标后留下第二个启动错误。
 - Windows 启动不再执行未配对的鼠标关闭或 Kitty Push/Pop；Unix 既有初始化保留。退出仅关闭当前持有的鼠标捕获，再恢复普通输入；粘贴、键盘和备用屏幕清理分别尝试，避免前一项失败阻断后续恢复。不吞运行期鼠标命令错误。
 - `src/terminal/windows_tests.rs` 在全新子进程和独立 Windows 控制台内验证冷启动、反复开关捕获、捕获开启时退出，并检查输入模式和原屏幕恢复。现有 Windows CI 的 `cargo test --locked --all-targets --all-features` 会自动执行；也可单独运行 `cargo test --locked terminal::windows_tests::console_lifecycle -- --exact`。
-- 本机 `RUST_TEST_THREADS=1 ./script/verify.sh` 通过格式、Clippy、374 项测试、Release 构建和 CLI：`/tmp/danmu-windows-fix-verify.log`。随后 `./script/install_cli.sh` 安装成功；Release 与 `~/.local/bin/danmu` 的 SHA-256 均为 `0539280a478791682988b15aa294d9e6f9168626d1cfcc6c854305f86c5902de`。
+- v0.5.1 最终本机门禁 `RUST_TEST_THREADS=1 ./script/verify.sh` 通过格式、Clippy、374 项测试、Release 构建和 CLI：`/tmp/danmu-v051-verify.log`。随后 `./script/install_cli.sh` 安装成功，版本为 `danmu 0.5.1`；Release 与 `~/.local/bin/danmu` 的 SHA-256 均为 `d784a2ee6be904d259977adcba2146013f38435603d29865c8fcc15b2a85f300`。
 - 安装版 macOS 实际 PTY 验证三种场景全部退出 0、终端模式完整恢复，并检查鼠标、备用屏幕、光标、粘贴和键盘协议的清理输出。证据：`/var/folders/dn/4hk1m1lj33g38l1jzt3wj4140000gn/T/danmu-windows-fix-smoke-ktv9m2h3/results.json` 及同目录 ANSI 记录。仅使用全新 local 私有目录，不连接真实房间、模型或 OBS，不操作用户终端。
-- 开发阶段验证边界：本机没有 Windows 运行环境。完整 Windows 交叉检查因缺少 SDK 的 `assert.h` 在 ring 构建阶段失败；抽取实际 TerminalGuard（不含未修改的应用绘制入口），连同新增测试通过 `x86_64-pc-windows-msvc` 定向类型检查和 Clippy。这不等于 Windows 运行验证；发布前需在 Windows CI 运行新增控制台回归。临时检查代码已清理，日志与实测证据保留；用户自行重启旧 TUI。
+- 独立代码审核通过。提交 `9d421074d3379d60a48958afb1a5680afabdcc80` 的 [CI 35427994678](https://github.com/rockythink/shisui-danmu/actions/runs/35427994678) 全绿（macOS、Linux、Windows、官网）；Windows 的 310 项测试通过，日志明确包含 `terminal::windows_tests::console_lifecycle ... ok`，覆盖独立真实控制台的三种生命周期。日志：`/tmp/danmu-v051-windows-ci.log`。本机交叉检查曾因缺少 Windows SDK 的 `assert.h` 失败，不将其算作 Windows 运行证据。
+- 验证边界：上述 Windows 证据来自 GitHub Windows runner，不等于已在 issue 报告者的终端环境回访确认。启动中途失败的统一回滚仍是既有局限，本轮未声称修复。临时类型检查代码已清理；用户自行重启旧 TUI，不操作用户终端、OBS 或历史库。
+- 正式发布：标签 `v0.5.1` 对应上述审核提交；[Release 流水线 35428328279](https://github.com/rockythink/shisui-danmu/actions/runs/35428328279) 全绿，五平台安装包及校验文件齐备。npm 通过 OIDC 发布（隔离安装后实际输出 `danmu 0.5.1`）；crates.io 从该提交的干净临时工作树发布并可查询；Homebrew 配方提交 `6b0be48cb768c5c7f0d35d3df13eae2ee6f613f0`，macOS ARM 发布包 SHA-256 校验通过。
+- 官网更新日志已部署，Cloudflare 版本 `31501841-b44f-4188-80ef-bac9ed612c85`。本地与线上独立 Chrome 验收版本提示、首页导航、Windows 搜索结果和 390px 手机无横向溢出；截图保留于 `/tmp/danmu-v051-site-{desktop,search,mobile}.png`。构建后用 Pagefind CLI 重新生成索引；自动化托管浏览器将 Worker 改成 blob URL 导致相对路径失败，已向工具报告并使用独立 Chrome 排除此工具故障，未为此修改产品搜索实现。
 
 ## 上轮：空回复可诊断，普通消息低成本合批
 
