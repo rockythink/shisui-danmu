@@ -1,8 +1,17 @@
 # 弹幕助手接入向导
 
-当前适用 v0.5.0。面向用户的任务式操作见[使用手册](https://danmu.elazer.wang/guide/)；本文保留开发接入与历史验证记录，历史构建号及旧轮次行为不代表当前版本。`/settings` 是“设置与操作”总菜单；主界面原生拖选后用终端快捷键复制，旧弹幕标识为↶。当前宿主与认证约束见[九宿主接入与认证边界](#九宿主接入与认证边界)。
+当前适用 v0.5.1。面向用户的任务式操作见[使用手册](https://danmu.elazer.wang/guide/)；本文保留开发接入与历史验证记录，历史构建号及旧轮次行为不代表当前版本。`/settings` 是“设置与操作”总菜单；主界面原生拖选后用终端快捷键复制，旧弹幕标识为↶。当前宿主与认证约束见[九宿主接入与认证边界](#九宿主接入与认证边界)。
 
-## 本轮：空回复可诊断，普通消息低成本合批
+## 本轮：Windows 终端启动与退出恢复（v0.5.1）
+
+- 对应 [GitHub issue #1](https://github.com/rockythink/shisui-danmu/issues/1)：v0.5.0 Windows 启动报错 `Initial console modes not set`。源码定位到未开启鼠标捕获就执行关闭；Crossterm 0.29 的 Windows 后端此时尚未保存原始模式。该后端还明确拒绝 Kitty 键盘增强命令，不能只修鼠标后留下第二个启动错误。
+- Windows 启动不再执行未配对的鼠标关闭或 Kitty Push/Pop；Unix 既有初始化保留。退出仅关闭当前持有的鼠标捕获，再恢复普通输入；粘贴、键盘和备用屏幕清理分别尝试，避免前一项失败阻断后续恢复。不吞运行期鼠标命令错误。
+- `src/terminal/windows_tests.rs` 在全新子进程和独立 Windows 控制台内验证冷启动、反复开关捕获、捕获开启时退出，并检查输入模式和原屏幕恢复。现有 Windows CI 的 `cargo test --locked --all-targets --all-features` 会自动执行；也可单独运行 `cargo test --locked terminal::windows_tests::console_lifecycle -- --exact`。
+- 本机 `RUST_TEST_THREADS=1 ./script/verify.sh` 通过格式、Clippy、374 项测试、Release 构建和 CLI：`/tmp/danmu-windows-fix-verify.log`。随后 `./script/install_cli.sh` 安装成功；Release 与 `~/.local/bin/danmu` 的 SHA-256 均为 `0539280a478791682988b15aa294d9e6f9168626d1cfcc6c854305f86c5902de`。
+- 安装版 macOS 实际 PTY 验证三种场景全部退出 0、终端模式完整恢复，并检查鼠标、备用屏幕、光标、粘贴和键盘协议的清理输出。证据：`/var/folders/dn/4hk1m1lj33g38l1jzt3wj4140000gn/T/danmu-windows-fix-smoke-ktv9m2h3/results.json` 及同目录 ANSI 记录。仅使用全新 local 私有目录，不连接真实房间、模型或 OBS，不操作用户终端。
+- 开发阶段验证边界：本机没有 Windows 运行环境。完整 Windows 交叉检查因缺少 SDK 的 `assert.h` 在 ring 构建阶段失败；抽取实际 TerminalGuard（不含未修改的应用绘制入口），连同新增测试通过 `x86_64-pc-windows-msvc` 定向类型检查和 Clippy。这不等于 Windows 运行验证；发布前需在 Windows CI 运行新增控制台回归。临时检查代码已清理，日志与实测证据保留；用户自行重启旧 TUI。
+
+## 上轮：空回复可诊断，普通消息低成本合批
 
 历史问题：曾观察到连续模型轮次没有公开回复。旧记录没有每轮原文与麦克风快照，不能追认开麦策略是确定根因；本次补足轮次诊断，不宣称自动重启解决了历史崩溃。
 - 开麦让位仅减少主动插话，不把未静音当作正在讲话或停止问答依据。直接问助手及基础范围允许的完整公开文字问题仍可简短回答；明确给主播/他人的消息、未知口播与发送授权边界不变。这是提示策略，不是对真实模型理解效果的保证。

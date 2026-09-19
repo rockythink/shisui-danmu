@@ -35,6 +35,12 @@ DANMU 把 B 站历史弹幕、实时互动、重点问题、发送状态和有�
 
 这是基础功能实录，**不代表已经展示 v0.5.0 的 AI 助手流程**。点击画面观看完整 MP4。
 
+## v0.5.1 修复
+
+- 修复 Windows 启动时的 `Initial console modes not set`，并避开 Windows 后端不支持的键盘增强命令。
+- 修正退出时鼠标捕获与输入模式的恢复顺序，保持原终端可正常继续输入。
+- 无需删除历史库、重配账号或停止 OBS。详细说明见[更新日志](https://danmu.elazer.wang/changelog/#v051)。
+
 ## v0.5.0 变化
 
 - **本机 ACP 助手**：接入用户自己的原生 AI 工具，打开面板、连接模型、启动值班与允许公开发送分别控制。Pi 提供显式准备命令 `danmu setup pi`，不代装原生 Pi、不登录、不启动推理。
@@ -44,7 +50,7 @@ DANMU 把 B 站历史弹幕、实时互动、重点问题、发送状态和有�
 - **低成本合批与轮次诊断**：普通空白、纯笑声和平台已识别纯表情可跳过；连续空轮后普通消息按 5–10 秒合批，点名不等合批但仍受单飞与授权限制。`/diag` 区分零候选、原生无正文、待审、拒绝和真正错误。
 - **官网使用手册**：用 Astro Starlight 承载完整操作文档，提供章节导航与搜索；README 保持为产品入口。
 
-从 0.4.5 升级请沿用原安装渠道，运行 `danmu --version` 确认 `0.5.0`，再自行重启所有旧 TUI 实例。无需删除历史库。历史版本说明见 [Releases](https://github.com/rockythink/shisui-danmu/releases)。
+从 0.4.5 或 0.5.0 升级请沿用原安装渠道，运行 `danmu --version` 确认 `0.5.1`，再自行重启所有旧 TUI 实例。无需删除历史库。历史版本说明见 [Releases](https://github.com/rockythink/shisui-danmu/releases)。
 
 ## 安装与首次启动
 

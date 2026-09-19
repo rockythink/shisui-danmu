@@ -13,6 +13,8 @@ mod activity;
 mod agent;
 mod assistant;
 mod settings;
+#[cfg(all(test, windows))]
+mod windows_tests;
 
 pub use agent::run_local as local;
 mod input;
@@ -41,11 +43,14 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Local, Utc};
+#[cfg(not(windows))]
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
-        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -3078,11 +3083,15 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        // Windows can only restore mouse mode after EnableMouseCapture saved it.
+        #[cfg(not(windows))]
+        execute!(stdout, DisableMouseCapture)?;
+        execute!(stdout, EnableBracketedPaste)?;
+        // Crossterm's Windows backend rejects the Kitty keyboard protocol.
+        #[cfg(not(windows))]
         execute!(
             stdout,
-            EnterAlternateScreen,
-            DisableMouseCapture,
-            EnableBracketedPaste,
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
@@ -3127,14 +3136,14 @@ impl TerminalGuard {
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Windows mouse restoration reinstates the saved raw input mode.
+        // Release owned capture before restoring cooked input for the shell.
+        let _ = self.set_mouse_capture(false);
         let _ = disable_raw_mode();
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            PopKeyboardEnhancementFlags,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
+        #[cfg(not(windows))]
+        let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
     }
 }

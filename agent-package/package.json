@@ -1,6 +1,6 @@
 {
   "name": "@shisui/danmu-agent-tools",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "description": "Shared CLI/MCP duty skill; no autonomous extension or background timer"
 }
