@@ -1,15 +1,15 @@
 ---
 title: DANMU 使用手册
-description: DANMU v0.5.0 中文使用手册，涵盖安装、直播间、OBS、AI助手、审核、隐私与故障排查。
+description: DANMU v0.5.1 中文使用手册，涵盖安装、直播间、OBS、AI助手、审核、隐私与故障排查。
 head:
   - tag: script
     attrs:
       type: application/ld+json
     content: |
-      {"@context":"https://schema.org","@type":"TechArticle","headline":"DANMU 使用手册","description":"DANMU v0.5.0 中文使用手册，涵盖安装、直播间、OBS、AI助手、审核、隐私与故障排查。","url":"https://danmu.elazer.wang/guide/"}
+      {"@context":"https://schema.org","@type":"TechArticle","headline":"DANMU 使用手册","description":"DANMU v0.5.1 中文使用手册，涵盖安装、直播间、OBS、AI助手、审核、隐私与故障排查。","url":"https://danmu.elazer.wang/guide/"}
 ---
 
-本手册适用于 **DANMU v0.5.0**。DANMU 是面向知识型主播的免费开源 B 站弹幕与直播监控工作台；当前只接入 B 站，不是播放器，也不替代 OBS。程序免费开源不代表外部 AI 模型免费：模型订阅、额度与联网搜索成本由所选宿主或服务商决定。
+本手册适用于 **DANMU v0.5.1**。DANMU 是面向知识型主播的免费开源 B 站弹幕与直播监控工作台；当前只接入 B 站，不是播放器，也不替代 OBS。程序免费开源不代表外部 AI 模型免费：模型订阅、额度与联网搜索成本由所选宿主或服务商决定。
 
 在线版本：<https://danmu.elazer.wang/guide/>　源码与下载：<https://github.com/rockythink/shisui-danmu>
 
@@ -38,7 +38,7 @@ npm 与 Bun 安装的是 Rust 原生程序。无须全局安装时，也可运�
 danmu --version
 ```
 
-输出包含 `0.5.0`。若找不到命令，重新打开终端并检查安装目录是否在 `PATH`；若摘要不匹配，不要运行文件，重新从 [Release](https://github.com/rockythink/shisui-danmu/releases/latest) 下载。
+输出包含 `0.5.1`。若找不到命令，重新打开终端并检查安装目录是否在 `PATH`；若摘要不匹配，不要运行文件，重新从 [Release](https://github.com/rockythink/shisui-danmu/releases/latest) 下载。
 
 ### 升级
 
@@ -106,7 +106,7 @@ danmu --logout
 - `/pin` 标记当前选中消息；未选择时使用最新消息。成功后界面提示已设为重点。
 - `/find [关键词]` 搜索已归档会话；省略关键词会打开编辑器，匹配结果显示房间与场次。没有结果时先核对关键词，再在 `/diag` 查看历史状态。
 
-旧 `/history`、`/theme`、`/layout`、`/login` 等斜杠写法不是 v0.5.0 的现行教程；登录使用启动参数，长期设置使用上述菜单或当前 `/display` 命令。
+旧 `/history`、`/theme`、`/layout`、`/login` 等斜杠写法不是 v0.5.1 的现行教程；登录使用启动参数，长期设置使用上述菜单或当前 `/display` 命令。
 
 ## OBS与直播间管理
 
