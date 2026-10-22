@@ -60,11 +60,6 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// 显式准备私有适配器；不启动助手、不修改原生配置或登录
-    Setup {
-        #[command(subcommand)]
-        adapter: SetupAdapter,
-    },
     /// 无房间隔离终端，仅人工输入及LocalTransport；必须指定新建私有实例目录
     Local {
         /// 启动即打开助手设置面板；不启动模型或开启发送
@@ -79,12 +74,6 @@ pub enum Command {
     },
     /// stdio MCP；不启动TUI，不登录、不读取平台凭据
     Mcp,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum SetupAdapter {
-    /// 私有安装已核定的 pi-acp@0.0.33；需要 Node.js 20+ 与 npm
-    Pi,
 }
 
 #[derive(Debug, Clone)]

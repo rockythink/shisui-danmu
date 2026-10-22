@@ -1,0 +1,13 @@
+[
+  {"id":"qa-123-danmu-1","kind":"danmu","timestamp":"2026-10-01T12:00:00Z","username":"合成观众甲","authorId":"42","content":"如何让旧消息不抢走当前阅读位置？","origin":"live","platformEventId":"qa-platform-1","emotes":[]},
+  {"id":"qa-123-danmu-2","kind":"danmu","timestamp":"2026-10-01T12:00:01Z","username":"合成观众乙","authorId":"43","content":"中文与 emoji 👨‍👩‍👧‍👦🙂🚀 混排的长正文：发送应按 Unicode 字素分段，不能拆开组合字符；回看时新消息不应该改变当前锚点，人工草稿也不能被迟到的发送回执清空。","replyTo":"合成主播","origin":"live","platformEventId":"qa-platform-2","emotes":[]},
+  {"id":"qa-123-sc-1","kind":"superchat","timestamp":"2026-10-01T12:00:02Z","username":"合成观众甲","authorId":"42","content":"合成 SC：请说明审核与实际送达的区别。","origin":"live","platformEventId":"qa-platform-sc-1","emotes":[]},
+  {"id":"qa-123-enter-1","kind":"enter","timestamp":"2026-10-01T12:00:03Z","username":"合成观众乙","authorId":"43","content":"进入直播间","origin":"live","platformEventId":"qa-platform-enter-1","emotes":[]},
+  {"id":"qa-123-like-1","kind":"like","timestamp":"2026-10-01T12:00:04Z","username":"合成观众甲","authorId":"42","content":"点赞","origin":"live","platformEventId":"qa-platform-like-1","emotes":[]},
+  {"id":"qa-123-history-copy-1","kind":"danmu","timestamp":"2026-10-01T12:00:00Z","username":"合成观众甲","authorId":"42","content":"如何让旧消息不抢走当前阅读位置？","origin":"history","platformEventId":"qa-platform-1","emotes":[]},
+  {"id":"qa-123-gift-batch-1","kind":"gift","timestamp":"2026-10-01T12:00:05Z","username":"合成观众乙","authorId":"43","content":"赠送 测试花 ×1","origin":"live","platformEventId":"qa-gift-batch-1","emotes":[],"gift":{"name":"测试花","action":"赠送","blindGift":null,"receipts":{"qa-transaction-1":1},"reportedQuantity":1}},
+  {"id":"qa-123-gift-batch-1","kind":"gift","timestamp":"2026-10-01T12:00:06Z","username":"合成观众乙","authorId":"43","content":"赠送 测试花 ×2","origin":"live","platformEventId":"qa-gift-batch-1","emotes":[],"gift":{"name":"测试花","action":"赠送","blindGift":null,"receipts":{"qa-transaction-2":1},"reportedQuantity":2}},
+  {"id":"qa-123-gift-batch-1","kind":"gift","timestamp":"2026-10-01T12:00:07Z","username":"合成观众乙","authorId":"43","content":"赠送 测试花 ×3","origin":"live","platformEventId":"qa-gift-batch-1","emotes":[],"gift":{"name":"测试花","action":"赠送","blindGift":null,"receipts":{},"reportedQuantity":3}},
+  {"id":"qa-123-gift-batch-1","kind":"gift","timestamp":"2026-10-01T12:00:06Z","username":"合成观众乙","authorId":"43","content":"赠送 测试花 ×2","origin":"live","platformEventId":"qa-gift-batch-1","emotes":[],"gift":{"name":"测试花","action":"赠送","blindGift":null,"receipts":{"qa-transaction-2":1},"reportedQuantity":2}},
+  {"id":"qa-123-archived-1","kind":"danmu","timestamp":"2026-09-30T12:00:00Z","username":"合成观众甲","authorId":"42","content":"只读恢复的上场旧消息，不触发新消息计数、通知或 AI。","origin":"archived","platformEventId":"qa-platform-archived-1","emotes":[]}
+]

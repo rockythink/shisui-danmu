@@ -5,12 +5,21 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
+
+/// A full session state reaches ~100 KB in a busy room; writing one per event cost hundreds of MB an hour.
+/// Recovery replays the events recorded after the latest state, so a periodic state is enough.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
+/// Forcing each message to the platter (F_FULLFSYNC on macOS) dominated a busy room's CPU. Written
+/// records already survive an app crash; state records and at least one sync a second bound what a
+/// power loss could take to the last moment of messages.
+const EVENT_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +48,8 @@ pub enum JournalKind {
 pub struct SessionJournal {
     root: PathBuf,
     mirror: Arc<Mutex<Option<JournalMirror>>>,
+    snapshots: Arc<Mutex<HashMap<String, Instant>>>,
+    synced: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 pub(crate) fn serialize_exports(session: &DanmuSession) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -69,6 +80,8 @@ impl SessionJournal {
         Self {
             root,
             mirror: Arc::new(Mutex::new(None)),
+            snapshots: Arc::new(Mutex::new(HashMap::new())),
+            synced: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     pub(crate) fn root(&self) -> &Path {
@@ -144,7 +157,7 @@ impl SessionJournal {
             let path = source.join("journal.jsonl");
             check_path(&path)?;
             let mut file = File::open(&path)?;
-            mirror.sync_journal(&source, &mut file, None)?;
+            mirror.sync_journal(&source, &mut file, None, true)?;
             mirror.sync_exports(&source)?;
         }
         Ok(Some(mirror))
@@ -155,7 +168,9 @@ impl SessionJournal {
             &session.id,
             JournalKind::SessionStarted,
             serde_json::to_value(session)?,
-        )
+        )?;
+        self.record_state(&session.id);
+        Ok(())
     }
 
     pub fn event(&self, session: &DanmuSession, event: &DanmuEvent) -> Result<()> {
@@ -164,9 +179,27 @@ impl SessionJournal {
             JournalKind::EventReceived,
             serde_json::to_value(event)?,
         );
+        if !self.snapshot_due(&session.id) {
+            return result;
+        }
         // A failed maintenance copy must not prevent the private recovery snapshot.
         let snapshot = self.snapshot(session);
         result.and(snapshot)
+    }
+
+    fn snapshot_due(&self, session_id: &str) -> bool {
+        let Ok(snapshots) = self.snapshots.lock() else {
+            return true;
+        };
+        snapshots
+            .get(session_id)
+            .is_none_or(|written| written.elapsed() >= SNAPSHOT_INTERVAL)
+    }
+
+    fn record_state(&self, session_id: &str) {
+        if let Ok(mut snapshots) = self.snapshots.lock() {
+            snapshots.insert(session_id.to_owned(), Instant::now());
+        }
     }
 
     pub fn unhandled_command(&self, session: &DanmuSession, command: &str) -> Result<()> {
@@ -177,16 +210,11 @@ impl SessionJournal {
         )
     }
 
-    pub(crate) fn assistant_stopped(
-        &self,
-        session: &DanmuSession,
-        native_session: &str,
-        reason: &str,
-    ) -> Result<()> {
+    pub(crate) fn assistant_stopped(&self, session: &DanmuSession, reason: &str) -> Result<()> {
         self.append(
             &session.id,
             JournalKind::AssistantStopped,
-            serde_json::json!({ "native_session": native_session, "reason": reason }),
+            serde_json::json!({ "reason": reason }),
         )
     }
     pub(crate) fn assistant_routing(&self, session: &DanmuSession, snapshot: &Value) -> Result<()> {
@@ -198,7 +226,9 @@ impl SessionJournal {
             &session.id,
             JournalKind::SessionSnapshot,
             serde_json::to_value(session)?,
-        )
+        )?;
+        self.record_state(&session.id);
+        Ok(())
     }
 
     pub fn end(&self, session: &DanmuSession) -> Result<()> {
@@ -379,15 +409,34 @@ impl SessionJournal {
         };
         serde_json::to_writer(&mut file, &record)?;
         file.write_all(b"\n")?;
-        file.sync_data()?;
+        let durable = self.sync_due(session_id, kind);
+        if durable {
+            file.sync_data()?;
+        }
         if let Some(mirror) = mirror.as_mut() {
-            mirror.sync_journal(&directory, &mut file, before.as_ref())?;
+            mirror.sync_journal(&directory, &mut file, before.as_ref(), durable)?;
         }
         FileExt::unlock(&file)?;
         Ok(())
     }
 
-    fn latest_session(&self, id: &str) -> Result<Option<DanmuSession>> {
+    /// Messages share a sync at most once a second; every other record is synced as it is written.
+    fn sync_due(&self, session_id: &str, kind: JournalKind) -> bool {
+        let Ok(mut synced) = self.synced.lock() else {
+            return true;
+        };
+        let routine = matches!(kind, JournalKind::EventReceived | JournalKind::UnhandledCommand);
+        let due = !routine
+            || synced
+                .get(session_id)
+                .is_none_or(|last| last.elapsed() >= EVENT_SYNC_INTERVAL);
+        if due {
+            synced.insert(session_id.to_owned(), Instant::now());
+        }
+        due
+    }
+
+    pub(crate) fn latest_session(&self, id: &str) -> Result<Option<DanmuSession>> {
         let path = self.session_directory(id).join("journal.jsonl");
         if let Some(session) = read_latest_session_state(&path)? {
             return Ok(Some(session));
@@ -545,6 +594,7 @@ impl JournalMirror {
         directory: &Path,
         source: &mut File,
         before_append: Option<&FileStamp>,
+        durable: bool,
     ) -> Result<()> {
         let target_dir = self.target(directory)?;
         let target = target_dir.join("journal.jsonl");
@@ -570,6 +620,7 @@ impl JournalMirror {
         source.seek(SeekFrom::Start(offset))?;
         let mut reader = BufReader::new(Read::by_ref(source).take(length - offset));
         let mut room = progress.map(|progress| progress.room.clone());
+        let mut has_events = false;
         let mut verified = offset;
         let mut line = Vec::new();
         loop {
@@ -587,6 +638,7 @@ impl JournalMirror {
             let record: JournalMirrorRecord<'_> =
                 serde_json::from_slice(&line).context("原始归档损坏；未覆盖副本")?;
             verified += count as u64;
+            has_events |= record.kind == "eventReceived";
             if record.kind == "sessionStarted" {
                 let id = record
                     .payload
@@ -599,6 +651,10 @@ impl JournalMirror {
                 );
                 room = Some(id.into());
             }
+        }
+        if room.is_none() && !has_events {
+            // Audit-only leftovers (e.g. a launch that never connected) carry no history to mirror.
+            return Ok(());
         }
         ensure!(room.is_some(), "原始归档缺少场次开始记录；未覆盖副本");
         ensure!(
@@ -638,7 +694,9 @@ impl JournalMirror {
         }
         source.seek(SeekFrom::Start(existing))?;
         std::io::copy(&mut source.take(verified - existing), &mut destination)?;
-        destination.sync_data()?;
+        if durable {
+            destination.sync_data()?;
+        }
         self.files.insert(target.clone(), FileStamp::read(&target)?);
         self.journals.insert(
             target,
@@ -763,6 +821,8 @@ struct JournalRecordHeader {
     #[serde(rename = "timestamp")]
     _timestamp: DateTime<Utc>,
     kind: JournalKind,
+    #[serde(rename = "payload")]
+    _payload: serde::de::IgnoredAny,
 }
 
 #[derive(Deserialize)]
@@ -777,7 +837,34 @@ fn read_latest_session_state(path: &Path) -> Result<Option<DanmuSession>> {
         Err(error) => return Err(error.into()),
     };
     FileExt::lock_shared(&file)?;
-    read_reverse_records(&mut file, read_session_state_line)
+    let Some((mut session, state_end)) = read_reverse_records(&mut file, |file, start, end| {
+        Ok(read_session_state_line(file, start, end)?.map(|session| (session, end)))
+    })?
+    else {
+        return Ok(None);
+    };
+    // States are written periodically; the events recorded after the latest one complete it.
+    file.seek(SeekFrom::Start(state_end))?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 || line.last() != Some(&b'\n') {
+            break;
+        }
+        if let Ok(record) = serde_json::from_slice::<JournalEventPayload>(&line)
+            && record.kind == JournalKind::EventReceived
+        {
+            session.ingest(record.payload);
+        }
+    }
+    Ok(Some(session))
+}
+
+#[derive(Deserialize)]
+struct JournalEventPayload {
+    kind: JournalKind,
+    payload: DanmuEvent,
 }
 
 fn read_reverse_records<T>(
@@ -857,9 +944,11 @@ fn read_records(path: &Path) -> Result<Vec<JournalRecord>> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LegacyJournalRecord {
+    #[serde(default)]
+    schema_version: Option<u32>,
     recorded_at: DateTime<Utc>,
     kind: String,
-    payload: Value,
+    payload: Box<serde_json::value::RawValue>,
 }
 
 fn replay_legacy_session(path: &Path, session_id: &str) -> Result<Option<DanmuSession>> {
@@ -869,38 +958,69 @@ fn replay_legacy_session(path: &Path, session_id: &str) -> Result<Option<DanmuSe
         Err(error) => return Err(error.into()),
     };
     let mut session: Option<DanmuSession> = None;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(record) = serde_json::from_str::<LegacyJournalRecord>(&line) else {
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let count = (&mut reader)
+            .take(8 * 1024 * 1024 + 1)
+            .read_until(b'\n', &mut line)?;
+        if count == 0 {
+            break;
+        }
+        ensure!(count <= 8 * 1024 * 1024, "旧弹幕归档单条过大");
+        if line.last() != Some(&b'\n') {
+            break; // Only the incomplete crash tail is ignored; never rewrite it.
+        }
+        if let Ok(current) = serde_json::from_slice::<JournalRecordHeader>(&line) {
+            ensure!(
+                !matches!(
+                    current.kind,
+                    JournalKind::SessionStarted
+                        | JournalKind::SessionSnapshot
+                        | JournalKind::SessionEnded
+                        | JournalKind::SessionInterrupted
+                ),
+                "会话状态归档损坏"
+            );
+            // An unconnected runtime may write routing metadata without ever
+            // starting a room session. It is not a legacy Swift archive.
             continue;
-        };
+        }
+        let record: LegacyJournalRecord =
+            serde_json::from_slice(&line).context("旧弹幕归档损坏")?;
+        ensure!(
+            record.schema_version.is_none_or(|version| version == 1),
+            "不支持的旧弹幕归档版本"
+        );
         match record.kind.as_str() {
             "sessionStarted" => {
-                let Some(room_id) = record.payload.get("roomID").and_then(Value::as_str) else {
-                    continue;
-                };
+                #[derive(Deserialize)]
+                struct Started {
+                    #[serde(rename = "roomID")]
+                    room_id: String,
+                }
+                let started: Started = serde_json::from_str(record.payload.get())?;
+                let room_id = started.room_id;
                 let mut restored = DanmuSession::with_options(room_id, 240, record.recorded_at);
                 restored.id = session_id.to_owned();
                 session = Some(restored);
             }
             "eventReceived" => {
-                if let (Some(restored), Some(event)) = (
-                    session.as_mut(),
-                    record
-                        .payload
-                        .get("event")
-                        .and_then(|value| serde_json::from_value::<DanmuEvent>(value.clone()).ok()),
-                ) {
+                let event = crate::legacy::decode_event(&record.payload)?;
+                if let Some(restored) = session.as_mut() {
                     restored.ingest(event);
                 }
             }
             "featuredChanged" => {
                 if let Some(restored) = session.as_mut() {
-                    restored.feature(
-                        record
-                            .payload
-                            .get("featuredEventID")
-                            .and_then(Value::as_str),
-                    );
+                    #[derive(Deserialize)]
+                    struct Featured {
+                        #[serde(rename = "featuredEventID")]
+                        event_id: Option<String>,
+                    }
+                    let featured: Featured = serde_json::from_str(record.payload.get())?;
+                    restored.feature(featured.event_id.as_deref());
                 }
             }
             "sessionInterrupted" => {
@@ -915,14 +1035,13 @@ fn replay_legacy_session(path: &Path, session_id: &str) -> Result<Option<DanmuSe
             }
             "sessionEnded" => {
                 if let Some(restored) = session.as_mut() {
-                    let reason = record
-                        .payload
-                        .get("endReason")
-                        .cloned()
-                        .and_then(|value| {
-                            serde_json::from_value::<DanmuSessionEndReason>(value).ok()
-                        })
-                        .unwrap_or(DanmuSessionEndReason::Completed);
+                    #[derive(Deserialize)]
+                    #[serde(rename_all = "camelCase")]
+                    struct Ended {
+                        end_reason: Option<DanmuSessionEndReason>,
+                    }
+                    let ended: Ended = serde_json::from_str(record.payload.get())?;
+                    let reason = ended.end_reason.unwrap_or(DanmuSessionEndReason::Completed);
                     restored.end(record.recorded_at, reason);
                 }
             }
@@ -938,6 +1057,129 @@ fn replay_legacy_session(path: &Path, session_id: &str) -> Result<Option<DanmuSe
 mod tests {
     use super::*;
     use crate::domain::{DanmuEvent, DanmuEventKind};
+
+    #[test]
+    fn archive_search_ignores_idle_metadata_but_reports_complete_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = SessionJournal::new(root.path().to_path_buf());
+        let idle = DanmuSession::new("");
+        journal
+            .assistant_routing(&idle, &serde_json::json!({ "active": false }))
+            .unwrap();
+        let path = journal.session_directory(&idle.id).join("journal.jsonl");
+        let original = std::fs::read(&path).unwrap();
+        let live = DanmuSession::new("123");
+        journal.start(&live).unwrap();
+
+        let sessions = journal.search("").unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![live.id.as_str()]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        let mut corrupted = original;
+        corrupted.extend_from_slice(b"{\"sequence\":2,\"kind\":\"assistantRouting\"}\n");
+        std::fs::write(&path, &corrupted).unwrap();
+        assert!(journal.search("").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+    }
+
+    #[test]
+    fn swift_archive_replay_and_index_keep_uid_and_leave_question_records_and_tail_untouched() {
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("journal.jsonl");
+        let record = |kind, payload| {
+            format!(
+                "{}\n",
+                json!({
+                    "schemaVersion": 1, "recordedAt": "2026-09-09T00:00:00Z",
+                    "kind": kind, "payload": payload
+                })
+            )
+        };
+        let mut source = record("sessionStarted", json!({"roomID": "123"}));
+        source += &record(
+            "eventReceived",
+            json!({"event": {
+                "id": "swift-42", "kind": "danmu", "timestamp": "2026-09-09T00:00:00Z",
+                "username": "同名观众", "authorID": "42", "content": "原始归档正文",
+                "origin": "history", "platformEventID": "original-platform-id", "replyTo": "主播",
+                "emotes": [{"text": "[好]", "imageURL": "https://example.invalid/emote.png"}]
+            }}),
+        );
+        source += &record(
+            "questionUpdated",
+            json!({"eventID": "swift-42", "status": "answered", "priority": "high"}),
+        );
+        source += &record("featuredChanged", json!({"featuredEventID": "swift-42"}));
+        source += r#"{"schemaVersion":1,"kind":"eventReceived","payload":{"event":"#;
+        std::fs::write(&path, &source).unwrap();
+        let original_hash = Sha256::digest(source.as_bytes());
+
+        let session = replay_legacy_session(&path, "legacy-session")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.id, "legacy-session");
+        assert_eq!(session.room_id, "123");
+        assert_eq!(session.recent_events.len(), 1);
+        let event = &session.recent_events[0];
+        assert_eq!(event.author_id.as_deref(), Some("42"));
+        assert_eq!(
+            event.platform_event_id.as_deref(),
+            Some("original-platform-id")
+        );
+        assert_eq!(event.origin, crate::domain::DanmuEventOrigin::History);
+        assert_eq!(event.reply_to.as_deref(), Some("主播"));
+        assert_eq!(
+            event.emotes[0].image_url.as_str(),
+            "https://example.invalid/emote.png"
+        );
+        assert_eq!(
+            session
+                .featured_event
+                .as_ref()
+                .unwrap()
+                .author_id
+                .as_deref(),
+            Some("42")
+        );
+
+        let history = crate::history::History::open(root.path(), "123").unwrap();
+        history.import_journal(&path).unwrap();
+        let hits = history
+            .search(["原始归档"].into_iter(), "42", &[], 4096)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["id"], "swift-42");
+        assert_eq!(hits[0]["broadcaster_account"], true);
+        let other_uid = history
+            .search(["原始归档"].into_iter(), "43", &[], 4096)
+            .unwrap();
+        assert_eq!(other_uid[0]["broadcaster_account"], false);
+        history.import_journal(&path).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(Sha256::digest(&after), original_hash);
+        assert_eq!(after, source.as_bytes());
+    }
+
+    #[test]
+    fn swift_archive_complete_corruption_is_reported_instead_of_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("journal.jsonl");
+        let source = b"{broken complete record}\n";
+        std::fs::write(&path, source).unwrap();
+        assert!(replay_legacy_session(&path, "legacy").is_err());
+        let history = crate::history::History::open(root.path(), "123").unwrap();
+        assert!(history.import_journal(&path).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), source);
+    }
 
     #[test]
     fn malformed_journal_does_not_prevent_other_sessions_from_being_indexed() {
@@ -974,6 +1216,51 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn busy_rooms_write_periodic_states_and_recovery_replays_later_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = SessionJournal::new(temp.path().into());
+        let mut session = DanmuSession::new("42");
+        journal.start(&session).unwrap();
+        for index in 0..50 {
+            let event = DanmuEvent::new(DanmuEventKind::Danmu, format!("第 {index} 条"));
+            session.ingest(event.clone());
+            journal.event(&session, &event).unwrap();
+        }
+        let path = journal.session_directory(&session.id).join("journal.jsonl");
+        let states = read_records(&path)
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.kind == JournalKind::SessionSnapshot)
+            .count();
+        assert_eq!(states, 0, "events within the interval must not each write a full state");
+        let restored = journal.latest_session(&session.id).unwrap().unwrap();
+        assert_eq!(restored.recent_events.len(), 50);
+        assert_eq!(restored.metrics.total_event_count, 50);
+        assert_eq!(restored.recent_events, session.recent_events);
+
+        // An explicit state (feature change, interruption) still lands immediately and later events replay on top.
+        journal.snapshot(&session).unwrap();
+        let event = DanmuEvent::new(DanmuEventKind::Danmu, "快照之后");
+        session.ingest(event.clone());
+        journal.event(&session, &event).unwrap();
+        let restored = journal.latest_session(&session.id).unwrap().unwrap();
+        assert_eq!(restored.recent_events, session.recent_events);
+    }
+
+    #[test]
+    fn messages_share_a_sync_while_state_records_always_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = SessionJournal::new(temp.path().into());
+        assert!(journal.sync_due("s", JournalKind::SessionStarted));
+        assert!(!journal.sync_due("s", JournalKind::EventReceived));
+        assert!(!journal.sync_due("s", JournalKind::EventReceived));
+        assert!(journal.sync_due("s", JournalKind::SessionSnapshot));
+        assert!(journal.sync_due("s", JournalKind::SessionEnded));
+        // Another session keeps its own pace.
+        assert!(journal.sync_due("other", JournalKind::EventReceived));
     }
 
     #[test]
@@ -1093,7 +1380,7 @@ mod tests {
         session.ingest(event);
         journal.start(&session).unwrap();
         journal
-            .assistant_stopped(&session, "native-42", "ACP disconnected")
+            .assistant_stopped(&session, "HTTP disconnected")
             .unwrap();
         let reopened = SessionJournal::new(temp.path().into());
         let restored = reopened.recent_room_history("42", 240).unwrap();
@@ -1130,6 +1417,27 @@ mod tests {
         assert_eq!(restored.metrics.total_event_count, 1);
         let duplicate = serde_json::from_value::<DanmuEvent>(event).unwrap();
         assert!(!restored.ingest(duplicate));
+    }
+
+    #[test]
+    fn audit_only_journal_from_an_unconnected_launch_does_not_block_workspace_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        let workspace = root.path().join("workspace");
+        let journal = SessionJournal::new(private.clone());
+        let idle = DanmuSession::new("");
+        journal
+            .assistant_routing(&idle, &serde_json::json!({ "active": false }))
+            .unwrap();
+        let live = DanmuSession::new("123");
+        journal.start(&live).unwrap();
+
+        journal.bind_workspace(&workspace, "123").unwrap();
+        let copies = workspace.join(".danmu/sessions");
+        assert!(copies.join(&live.id).join("journal.jsonl").exists());
+        assert!(!copies.join(&idle.id).exists());
+        // The private original stays untouched.
+        assert!(private.join(&idle.id).join("journal.jsonl").exists());
     }
 
     #[test]

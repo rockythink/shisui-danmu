@@ -1,14 +1,12 @@
 # Third-party notices
 
-## agent-client-protocol
+## jsonwebtoken
 
-- Repository: <https://github.com/agentclientprotocol/rust-sdk>
-- Version: 2.1.0 (exact Cargo.lock pin; default features disabled).
-- License: Apache-2.0
-- Usage: official typed ACP v1 client, JSON-RPC correlation and dispatch. The
-  application retains bounded transport and native-host/business authorization.
-- Transitive versions and license identifiers are captured in the 04-SDK
-  dependency evidence; no adapter or native Agent is bundled.
+- Repository: <https://github.com/Keats/jsonwebtoken>
+- Locked version: 11.1.0 (RustCrypto backend; default features disabled).
+- License: MIT.
+- Usage: validate official Sign in with ChatGPT ID/access-token signatures, issuer, audience and expiry.
+- Token storage and application authorization remain application-owned.
 
 ## rusqlite / libsqlite3-sys
 

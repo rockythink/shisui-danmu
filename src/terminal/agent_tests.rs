@@ -1,21 +1,46 @@
 use super::*;
+use crate::runner::test_support::{HttpServer, RecordedRequest, Response, Scenario, openai};
 use serde_json::Value;
+
+fn api_input(request: &RecordedRequest) -> Value {
+    serde_json::from_str(request.json()["messages"][1]["content"].as_str().unwrap()).unwrap()
+}
+fn answer_scenario(text: String) -> Scenario {
+    Scenario::respond(move |request| {
+        let input = api_input(request);
+        let answer = serde_json::json!({"round_id": input["round_id"], "candidates": [{
+            "message_id": input["untrusted_messages"][0]["id"], "text": text
+        }]})
+        .to_string();
+        Response::json(openai(Some(&answer), "stop"))
+    })
+}
+fn configure_api(app: &mut RuntimeState, root: &Path, server: &HttpServer) {
+    app.runner.settings.api.base_url = server.base_url();
+    app.runner.settings.api.model = "fixture-openai".into();
+    crate::runner::credentials::save(
+        &root.join("assistant.json"),
+        &app.runner.settings.api,
+        "fixture-key-only",
+    )
+    .unwrap();
+}
 fn queue_account_fixture(root: &Path, independent: bool) -> AccountStatus {
     let main = automatic_account_fixture(root, "11");
     if independent {
-        let staged = tempfile::tempdir_in(root).unwrap();
+        let staged = crate::test_support::private_tempdir().unwrap();
         automatic_account_fixture(staged.path(), "22");
         let id = uuid::Uuid::new_v4();
         let directory = root.join("AssistantAccounts");
-        std::fs::create_dir_all(&directory).unwrap();
+        crate::bridge::wire::private_root(&directory).unwrap();
         std::fs::copy(
             staged.path().join("account.json"),
             directory.join(format!("{id}.json")),
         )
         .unwrap();
-        std::fs::write(
-            root.join("assistant-account.json"),
-            serde_json::to_vec(&serde_json::json!({
+        crate::storage::write_private_atomic(
+            &root.join("assistant-account.json"),
+            &serde_json::to_vec(&serde_json::json!({
                 "mode": "independent", "account": id
             }))
             .unwrap(),
@@ -28,7 +53,7 @@ fn queue_account_fixture(root: &Path, independent: bool) -> AccountStatus {
 #[tokio::test]
 async fn account_queues_allow_independent_senders_between_segments_but_serialize_reuse() {
     for (independent, assistant_first) in [(true, true), (true, false), (false, true)] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let status = queue_account_fixture(root.path(), independent);
         let (mut app, request, _) = setup(root.path());
         app.account_status = status;
@@ -51,13 +76,13 @@ async fn account_queues_allow_independent_senders_between_segments_but_serialize
             let mut completed = 0;
             while completed < 2 {
                 let event = rx.recv().await.unwrap();
-                if let UiEvent::LocalEcho(text) = &event {
+                if let CoreEvent::LocalEcho(text) = &event {
                     echoes.push(text.clone());
                     if text == "first-1" {
                         app.enqueue(vec!["other-account".into()], job.take(), tx.clone());
                     }
                 }
-                if matches!(event, UiEvent::DeliveryCompleted) {
+                if matches!(event, CoreEvent::DeliveryCompleted) {
                     completed += 1;
                 }
                 app.handle_ui_event(event);
@@ -81,7 +106,7 @@ async fn account_queues_allow_independent_senders_between_segments_but_serialize
 
 #[tokio::test]
 async fn account_queues_manual_rejection_does_not_cancel_independent_assistant() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let status = queue_account_fixture(root.path(), true);
     let (mut app, request, _) = setup(root.path());
     app.account_status = status;
@@ -104,7 +129,7 @@ async fn account_queues_manual_rejection_does_not_cancel_independent_assistant()
             let event = rx.recv().await.unwrap();
             if matches!(
                 event,
-                UiEvent::DeliveryCompleted | UiEvent::DeliveryNotice(_)
+                CoreEvent::DeliveryCompleted | CoreEvent::DeliveryNotice(_)
             ) {
                 completed += 1;
             }
@@ -135,7 +160,7 @@ async fn account_queues_manual_rejection_does_not_cancel_independent_assistant()
 
 #[tokio::test]
 async fn delivery_archive_failure_preserves_confirmation_and_revokes_future_sends() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let (mut app, request, _) = setup(root.path());
     let (tx, mut rx) = mpsc::channel(32);
     let log = root.path().join("deliveries.jsonl");
@@ -154,7 +179,7 @@ async fn delivery_archive_failure_preserves_confirmation_and_revokes_future_send
     std::fs::write(&blocked, "preserve-existing-file").unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         while let Some(event) = rx.recv().await {
-            if matches!(&event, UiEvent::AssistantDelivery { .. }) {
+            if matches!(&event, CoreEvent::AssistantDelivery { .. }) {
                 app.journal = SessionJournal::new(blocked.clone());
                 app.handle_ui_event(event);
                 break;
@@ -179,15 +204,18 @@ async fn delivery_archive_failure_preserves_confirmation_and_revokes_future_send
 #[cfg(unix)]
 #[tokio::test]
 async fn completed_round_archive_failure_revokes_sending_without_losing_manual_input() {
-    use std::os::unix::fs::PermissionsExt;
-    let root = tempfile::tempdir().unwrap();
-    let binary = root.path().join("fixture.py");
-    std::fs::write(&binary, include_str!("../../tests/fixtures/acp_agent.py")).unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::write(root.path().join("fixture.json"), r#"{"mode":"no_answer"}"#).unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
+    let server = HttpServer::spawn(vec![Scenario::respond(|request| {
+        let input = api_input(request);
+        Response::json(openai(
+            Some(&serde_json::json!({"round_id":input["round_id"],"candidates":[]}).to_string()),
+            "stop",
+        ))
+    })])
+    .await;
     let mut app = replay::app(root.path(), DanmuSession::new("local"));
     app.bridge.available(true);
-    app.runner.settings.binary = binary;
+    configure_api(&mut app, root.path(), &server);
     app.input = "保留人工草稿".into();
     let (tx, _rx) = mpsc::channel(8);
     let delivery_log = root.path().join("deliveries.jsonl");
@@ -196,7 +224,7 @@ async fn completed_round_archive_failure_revokes_sending_without_losing_manual_i
         log: delivery_log.clone(),
         tx: tx.clone(),
     }));
-    app.runner.start(&app.bridge, false, false).unwrap();
+    app.runner.start(&app.bridge, false).unwrap();
     app.bridge.permission(true).unwrap();
     app.bridge
         .ingest(DanmuEvent::new(DanmuEventKind::Danmu, "请解释事务隔离"));
@@ -229,57 +257,14 @@ async fn completed_round_archive_failure_revokes_sending_without_losing_manual_i
     app.runner.shutdown(&app.bridge).await;
 }
 
-#[test]
-fn compact_assistant_only_becomes_ready_after_acp_session_is_connected() {
-    let root = tempfile::tempdir().unwrap();
-    let mut app = replay::app(root.path(), DanmuSession::new("local"));
-
-    assert!(assistant::compact(&app, 16).content.is_empty());
-    app.resume_pending = true;
-    assert!(assistant::compact(&app, 16).content.contains("AI启动中"));
-    app.pause_assistant();
-    assert!(assistant::compact(&app, 16).content.is_empty());
-
-    app.runner.running = true;
-    app.runner.report.authentication.push("浏览器登录".into());
-    let first = assistant::compact(&app, 16);
-    assert!(first.content.contains("AI启动中"));
-    assert_eq!(first.style.fg, Some(Color::Cyan));
-
-    app.animation_tick += 1;
-    let next = assistant::compact(&app, 16);
-    assert!(next.content.contains("AI启动中"));
-    assert_ne!(first.content, next.content);
-
-    app.runner.report.session = Some("restoring-session".into());
-    assert!(assistant::compact(&app, 16).content.contains("AI启动中"));
-
-    app.runner.report.connected = true;
-    app.runner.report.session = None;
-    assert!(assistant::compact(&app, 16).content.contains("AI启动中"));
-
-    app.runner.report.session = Some("ready-session".into());
-    app.runner.settings.automatic = false;
-    let ready = assistant::compact(&app, 16);
-    assert_eq!(ready.content.as_ref(), crate::bridge::AI_PREFIX);
-    assert_eq!(ready.style.fg, Some(Color::Green));
-
-    app.runner.running = false;
-    assert!(assistant::compact(&app, 16).content.is_empty());
-}
 #[cfg(unix)]
 #[tokio::test]
 async fn compact_startup_animation_stops_and_preserves_the_real_connection_error() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let root = tempfile::tempdir().unwrap();
-    let binary = root.path().join("fixture.py");
-    std::fs::write(&binary, include_str!("../../tests/fixtures/acp_agent.py")).unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::write(root.path().join("fixture.json"), r#"{"mode":"eof"}"#).unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
+    let server = HttpServer::spawn(vec![Scenario::new(Response::disconnect())]).await;
     let mut app = replay::app(root.path(), DanmuSession::new("local"));
     app.bridge.available(true);
-    app.runner.settings.binary = binary;
+    configure_api(&mut app, root.path(), &server);
     let (tx, _rx) = mpsc::channel(8);
     app.local_transport = Some(Arc::new(LocalTransport {
         outcome: AtomicU8::new(0),
@@ -287,8 +272,9 @@ async fn compact_startup_animation_stops_and_preserves_the_real_connection_error
         tx: tx.clone(),
     }));
 
-    app.runner.start(&app.bridge, false, false).unwrap();
-    assert!(assistant::compact(&app, 16).content.contains("AI启动中"));
+    app.runner.start(&app.bridge, false).unwrap();
+    assert!(server.requests().is_empty(), "本地启动不能发送连接测试");
+    app.ingest_event(DanmuEvent::new(DanmuEventKind::Danmu, "请助手解释故障"));
     tokio::time::timeout(Duration::from_secs(5), async {
         while app.runner.running {
             app.advance_bridge(tx.clone());
@@ -305,9 +291,105 @@ async fn compact_startup_animation_stops_and_preserves_the_real_connection_error
 }
 
 #[tokio::test]
+async fn fatal_http_notice_expires_without_restoring_worker_or_sending_permission() {
+    let root = crate::test_support::private_tempdir().unwrap();
+    let server =
+        HttpServer::spawn(vec![Scenario::new(Response::bytes(Vec::new()).status(401))]).await;
+    let mut app = automatic_app(root.path(), "100", "11", false);
+    configure_api(&mut app, root.path(), &server);
+    app.set_automatic_permission(true).unwrap();
+    assert!(app.assistant_accounts.has_automatic_grant());
+    let (tx, _rx) = mpsc::channel(8);
+    let deliveries = root.path().join("deliveries.jsonl");
+    app.local_transport = Some(Arc::new(LocalTransport {
+        outcome: AtomicU8::new(0),
+        log: deliveries.clone(),
+        tx: tx.clone(),
+    }));
+    app.input = "仍可编辑甲🙂乙".into();
+    app.input.move_left();
+    let cursor = app.input.cursor();
+    app.runner.start(&app.bridge, false).unwrap();
+    app.resume_pending = true;
+    app.ingest_event(DanmuEvent::new(DanmuEventKind::Danmu, "请助手解释故障"));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app.runner.running {
+            app.advance_bridge(tx.clone());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(app.runner.failed());
+    assert!(app.runner.note.contains("401"));
+    assert!(app.notice.contains(&app.runner.note));
+    assert_eq!(app.notice_level, NoticeLevel::Error);
+    let error = app.runner.note.clone();
+    let deadline = app.notice_deadline.expect("致命错误底部文字也应限时消退");
+    app.expire_notice_at(deadline - Duration::from_nanos(1));
+    assert!(app.notice.contains(&error));
+    app.expire_notice_at(deadline);
+    assert!(app.notice.is_empty());
+    assert_eq!(app.notice_level, NoticeLevel::Error, "消退不能刷成成功");
+    app.ingest_event(DanmuEvent::new(DanmuEventKind::Danmu, "请助手处理新的问题"));
+    app.advance_bridge(tx.clone());
+    assert!(!app.runner.running && app.runner.failed());
+    assert!(!app.bridge.sending_enabled());
+    assert!(!app.resume_pending && !app.runner.settings.resume_on_start);
+    assert!(!app.assistant_accounts.has_automatic_grant());
+    assert!(app.bridge.candidates().is_empty());
+    assert_eq!(server.requests().len(), 1, "清文字不能重试或恢复worker");
+    assert!(!deliveries.exists());
+    assert_eq!(app.runner.note, error);
+    assert!(app.notice.is_empty());
+    assert_eq!(app.input, "仍可编辑甲🙂乙");
+    assert_eq!(app.input.cursor(), cursor);
+    let journal = std::fs::read_to_string(
+        app.journal
+            .root()
+            .join(&app.session.id)
+            .join("journal.jsonl"),
+    )
+    .unwrap();
+    let records: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(records.iter().any(|record| {
+        record["kind"] == "assistantStopped" && record["payload"]["reason"] == error
+    }));
+    assert!(records.iter().any(|record| {
+        record["payload"]["outcome"] == "error" && record["payload"].to_string().contains("401")
+    }));
+    app.command("/diag", tx.clone()).await.unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE), tx)
+        .await
+        .unwrap();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 60)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let visible: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .filter(|symbol| *symbol != " ")
+        .collect();
+    assert!(visible.contains("当前原因"));
+    assert!(visible.contains("401"), "到期后的/diag应保留实际HTTP错误");
+    assert_eq!(app.input, "仍可编辑甲🙂乙");
+    assert_eq!(app.input.cursor(), cursor);
+    app.runner.shutdown(&app.bridge).await;
+    drop(app);
+    let reloaded = automatic_app(root.path(), "100", "11", false);
+    assert!(!reloaded.runner.settings.resume_on_start);
+    assert!(!reloaded.assistant_accounts.has_automatic_grant());
+}
+
+#[tokio::test]
 async fn batch_review_keys_only_change_pending_candidates_and_preserve_the_draft() {
     for (key, expected) in [('a', "accepted"), ('d', "cancelled")] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let (mut app, first, message) = setup(root.path());
         let second = candidate(&app, "a", "two", &message);
         let uncertain = candidate(&app, "a", "uncertain", &message);
@@ -351,7 +433,7 @@ async fn batch_review_keys_only_change_pending_candidates_and_preserve_the_draft
 
 #[tokio::test]
 async fn bulk_send_rejects_an_identity_change_since_the_review_was_shown() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let (mut app, request, _) = setup(root.path());
     app.bridge.permission(false).unwrap();
     app.open_candidate_review().unwrap();
@@ -368,7 +450,7 @@ async fn bulk_send_rejects_an_identity_change_since_the_review_was_shown() {
 
 #[tokio::test]
 async fn command_search_cannot_approve_a_reply_hidden_below_it() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let (mut app, request, _) = setup(root.path());
     app.bridge.permission(false).unwrap();
     let (tx, _rx) = mpsc::channel(8);
@@ -397,7 +479,7 @@ async fn command_search_cannot_approve_a_reply_hidden_below_it() {
 
 #[tokio::test]
 async fn fresh_review_press_reopens_after_a_missing_release_without_repeating() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let (mut app, request, _) = setup(root.path());
     let reply = app.bridge.candidates()[0].clone();
     app.bridge
@@ -440,7 +522,7 @@ async fn fresh_review_press_reopens_after_a_missing_release_without_repeating() 
 }
 #[test]
 fn mouse_clicks_cannot_open_or_send_a_visible_candidate() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let (mut app, request, _) = setup(root.path());
     paint(&mut app);
     for row in 0..36 {
@@ -467,7 +549,7 @@ fn mouse_clicks_cannot_open_or_send_a_visible_candidate() {
 
 #[tokio::test]
 async fn review_uses_only_the_seen_version_and_one_fresh_press() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let (mut app, request, message) = setup(root.path());
     app.bridge.permission(false).unwrap();
     let submit = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
@@ -537,7 +619,7 @@ async fn review_uses_only_the_seen_version_and_one_fresh_press() {
 
 #[tokio::test]
 async fn long_review_must_be_expanded_seen_and_reseen_after_edit() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let (mut app, request, _) = setup(root.path());
     app.bridge.permission(false).unwrap();
     let original = app.bridge.candidates()[0].clone();
@@ -584,16 +666,12 @@ async fn long_review_must_be_expanded_seen_and_reseen_after_edit() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sdk_candidate_reaches_only_approved_local_transport_and_unknown_never_retries() {
-    use std::os::unix::fs::PermissionsExt;
     for outcome in [0, 1] {
-        let root = tempfile::tempdir().unwrap();
-        let binary = root.path().join("fixture.py");
-        std::fs::write(&binary, include_str!("../../tests/fixtures/acp_agent.py")).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(root.path().join("fixture.json"), r#"{"mode":"normal"}"#).unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
+        let server = HttpServer::spawn(vec![answer_scenario("受控候选".into())]).await;
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         app.bridge.available(true);
-        app.runner.settings.binary = binary;
+        configure_api(&mut app, root.path(), &server);
         app.input = "保留人工草稿".into();
         let (tx, mut rx) = mpsc::channel(32);
         let log = root.path().join("deliveries.jsonl");
@@ -602,7 +680,7 @@ async fn sdk_candidate_reaches_only_approved_local_transport_and_unknown_never_r
             log: log.clone(),
             tx: tx.clone(),
         }));
-        app.runner.start(&app.bridge, false, false).unwrap();
+        app.runner.start(&app.bridge, false).unwrap();
         let event = DanmuEvent::new(DanmuEventKind::Danmu, "受控问题");
         let message = event.id.clone();
         app.ingest_event(event);
@@ -616,13 +694,7 @@ async fn sdk_candidate_reaches_only_approved_local_transport_and_unknown_never_r
             }
         })
         .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "{error}: {}; wire={}",
-                app.runner.note,
-                std::fs::read_to_string(root.path().join("wire.jsonl")).unwrap_or_default()
-            )
-        });
+        .unwrap_or_else(|error| panic!("{error}: {}", app.runner.note));
         let reply = app.bridge.candidates()[0].clone();
         app.advance_bridge(tx.clone());
         assert!(!log.exists());
@@ -690,7 +762,7 @@ async fn sdk_candidate_reaches_only_approved_local_transport_and_unknown_never_r
 
 #[tokio::test]
 async fn help_blocks_drafts_and_review_but_keeps_global_safety_keys() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let (mut app, request, _) = setup(root.path());
     let (tx, _rx) = mpsc::channel(8);
     app.command("/help", tx.clone()).await.unwrap();
@@ -734,7 +806,7 @@ async fn help_blocks_drafts_and_review_but_keeps_global_safety_keys() {
 
 #[tokio::test]
 async fn assistant_menu_preserves_manual_input_without_starting_or_sending() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let (mut app, request, _) = setup(root.path());
     app.bridge.permission(false).unwrap();
     let (tx, _rx) = mpsc::channel(8);
@@ -754,7 +826,7 @@ async fn assistant_menu_preserves_manual_input_without_starting_or_sending() {
     assert_eq!(app.input.cursor(), 3);
 }
 
-fn candidate(app: &TerminalApp, caller: &str, request: &str, message: &str) -> bridge::Request {
+fn candidate(app: &RuntimeState, caller: &str, request: &str, message: &str) -> bridge::Request {
     let req = bridge::Request::Reply {
         session: app.bridge.status()["session"].as_str().unwrap().into(),
         caller: caller.into(),
@@ -766,7 +838,7 @@ fn candidate(app: &TerminalApp, caller: &str, request: &str, message: &str) -> b
     app.bridge.apply(req.clone()).unwrap();
     req
 }
-fn setup(root: &Path) -> (TerminalApp, bridge::Request, String) {
+fn setup(root: &Path) -> (RuntimeState, bridge::Request, String) {
     let mut app = replay::app(root, DanmuSession::new("local"));
     let event = DanmuEvent::new(DanmuEventKind::Danmu, "问题");
     let message = event.id.clone();
@@ -777,14 +849,14 @@ fn setup(root: &Path) -> (TerminalApp, bridge::Request, String) {
     app.input.set_cursor(3);
     (app, request, message)
 }
-fn paint(app: &mut TerminalApp) {
+fn paint(app: &mut RuntimeState) {
     let backend = ratatui::backend::TestBackend::new(120, 36);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| super::super::draw(frame, app))
         .unwrap();
 }
-async fn key(app: &mut TerminalApp, code: KeyCode, tx: &mpsc::Sender<UiEvent>) {
+async fn key(app: &mut RuntimeState, code: KeyCode, tx: &mpsc::Sender<CoreEvent>) {
     paint(app);
     assert!(
         !app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), tx.clone())
@@ -792,7 +864,7 @@ async fn key(app: &mut TerminalApp, code: KeyCode, tx: &mpsc::Sender<UiEvent>) {
             .unwrap()
     );
 }
-async fn open_menu(app: &mut TerminalApp, tx: &mpsc::Sender<UiEvent>) {
+async fn open_menu(app: &mut RuntimeState, tx: &mpsc::Sender<CoreEvent>) {
     assert!(
         !app.handle_key(
             KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
@@ -803,7 +875,7 @@ async fn open_menu(app: &mut TerminalApp, tx: &mpsc::Sender<UiEvent>) {
     );
 }
 
-async fn candidate_menu(app: &mut TerminalApp, approve: bool, tx: &mpsc::Sender<UiEvent>) {
+async fn candidate_menu(app: &mut RuntimeState, approve: bool, tx: &mpsc::Sender<CoreEvent>) {
     app.command("/review", tx.clone()).await.unwrap();
     if !approve {
         key(app, KeyCode::Down, tx).await;
@@ -815,7 +887,7 @@ async fn candidate_menu(app: &mut TerminalApp, approve: bool, tx: &mpsc::Sender<
     }
 }
 
-fn result(app: &TerminalApp, request: &bridge::Request) -> Value {
+fn result(app: &RuntimeState, request: &bridge::Request) -> Value {
     let bridge::Request::Reply {
         session,
         caller,
@@ -836,7 +908,7 @@ fn result(app: &TerminalApp, request: &bridge::Request) -> Value {
 
 #[tokio::test]
 async fn edit_save_binds_identity_preserves_draft_and_sends_edited_text_only_after_approval() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::private_tempdir().unwrap();
     let (mut app, request, message) = setup(temp.path());
     let (tx, mut rx) = mpsc::channel(32);
     let log = temp.path().join("deliveries.jsonl");
@@ -916,7 +988,7 @@ async fn edit_save_binds_identity_preserves_draft_and_sends_edited_text_only_aft
 
 #[tokio::test]
 async fn cancel_and_validation_errors_keep_candidate_and_manual_draft_separate() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::private_tempdir().unwrap();
     let (mut app, request, _) = setup(temp.path());
     let (tx, _rx) = mpsc::channel(8);
     candidate_menu(&mut app, false, &tx).await;
@@ -945,7 +1017,7 @@ async fn cancel_and_validation_errors_keep_candidate_and_manual_draft_separate()
 #[tokio::test]
 async fn pause_preserves_editable_candidates_and_requires_fresh_explicit_approval() {
     for route in ["ctrl-p", "pause"] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let (mut app, request, message) = setup(temp.path());
         let (tx, mut rx) = mpsc::channel(32);
         let log = temp.path().join("pause-deliveries.jsonl");
@@ -1026,7 +1098,7 @@ async fn pause_preserves_editable_candidates_and_requires_fresh_explicit_approva
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let event = rx.recv().await.unwrap();
-                let done = matches!(event, UiEvent::DeliveryCompleted);
+                let done = matches!(event, CoreEvent::DeliveryCompleted);
                 app.handle_ui_event(event);
                 if done {
                     break;
@@ -1093,7 +1165,7 @@ async fn stale_editor_cannot_revive_terminal_candidate_or_cross_into_new_scene()
         "confirmed",
         "uncertain",
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let (mut app, request, _) = setup(temp.path());
         let (tx, _rx) = mpsc::channel(8);
         candidate_menu(&mut app, false, &tx).await;
@@ -1139,7 +1211,7 @@ async fn stale_editor_cannot_revive_terminal_candidate_or_cross_into_new_scene()
 
 #[tokio::test]
 async fn native_reply_review_edits_and_shared_queue_keep_original_target_and_ai_marker() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::private_tempdir().unwrap();
     let mut app = replay::app(temp.path(), DanmuSession::new("local"));
     let (tx, mut rx) = mpsc::channel(32);
     let log = temp.path().join("deliveries.jsonl");
@@ -1214,7 +1286,7 @@ async fn native_reply_review_edits_and_shared_queue_keep_original_target_and_ai_
         let mut completed = 0;
         while completed < 2 {
             let event = rx.recv().await.unwrap();
-            if matches!(event, UiEvent::DeliveryCompleted) {
+            if matches!(event, CoreEvent::DeliveryCompleted) {
                 completed += 1;
             }
             app.handle_ui_event(event);
@@ -1256,39 +1328,36 @@ fn assistant_marker_reserves_grapheme_capacity_and_deduplicates_model_prefixes()
 }
 
 #[cfg(unix)]
-fn repair_app(
+async fn repair_app(
     root: &Path,
     mode: u8,
     automatic: bool,
     known_word: bool,
+    hold_repair: bool,
 ) -> (
-    TerminalApp,
-    mpsc::Sender<UiEvent>,
-    mpsc::Receiver<UiEvent>,
+    RuntimeState,
+    mpsc::Sender<CoreEvent>,
+    mpsc::Receiver<CoreEvent>,
     PathBuf,
+    HttpServer,
+    Option<oneshot::Sender<()>>,
 ) {
-    use std::os::unix::fs::PermissionsExt;
-    let binary = root.join("repair_fixture.py");
-    let fixture = include_str!("../../tests/fixtures/acp_agent.py").replace(
-            "\"text\":\"受控候选\"",
-            "\"text\": (\"合规改写正文\" if \"repair\" in payload else config.get(\"initial_text\", \"原始候选\"))"
-        );
-    let fixture = fixture.replace("payload = json.loads(req[\"params\"][\"prompt\"][0][\"text\"])", "payload = json.loads(req[\"params\"][\"prompt\"][0][\"text\"])\n    if \"repair\" in payload: time.sleep(.15)");
-    std::fs::write(&binary, fixture).unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
     let initial = if mode == 6 {
         format!("{}{}", "甲".repeat(38), "乙".repeat(20))
     } else {
         "原始候选".into()
     };
-    std::fs::write(
-        root.join("fixture.json"),
-        serde_json::json!({"mode":"normal", "initial_text":initial}).to_string(),
-    )
-    .unwrap();
+    let repair = answer_scenario("合规改写正文".into());
+    let (repair, release) = if hold_repair {
+        let (scenario, _received, release) = repair.barrier();
+        (scenario, Some(release))
+    } else {
+        (repair, None)
+    };
+    let server = HttpServer::spawn(vec![answer_scenario(initial), repair]).await;
     let mut app = replay::app(root, DanmuSession::new("local"));
     app.bridge.available(true);
-    app.runner.settings.binary = binary;
+    configure_api(&mut app, root, &server);
     app.runner.settings.automatic = automatic;
     app.runner.settings.mention_sender = true;
     if known_word {
@@ -1301,12 +1370,11 @@ fn repair_app(
         log: log.clone(),
         tx: tx.clone(),
     }));
-    app.runner.start(&app.bridge, false, false).unwrap();
+    app.runner.start(&app.bridge, false).unwrap();
     if automatic {
         app.bridge.permission(true).unwrap();
     }
-
-    (app, tx, rx, log)
+    (app, tx, rx, log, server, release)
 }
 
 #[cfg(unix)]
@@ -1321,8 +1389,9 @@ async fn owned_repair_rounds_deliver_once_with_frozen_review_target_and_segment_
         (0, true, true),
         (4, true, false),
     ] {
-        let root = tempfile::tempdir().unwrap();
-        let (mut app, tx, mut rx, log) = repair_app(root.path(), mode, automatic, known_word);
+        let root = crate::test_support::private_tempdir().unwrap();
+        let (mut app, tx, mut rx, log, server, _release) =
+            repair_app(root.path(), mode, automatic, known_word, false).await;
         let mut event = DanmuEvent::new(DanmuEventKind::Danmu, "需要实时外部资料的合理问题");
         event.author_id = Some("42".into());
         event.username = Some("原作者".into());
@@ -1383,12 +1452,7 @@ async fn owned_repair_rounds_deliver_once_with_frozen_review_target_and_segment_
             request_id: original.request_id.clone(),
         };
         let original_record = app.bridge.apply(query.clone()).unwrap();
-        let prompts: Vec<Value> = std::fs::read_to_string(root.path().join("wire.jsonl"))
-            .unwrap()
-            .lines()
-            .map(|s| serde_json::from_str::<Value>(s).unwrap())
-            .filter(|r| r["direction"] == "in" && r["value"]["method"] == "session/prompt")
-            .collect();
+        let prompts: Vec<Value> = server.requests().iter().map(api_input).collect();
         assert_eq!(prompts.len(), if matches!(mode, 1 | 3) { 1 } else { 2 });
         if !matches!(mode, 1 | 3) {
             let repaired = results.iter().find(|r| r.retry_of.is_some()).unwrap();
@@ -1407,12 +1471,7 @@ async fn owned_repair_rounds_deliver_once_with_frozen_review_target_and_segment_
             if !automatic {
                 assert!(approved && review_seen);
             }
-            let input: Value = serde_json::from_str(
-                prompts[1]["value"]["params"]["prompt"][0]["text"]
-                    .as_str()
-                    .unwrap(),
-            )
-            .unwrap();
+            let input = &prompts[1];
             assert_eq!(input["repair"]["original_message"]["authorId"], "42");
             if mode == 6 {
                 assert_eq!(
@@ -1469,8 +1528,9 @@ async fn owned_repair_rounds_deliver_once_with_frozen_review_target_and_segment_
 #[tokio::test]
 async fn owned_repair_inflight_output_cannot_survive_pause_scene_change_or_late_echo() {
     for transition in ["pause", "scene", "late_echo", "revoke"] {
-        let root = tempfile::tempdir().unwrap();
-        let (mut app, tx, mut rx, log) = repair_app(root.path(), 5, true, false);
+        let root = crate::test_support::private_tempdir().unwrap();
+        let (mut app, tx, mut rx, log, server, release) =
+            repair_app(root.path(), 5, true, false, true).await;
         app.ingest_event(DanmuEvent::new(DanmuEventKind::Danmu, "合理问题"));
         let mut original = None;
         tokio::time::timeout(Duration::from_secs(8), async {
@@ -1486,12 +1546,7 @@ async fn owned_repair_inflight_output_cannot_survive_pause_scene_change_or_late_
                         .into_iter()
                         .find(|r| r.retry_of.is_none());
                 }
-                let prompts = std::fs::read_to_string(root.path().join("wire.jsonl"))
-                    .unwrap_or_default()
-                    .lines()
-                    .filter_map(|s| serde_json::from_str::<Value>(s).ok())
-                    .filter(|r| r["direction"] == "in" && r["value"]["method"] == "session/prompt")
-                    .count();
+                let prompts = server.requests().len();
                 if prompts == 2 {
                     break;
                 }
@@ -1510,6 +1565,7 @@ async fn owned_repair_inflight_output_cannot_survive_pause_scene_change_or_late_
             }
             _ => unreachable!(),
         }
+        let _ = release.unwrap().send(());
         for _ in 0..120 {
             app.advance_bridge(tx.clone());
             while let Ok(event) = rx.try_recv() {
@@ -1544,7 +1600,7 @@ fn automatic_account_fixture(root: &Path, uid: &str) -> AccountStatus {
     status
 }
 
-fn automatic_app(root: &Path, room_id: &str, uid: &str, local: bool) -> TerminalApp {
+fn automatic_app(root: &Path, room_id: &str, uid: &str, local: bool) -> RuntimeState {
     let status = automatic_account_fixture(root, uid);
     let mut app = replay::app(root, DanmuSession::new(room_id));
     app.config.room_id = room_id.into();
@@ -1563,7 +1619,7 @@ fn automatic_app(root: &Path, room_id: &str, uid: &str, local: bool) -> Terminal
     app
 }
 
-fn restore_current_automatic(app: &mut TerminalApp) -> anyhow::Result<()> {
+fn restore_current_automatic(app: &mut RuntimeState) -> anyhow::Result<()> {
     let session = app.bridge.session_id();
     let generation = app.assistant_accounts.generation();
     app.restore_automatic(&session, generation)
@@ -1571,7 +1627,7 @@ fn restore_current_automatic(app: &mut TerminalApp) -> anyhow::Result<()> {
 
 #[test]
 fn automatic_permission_reloads_only_for_the_same_room_and_sending_uid() {
-    let same = tempfile::tempdir().unwrap();
+    let same = crate::test_support::private_tempdir().unwrap();
     let mut authorized = automatic_app(same.path(), "100", "11", false);
     authorized.set_automatic_permission(true).unwrap();
     assert!(authorized.bridge.sending_enabled());
@@ -1582,7 +1638,7 @@ fn automatic_permission_reloads_only_for_the_same_room_and_sending_uid() {
     restore_current_automatic(&mut reloaded).unwrap();
     assert!(reloaded.bridge.sending_enabled());
 
-    let different_room = tempfile::tempdir().unwrap();
+    let different_room = crate::test_support::private_tempdir().unwrap();
     let mut authorized = automatic_app(different_room.path(), "100", "11", false);
     authorized.set_automatic_permission(true).unwrap();
     drop(authorized);
@@ -1590,7 +1646,7 @@ fn automatic_permission_reloads_only_for_the_same_room_and_sending_uid() {
     let _ = restore_current_automatic(&mut reloaded);
     assert!(!reloaded.bridge.sending_enabled());
 
-    let different_account = tempfile::tempdir().unwrap();
+    let different_account = crate::test_support::private_tempdir().unwrap();
     let mut authorized = automatic_app(different_account.path(), "100", "11", false);
     authorized.set_automatic_permission(true).unwrap();
     drop(authorized);
@@ -1601,7 +1657,7 @@ fn automatic_permission_reloads_only_for_the_same_room_and_sending_uid() {
 
 #[test]
 fn missing_credentials_cannot_restore_a_saved_automatic_grant() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let mut authorized = automatic_app(root.path(), "100", "11", false);
     authorized.set_automatic_permission(true).unwrap();
     drop(authorized);
@@ -1615,7 +1671,7 @@ fn missing_credentials_cannot_restore_a_saved_automatic_grant() {
 
 #[test]
 fn automatic_restore_rejects_late_identity_generation_and_scene() {
-    let generation_root = tempfile::tempdir().unwrap();
+    let generation_root = crate::test_support::private_tempdir().unwrap();
     let mut authorized = automatic_app(generation_root.path(), "100", "11", false);
     authorized.set_automatic_permission(true).unwrap();
     drop(authorized);
@@ -1631,7 +1687,7 @@ fn automatic_restore_rejects_late_identity_generation_and_scene() {
     let _ = reloaded.restore_automatic(&session, stale_generation);
     assert!(!reloaded.bridge.sending_enabled());
 
-    let scene_root = tempfile::tempdir().unwrap();
+    let scene_root = crate::test_support::private_tempdir().unwrap();
     let mut authorized = automatic_app(scene_root.path(), "100", "11", false);
     authorized.set_automatic_permission(true).unwrap();
     drop(authorized);
@@ -1646,7 +1702,7 @@ fn automatic_restore_rejects_late_identity_generation_and_scene() {
 
 #[test]
 fn explicit_disable_survives_reload_and_removes_the_restore_grant() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let mut authorized = automatic_app(root.path(), "100", "11", false);
     authorized.set_automatic_permission(true).unwrap();
     authorized.set_automatic_permission(false).unwrap();
@@ -1660,7 +1716,7 @@ fn explicit_disable_survives_reload_and_removes_the_restore_grant() {
 
 #[test]
 fn local_permission_never_becomes_a_persistent_production_grant() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let mut local = automatic_app(root.path(), "100", "11", true);
     local.set_automatic_permission(true).unwrap();
     assert!(local.bridge.sending_enabled());
@@ -1673,7 +1729,7 @@ fn local_permission_never_becomes_a_persistent_production_grant() {
 
 #[test]
 fn automatic_permission_rejects_unverified_identity_before_changing_settings() {
-    let missing = tempfile::tempdir().unwrap();
+    let missing = crate::test_support::private_tempdir().unwrap();
     let mut signed_out = replay::app(missing.path(), DanmuSession::new("100"));
     signed_out.config.room_id = "100".into();
     signed_out.bridge = Bridge::new(false);
@@ -1682,7 +1738,7 @@ fn automatic_permission_rejects_unverified_identity_before_changing_settings() {
     assert!(!signed_out.bridge.sending_enabled());
     assert!(!signed_out.runner.settings.automatic);
 
-    let mismatched = tempfile::tempdir().unwrap();
+    let mismatched = crate::test_support::private_tempdir().unwrap();
     let mut app = automatic_app(mismatched.path(), "100", "11", false);
     app.account_status = AccountStatus::SignedIn {
         display_name: "错误缓存身份".into(),
@@ -1696,7 +1752,7 @@ fn automatic_permission_rejects_unverified_identity_before_changing_settings() {
 #[tokio::test]
 async fn invalid_identity_command_keeps_the_room_and_manual_sending_alive() {
     for search in [false, true] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = automatic_app(root.path(), "100", "11", false);
         app.set_automatic_permission(true).unwrap();
         app.resume_pending = true;
@@ -1765,7 +1821,7 @@ async fn invalid_identity_command_keeps_the_room_and_manual_sending_alive() {
 
 #[tokio::test]
 async fn command_recovery_does_not_hide_current_journal_write_failures() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let mut app = replay::app(root.path(), DanmuSession::new("local"));
     let blocked = root.path().join("not-a-directory");
     std::fs::write(&blocked, "occupied").unwrap();
@@ -1786,7 +1842,7 @@ async fn command_recovery_does_not_hide_current_journal_write_failures() {
 
 #[test]
 fn pause_revokes_and_forgets_automatic_permission_without_erasing_preference() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
     let mut app = automatic_app(root.path(), "100", "11", false);
     app.set_automatic_permission(true).unwrap();
     app.pause_assistant();
@@ -1809,26 +1865,25 @@ fn pause_revokes_and_forgets_automatic_permission_without_erasing_preference() {
 #[cfg(unix)]
 #[tokio::test]
 async fn persisted_ungranted_resume_keeps_input_live_and_starts_only_after_command() {
-    use std::os::unix::fs::PermissionsExt;
-    let root = tempfile::tempdir().unwrap();
-    let fixture = root.path().join("fixture");
-    std::fs::create_dir(&fixture).unwrap();
-    let program = fixture.join("acp-agent");
-    std::fs::write(
-        &program,
-        include_bytes!("../../tests/fixtures/acp_agent.py"),
-    )
-    .unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::write(fixture.join("fixture.json"), r#"{"mode":"normal"}"#).unwrap();
+    let root = crate::test_support::private_tempdir().unwrap();
+    let server = HttpServer::spawn(Vec::new()).await;
     let settings = crate::runner::settings::Settings {
-        host: crate::runner::settings::Host::Omp,
-        binary: program,
+        api: crate::runner::settings::ApiConfig {
+            base_url: server.base_url(),
+            model: "fixture-openai".into(),
+            ..Default::default()
+        },
         automatic: true,
         resume_on_start: true,
         ..Default::default()
     };
     settings.save(&root.path().join("assistant.json")).unwrap();
+    crate::runner::credentials::save(
+        &root.path().join("assistant.json"),
+        &settings.api,
+        "fixture-key-only",
+    )
+    .unwrap();
     let mut app = replay::app(root.path(), DanmuSession::new("local"));
     let (tx, _rx) = mpsc::channel(128);
     app.local_transport = Some(Arc::new(LocalTransport {
@@ -1851,27 +1906,247 @@ async fn persisted_ungranted_resume_keeps_input_live_and_starts_only_after_comma
     assert_eq!(app.input, "甲甲甲甲");
     assert!(!app.runner.running);
     assert!(!app.bridge.sending_enabled());
-    assert!(!fixture.join("wire.jsonl").exists());
+    assert!(server.requests().is_empty());
     app.command("/ai start", tx.clone()).await.unwrap();
-    for _ in 0..100 {
-        app.advance_bridge(tx.clone());
-        if app.runner.report.connected {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(app.runner.running && app.runner.report.connected);
+    assert!(app.runner.running);
     assert!(!app.bridge.sending_enabled());
     assert_eq!(app.input, "甲甲甲甲");
-    let wire = std::fs::read_to_string(fixture.join("wire.jsonl")).unwrap();
-    assert_eq!(
-        wire.lines()
-            .filter(|line| {
-                let row: Value = serde_json::from_str(line).unwrap();
-                row["direction"] == "in" && row["value"]["method"] == "session/new"
-            })
-            .count(),
-        1
-    );
+    assert!(server.requests().is_empty(), "显式启动也不能连接测试");
     app.runner.shutdown(&app.bridge).await;
+}
+
+#[test]
+fn migrated_settings_do_not_restore_a_real_matching_old_automatic_grant() {
+    for legacy in [
+        serde_json::json!({"host":"omp","automatic":true}),
+        serde_json::json!({"format":2,"host":"omp","automatic":true,"resume_on_start":true,"web_search":true}),
+        serde_json::json!({"format":3,"host":"omp","automatic":true,"resume_on_start":true,"web_search":true}),
+    ] {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let mut old = automatic_app(root.path(), "100", "11", false);
+        old.set_automatic_permission(true).unwrap();
+        assert!(old.assistant_accounts.has_automatic_grant());
+        drop(old);
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        std::fs::write(root.path().join("assistant.json"), &bytes).unwrap();
+        let mut migrated = automatic_app(root.path(), "100", "11", false);
+        assert!(
+            migrated
+                .assistant_accounts
+                .automatic_matches("100", &migrated.account_status),
+            "真实旧授权文件仍匹配，不能以删文件绕过迁移测试"
+        );
+        assert!(
+            !migrated.runner.settings.automatic
+                && !migrated.runner.settings.resume_on_start
+                && !migrated.runner.settings.web_search
+        );
+        assert!(!migrated.runner.running && !migrated.bridge.sending_enabled());
+        assert!(restore_current_automatic(&mut migrated).is_err());
+        assert_eq!(
+            std::fs::read(root.path().join("assistant.json")).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[tokio::test]
+async fn hidden_api_key_failure_success_and_cancel_keep_unicode_cursor_and_never_send() {
+    let root = crate::test_support::private_tempdir().unwrap();
+    let server = HttpServer::spawn(Vec::new()).await;
+    let mut app = replay::app(root.path(), DanmuSession::new("local"));
+    app.runner.settings.api.base_url = server.base_url();
+    app.runner.settings.api.model = "fixture-openai".into();
+    app.input = "人工甲🙂乙".into();
+    app.input.move_left();
+    let cursor = app.input.cursor();
+    let (tx, mut rx) = mpsc::channel(32);
+    app.open_ai_section("model").unwrap();
+    app.begin_assistant_api_key().unwrap();
+    app.handle_paste("fake-hidden-key-only");
+    paint(&mut app);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(!format!("{:?}", terminal.backend().buffer()).contains("fake-hidden-key-only"));
+    assert!(!app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE
+    }));
+    app.handle_key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        tx.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.input, "fake-hidden-key-only");
+    std::fs::write(root.path().join("assistant-secrets"), "occupied").unwrap();
+    app.handle_key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        tx.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(app.secret_target == Some(SecretTarget::AssistantApiKey));
+    assert_eq!(app.input, "fake-hidden-key-only");
+    assert!(!app.notice.contains("fake-hidden-key-only"));
+    assert!(rx.try_recv().is_err());
+    std::fs::remove_file(root.path().join("assistant-secrets")).unwrap();
+    app.handle_key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        tx.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(app.secret_target.is_none());
+    assert_eq!(app.input, "人工甲🙂乙");
+    assert_eq!(app.input.cursor(), cursor);
+    assert!(
+        crate::runner::credentials::load(
+            &root.path().join("assistant.json"),
+            &app.runner.settings.api
+        )
+        .unwrap()
+        .is_some()
+    );
+    app.begin_assistant_api_key().unwrap();
+    app.handle_paste("cancelled-secret");
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        tx.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.input, "cancelled-secret");
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx.clone())
+        .await
+        .unwrap();
+    assert_eq!(app.input, "人工甲🙂乙");
+    assert_eq!(app.input.cursor(), cursor);
+    app.command("/ai key do-not-log-key", tx).await.unwrap();
+    assert!(app.secret_target.is_none());
+    assert!(!app.notice.contains("do-not-log-key"));
+    assert!(server.requests().is_empty());
+    assert!(app.session.recent_events.is_empty());
+}
+
+#[tokio::test]
+async fn pending_resume_and_owned_subscription_operations_gate_connection_changes_without_network()
+{
+    let root = crate::test_support::private_tempdir().unwrap();
+    let mut app = replay::app(root.path(), DanmuSession::new("local"));
+    let (tx, _rx) = mpsc::channel(8);
+    app.ui_tx = Some(tx);
+    app.input = "原始甲🙂乙".into();
+    app.input.move_left();
+    let cursor = app.input.cursor();
+    app.resume_pending = true;
+    assert!(app.begin_assistant_api_key().is_err());
+    assert!(app.begin_chatgpt_login(None).is_err());
+    assert!(app.begin_chatgpt_sign_out("not-used").is_err());
+    assert!(app.begin_chatgpt_models().is_err());
+    app.resume_pending = false;
+    app.runner.running = true;
+    assert!(app.begin_assistant_api_key().is_err());
+    assert!(app.begin_chatgpt_login(None).is_err());
+    assert!(app.begin_chatgpt_models().is_err());
+    app.pause_assistant();
+    assert_eq!(app.input, "原始甲🙂乙");
+    assert_eq!(app.input.cursor(), cursor);
+    let token = uuid::Uuid::new_v4();
+    app.chatgpt_operation = Some(ChatgptOperation {
+        token,
+        account_id: None,
+        scene_id: app.bridge.session_id(),
+        account_generation: app.assistant_accounts.generation(),
+        task: tokio::spawn(std::future::pending()),
+    });
+    assert!(app.begin_assistant_api_key().is_err());
+    assert!(app.begin_chatgpt_models().is_err());
+    app.handle_ui_event(CoreEvent::ChatgptModels {
+        token: uuid::Uuid::new_v4(),
+        result: Ok(vec![]),
+    });
+    assert!(app.chatgpt_operation.is_some(), "旧完成事件不能取消新操作");
+    app.cancel_chatgpt_operation();
+    assert!(app.chatgpt_operation.is_none());
+    assert_eq!(app.input, "原始甲🙂乙");
+    assert_eq!(app.input.cursor(), cursor);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real PTY entry exercised explicitly by script/agent_smoke.py"]
+async fn subscription_pty_instance() {
+    let phase = match std::env::var("DANMU_TEST_SUBSCRIPTION_PHASE") {
+        Ok(phase) => phase,
+        Err(std::env::VarError::NotPresent) => return,
+        Err(_) => panic!("invalid subscription test phase"),
+    };
+    assert!(phase == "pty", "unknown subscription test phase");
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Control {
+        root: PathBuf,
+        oauth_origin: String,
+        api_origin: String,
+        browser_channel: PathBuf,
+    }
+    let path = PathBuf::from(
+        std::env::var_os("DANMU_TEST_SUBSCRIPTION_CONTROL")
+            .expect("private test control path required"),
+    );
+    crate::workspace_config::check_file(&path).unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    assert!(metadata.len() <= 16 * 1024);
+    let control: Control = serde_json::from_slice(&std::fs::read(&path).unwrap())
+        .expect("invalid private test control");
+    assert!(control.root.is_absolute() && control.browser_channel.is_absolute());
+    assert!(
+        control.browser_channel.parent() == path.parent(),
+        "browser channel must stay in private control directory"
+    );
+    crate::runner::subscription::install_test_oauth_origin(&control.oauth_origin).unwrap();
+    crate::runner::responses::install_test_api_origin(&control.api_origin).unwrap();
+    SUBSCRIPTION_TEST_BROWSER
+        .set(control.browser_channel.clone())
+        .expect("test browser already installed");
+    let fixtures = serde_json::json!({
+        "discovery": crate::runner::subscription::fixture_discovery(&control.oauth_origin),
+        "jwks": crate::runner::subscription::fixture_jwks(),
+        "refresh": crate::runner::subscription::fixture_token_response("refresh-2"),
+    });
+    crate::storage::write_private_atomic(
+        &control.browser_channel.with_extension("fixtures.json"),
+        &serde_json::to_vec(&fixtures).unwrap(),
+    )
+    .unwrap();
+    super::run_local(&control.root, false).await.unwrap();
+}
+
+#[test]
+fn fatal_cleanup_reports_original_and_both_durable_revocation_failures() {
+    let root = crate::test_support::private_tempdir().unwrap();
+    let mut app = automatic_app(root.path(), "100", "11", false);
+    app.set_automatic_permission(true).unwrap();
+    app.resume_pending = true;
+    app.input = "仍可编辑甲🙂乙".into();
+    app.input.move_left();
+    let cursor = app.input.cursor();
+    for filename in ["assistant.json", "assistant-account.json"] {
+        let path = root.path().join(filename);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(path).unwrap();
+    }
+    let message = app.fail_assistant("original-http-401-failure".into());
+    assert!(message.contains("original-http-401-failure"));
+    assert!(message.contains("保存助手停用状态失败"));
+    assert!(message.contains("清除自动发送授权失败"));
+    assert!(!app.resume_pending && !app.runner.running && !app.bridge.sending_enabled());
+    assert!(
+        app.assistant_accounts.has_automatic_grant(),
+        "不能谎称落盘撤权成功"
+    );
+    assert_eq!(app.input, "仍可编辑甲🙂乙");
+    assert_eq!(app.input.cursor(), cursor);
 }

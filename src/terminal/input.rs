@@ -4,24 +4,24 @@ use tui_input::{Input, InputRequest};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct EditorInput {
+pub(crate) struct EditorInput {
     inner: Input,
 }
 
 impl EditorInput {
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.inner.reset();
     }
 
-    pub(super) fn replace(&mut self, value: String) {
+    pub(crate) fn replace(&mut self, value: String) {
         self.inner = Input::new(value);
     }
 
-    pub(super) fn take(&mut self) -> String {
+    pub(crate) fn take(&mut self) -> String {
         self.inner.value_and_reset()
     }
 
-    pub(super) fn cursor(&self) -> usize {
+    pub(crate) fn cursor(&self) -> usize {
         let codepoint_cursor = self.inner.cursor();
         let mut codepoints = 0;
         self.inner
@@ -38,7 +38,7 @@ impl EditorInput {
     }
 
     #[cfg(test)]
-    pub(super) fn set_cursor(&mut self, grapheme_cursor: usize) {
+    pub(crate) fn set_cursor(&mut self, grapheme_cursor: usize) {
         let codepoint_cursor = self
             .inner
             .value()
@@ -50,14 +50,14 @@ impl EditorInput {
         self.inner.handle(InputRequest::SetCursor(codepoint_cursor));
     }
 
-    pub(super) fn insert_text(&mut self, text: &str) {
+    pub(crate) fn insert_text(&mut self, text: &str) {
         for character in text.chars() {
             self.inner.handle(InputRequest::InsertChar(character));
         }
     }
 
     /// Paste is text, never a stream of terminal key events.
-    pub(super) fn insert_paste(&mut self, text: &str, multiline: bool) {
+    pub(crate) fn insert_paste(&mut self, text: &str, multiline: bool) {
         let mut previous_cr = false;
         for character in text.chars() {
             if !(previous_cr && character == '\n') {
@@ -75,47 +75,47 @@ impl EditorInput {
         }
     }
 
-    pub(super) fn move_to_start(&mut self) {
+    pub(crate) fn move_to_start(&mut self) {
         self.inner.handle(InputRequest::GoToStart);
     }
 
-    pub(super) fn move_to_end(&mut self) {
+    pub(crate) fn move_to_end(&mut self) {
         self.inner.handle(InputRequest::GoToEnd);
     }
 
-    pub(super) fn move_left(&mut self) {
+    pub(crate) fn move_left(&mut self) {
         self.inner.handle(InputRequest::GoToPrevChar);
     }
 
-    pub(super) fn move_right(&mut self) {
+    pub(crate) fn move_right(&mut self) {
         self.inner.handle(InputRequest::GoToNextChar);
     }
 
-    pub(super) fn move_word_left(&mut self) {
+    pub(crate) fn move_word_left(&mut self) {
         self.inner.handle(InputRequest::GoToPrevWord);
     }
 
-    pub(super) fn move_word_right(&mut self) {
+    pub(crate) fn move_word_right(&mut self) {
         self.inner.handle(InputRequest::GoToNextWord);
     }
 
-    pub(super) fn delete_before_cursor(&mut self) {
+    pub(crate) fn delete_before_cursor(&mut self) {
         self.inner.handle(InputRequest::DeletePrevChar);
     }
 
-    pub(super) fn delete_at_cursor(&mut self) {
+    pub(crate) fn delete_at_cursor(&mut self) {
         self.inner.handle(InputRequest::DeleteNextChar);
     }
 
-    pub(super) fn delete_previous_word(&mut self) {
+    pub(crate) fn delete_previous_word(&mut self) {
         self.inner.handle(InputRequest::DeletePrevWord);
     }
 
-    pub(super) fn delete_to_end(&mut self) {
+    pub(crate) fn delete_to_end(&mut self) {
         self.inner.handle(InputRequest::DeleteTillEnd);
     }
 
-    pub(super) fn previous_grapheme(&self) -> Option<&str> {
+    pub(crate) fn previous_grapheme(&self) -> Option<&str> {
         let cursor = self.cursor();
         self.inner
             .value()

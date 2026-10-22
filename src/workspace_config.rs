@@ -1,5 +1,5 @@
 //! Program-owned observations, never a settings source or authorization to run/send.
-use crate::runner::settings::{Settings, Source};
+use crate::runner::settings::Settings;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -25,15 +25,12 @@ pub(crate) struct Reading {
 // Deliberate whitelist: no Settings serialization, auth discovery, source-file reads,
 // process options, runtime session IDs, room state, or Bridge permission state.
 fn assistant(settings: &Settings) -> Value {
-    let native = settings.native_preferences();
     json!({
-        "host": settings.host,
+        "api_protocol": settings.api.protocol,
         "name": settings.name,
         "preferences": settings.preferences,
         "use_profile": settings.use_profile,
         "use_project": settings.use_project,
-        "source_kind": match settings.source { Source::Default => "default", Source::OmpProfile(_) => "omp_profile", Source::NativePrompt(_) => "native_prompt" },
-        "omp_profile": match &settings.source { Source::OmpProfile(name) => Some(name), _ => None },
         "automatic_preference": settings.automatic,
         "resume_on_start_preference": settings.resume_on_start,
         "reply_activity": settings.reply_activity,
@@ -49,8 +46,9 @@ fn assistant(settings: &Settings) -> Value {
         "blocked_words": settings.blocked_words,
         "skills": settings.skills,
         "persona": settings.persona,
-        "model": native.and_then(|p| p.model.as_deref()),
-        "thinking": native.and_then(|p| p.thinking.as_deref()),
+        "model": settings.api.model,
+        "max_output_tokens": settings.api.max_output_tokens,
+        "openai_token_limit": settings.api.openai_token_limit,
     })
 }
 
@@ -140,7 +138,7 @@ pub(crate) fn record(
     Ok(())
 }
 
-fn check_file(path: &Path) -> Result<()> {
+pub(crate) fn check_file(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             ensure!(
@@ -246,22 +244,43 @@ mod tests {
         assert_ne!(records[0]["revision"], records[2]["revision"]);
     }
     #[test]
-    fn source_paths_and_contents_are_not_copied() {
+    fn connection_addresses_and_private_storage_are_not_copied() {
         let root = tempfile::tempdir().unwrap();
-        let secret = root.path().join("native-auth-secret.json");
+        let secret = root.path().join("assistant-secrets/api-key.json");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
         std::fs::write(&secret, "BILIBILI_OBS_MODEL_BRIDGE_SECRET").unwrap();
         let settings = Settings {
-            source: Source::NativePrompt(secret),
-            binary: "/private/SECRET_EXECUTABLE".into(),
+            api: crate::runner::settings::ApiConfig {
+                base_url: "https://SECRET_ENDPOINT.example/v1".into(),
+                model: "chosen-model".into(),
+                chatgpt_account: Some("private-registration-id".into()),
+                ..crate::runner::settings::ApiConfig::default()
+            },
             ..Settings::default()
         };
         record(root.path(), &settings, None).unwrap();
         let text = std::fs::read_to_string(root.path().join(".danmu/config/current.json")).unwrap();
-        assert!(!text.contains("SECRET") && !text.contains("native-auth-secret"));
-        assert_eq!(
-            history(root.path())[0]["assistant"]["source_kind"],
-            "native_prompt"
-        );
+        let journal =
+            std::fs::read_to_string(root.path().join(".danmu/config/history.jsonl")).unwrap();
+        for text in [&text, &journal] {
+            for hidden in [
+                "SECRET",
+                "assistant-secrets",
+                "api-key",
+                "base_url",
+                "chatgpt_account",
+                "private-registration-id",
+                "source_kind",
+                "omp_profile",
+                "thinking",
+                "\"host\"",
+            ] {
+                assert!(!text.contains(hidden), "{hidden}");
+            }
+        }
+        let projection = &history(root.path())[0]["assistant"];
+        assert_eq!(projection["model"], "chosen-model");
+        assert_eq!(projection["max_output_tokens"], 4096);
     }
     #[test]
     fn committed_journal_repairs_missing_projection_and_partial_tail() {
@@ -313,13 +332,11 @@ mod tests {
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
     #[test]
-    fn reading_and_native_selection_survive_assistant_only_updates() {
+    fn reading_and_model_selection_survive_assistant_only_updates() {
         let root = tempfile::tempdir().unwrap();
         let mut settings = Settings::default();
-        let mut native = crate::runner::settings::NativePreferences::scope(&settings);
-        native.model = Some("chosen-model".into());
-        native.thinking = Some("high".into());
-        settings.remember_native(native);
+        settings.api.model = "chosen-model".into();
+        settings.api.max_output_tokens = 2048;
         let reading = Reading {
             single_line: true,
             chat_layout: false,
@@ -337,7 +354,6 @@ mod tests {
         .unwrap();
         assert_eq!(current["reading"], serde_json::to_value(&reading).unwrap());
         assert_eq!(current["assistant"]["model"], "chosen-model");
-        assert_eq!(current["assistant"]["thinking"], "high");
         assert_eq!(current["assistant"]["dynamic_host_priority"], false);
         assert_eq!(history(root.path()).len(), 2);
     }
@@ -346,7 +362,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("config.toml");
         let workspace = root.path().join("workspace");
-        let mut runner = crate::runner::Runner::load(&config);
+        let mut runner = crate::runner::Runner::load(&config, &workspace);
         runner.settings.workspace = Some(workspace.clone());
         let directory = crate::workspace::managed_root(&workspace)
             .unwrap()
@@ -356,7 +372,7 @@ mod tests {
         let mut settings = runner.settings.clone();
         settings.preferences = "已正式提交".into();
         runner
-            .save(settings.clone(), &crate::bridge::Bridge::new(true), false)
+            .save(settings.clone(), &crate::bridge::Bridge::new(true))
             .unwrap();
         let (saved, _) = Settings::load(&root.path().join("assistant.json")).unwrap();
         assert_eq!(runner.settings, saved);
@@ -365,7 +381,7 @@ mod tests {
         assert!(!runner.running);
         std::fs::remove_dir(directory.join("current.json")).unwrap();
         runner
-            .save(saved, &crate::bridge::Bridge::new(true), false)
+            .save(saved, &crate::bridge::Bridge::new(true))
             .unwrap();
         assert!(runner.config_warning.is_none());
         assert_eq!(history(&workspace).len(), 1);
@@ -373,7 +389,7 @@ mod tests {
         invalid.name.clear();
         assert!(
             runner
-                .save(invalid, &crate::bridge::Bridge::new(true), false)
+                .save(invalid, &crate::bridge::Bridge::new(true))
                 .is_err()
         );
         assert_eq!(history(&workspace).len(), 1);

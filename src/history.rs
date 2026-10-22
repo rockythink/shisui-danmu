@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::File,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -228,21 +228,35 @@ impl History {
             offset >= 0 && offset <= bytes,
             "历史归档已截断；保留索引和归档，停止导入"
         );
-        // Journals are append-only. Restrict this import to the prefix that existed
-        // when the file was opened so writers remain unblocked and a busy journal
-        // cannot make the scan chase a moving EOF.
-        let mut reader = BufReader::new(file.take(bytes as u64));
-        let mut digest = Sha256::new();
-        std::io::copy(&mut (&mut reader).take(offset as u64), &mut digest)?;
+        let mut file = file;
         if let Some((_, expected)) = &previous {
-            ensure!(
-                &digest.clone().finalize()[..] == expected,
-                "历史归档已修改；保留两边，停止导入"
-            );
+            let unchanged = if expected.first() == Some(&PREFIX_FINGERPRINT_VERSION) {
+                prefix_fingerprint(&mut file, offset as u64)? == *expected
+            } else {
+                // Rows from before fingerprints hold a hash of the whole prefix; check it once,
+                // then the row below moves to the bounded fingerprint.
+                let mut digest = Sha256::new();
+                file.seek(SeekFrom::Start(0))?;
+                std::io::copy(&mut (&mut file).take(offset as u64), &mut digest)?;
+                digest.finalize()[..] == expected[..]
+            };
+            ensure!(unchanged, "历史归档已修改；保留两边，停止导入");
             if offset == bytes {
+                if expected.first() != Some(&PREFIX_FINGERPRINT_VERSION) {
+                    let fingerprint = prefix_fingerprint(&mut file, offset as u64)?;
+                    self.connection.execute(
+                        "UPDATE journal_imports SET digest=?2 WHERE path=?1",
+                        params![key, fingerprint],
+                    )?;
+                }
                 return Ok(());
             }
         }
+        // Journals are append-only. Restrict this import to the prefix that existed
+        // when the file was opened so writers remain unblocked and a busy journal
+        // cannot make the scan chase a moving EOF.
+        file.seek(SeekFrom::Start(offset as u64))?;
+        let mut reader = BufReader::new((&mut file).take((bytes - offset) as u64));
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Record<'a> {
@@ -264,20 +278,6 @@ impl History {
         struct LegacyRoom {
             #[serde(rename = "roomID")]
             id: String,
-        }
-        #[derive(Deserialize)]
-        struct LegacyPayload {
-            event: LegacyEvent,
-        }
-        #[derive(Deserialize)]
-        struct LegacyEvent {
-            id: String,
-            kind: DanmuEventKind,
-            timestamp: chrono::DateTime<chrono::Utc>,
-            username: Option<String>,
-            #[serde(rename = "authorID")]
-            author_id: Option<String>,
-            content: String,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -304,7 +304,6 @@ impl History {
             let record: Record =
                 serde_json::from_slice(&line).context("历史归档损坏，未完成索引")?;
             completed += count as u64;
-            digest.update(&line);
             let legacy = match record.schema_version {
                 None => false,
                 Some(1) => true,
@@ -321,24 +320,18 @@ impl History {
                 }
                 belongs = true;
             } else if belongs && record.kind == Kind::EventReceived {
-                if legacy {
-                    let event = serde_json::from_str::<LegacyPayload>(record.payload.get())?.event;
-                    if event.kind == DanmuEventKind::Danmu {
-                        self.insert(
-                            &event.id,
-                            event.timestamp.timestamp(),
-                            event.author_id.as_deref(),
-                            event.username.as_deref(),
-                            &event.content,
-                        )?;
-                    }
+                let event = if legacy {
+                    crate::legacy::decode_event(record.payload)?
                 } else {
-                    self.record(&serde_json::from_str::<DanmuEvent>(record.payload.get())?)?;
-                }
+                    serde_json::from_str::<DanmuEvent>(record.payload.get())?
+                };
+                self.record(&event)?;
             }
         }
         if belongs {
-            transaction.execute("INSERT INTO journal_imports(path,bytes,digest) VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET bytes=excluded.bytes,digest=excluded.digest", params![key,completed,digest.finalize().to_vec()])?;
+            drop(reader);
+            let fingerprint = prefix_fingerprint(&mut file, completed)?;
+            transaction.execute("INSERT INTO journal_imports(path,bytes,digest) VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET bytes=excluded.bytes,digest=excluded.digest", params![key,completed,fingerprint])?;
         }
         transaction.commit()?;
         Ok(())
@@ -564,6 +557,25 @@ fn tokens(text: &str) -> BTreeSet<String> {
     out
 }
 
+const PREFIX_FINGERPRINT_VERSION: u8 = 2;
+const FINGERPRINT_WINDOW: u64 = 64 * 1024;
+
+/// Identifies an imported prefix of an append-only journal without rereading all of it: its
+/// length plus its first and last 64 KB. Hashing whole prefixes made every connect reread
+/// hundreds of megabytes of a busy room's archive.
+fn prefix_fingerprint(file: &mut File, length: u64) -> Result<Vec<u8>> {
+    let mut digest = Sha256::new();
+    digest.update(length.to_le_bytes());
+    file.seek(SeekFrom::Start(0))?;
+    std::io::copy(&mut (&mut *file).take(length.min(FINGERPRINT_WINDOW)), &mut digest)?;
+    let tail = length.saturating_sub(FINGERPRINT_WINDOW).max(length.min(FINGERPRINT_WINDOW));
+    file.seek(SeekFrom::Start(tail))?;
+    std::io::copy(&mut (&mut *file).take(length - tail), &mut digest)?;
+    let mut fingerprint = vec![PREFIX_FINGERPRINT_VERSION];
+    fingerprint.extend_from_slice(&digest.finalize());
+    Ok(fingerprint)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +586,65 @@ mod tests {
         event.username = Some("同名主播".into());
         event.timestamp = chrono::DateTime::from_timestamp(seconds, 0).unwrap();
         event
+    }
+
+    #[test]
+    fn reconnecting_checks_a_bounded_fingerprint_and_still_catches_rewrites() {
+        let root = tempfile::tempdir().unwrap();
+        let history = History::open(root.path(), "123").unwrap();
+        let journal = root.path().join("journal.jsonl");
+        let started = json!({"kind":"sessionStarted","payload":{"roomId":"123"}}).to_string();
+        let mut body = format!("{started}\n");
+        // Large enough that the head and tail windows do not cover the middle.
+        for index in 0..3_000 {
+            let line = json!({"kind":"eventReceived","payload":event(&format!("e{index}"), "u", 1_000 + index, &format!("第 {index} 条"))});
+            body.push_str(&format!("{line}\n"));
+        }
+        std::fs::write(&journal, &body).unwrap();
+        history.import_journal(&journal).unwrap();
+        let stored: Vec<u8> = history
+            .connection
+            .query_row("SELECT digest FROM journal_imports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored.first(), Some(&PREFIX_FINGERPRINT_VERSION));
+
+        // Appending imports only the new part.
+        let appended = json!({"kind":"eventReceived","payload":event("late", "u", 9_999, "后来的")});
+        std::fs::write(&journal, format!("{body}{appended}\n")).unwrap();
+        history.import_journal(&journal).unwrap();
+        assert_eq!(history.search(["后来的"].into_iter(), "", &[], 4096).unwrap().len(), 1);
+
+        // Rewriting the start of an imported prefix is still refused.
+        let rewritten = format!("{body}{appended}\n").replacen("第 0 条", "第 X 条", 1);
+        std::fs::write(&journal, rewritten).unwrap();
+        assert!(history.import_journal(&journal).is_err());
+    }
+
+    #[test]
+    fn whole_prefix_hashes_from_older_versions_are_verified_once_then_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let history = History::open(root.path(), "123").unwrap();
+        let journal = root.path().join("journal.jsonl");
+        let body = format!(
+            "{}\n{}\n",
+            json!({"kind":"sessionStarted","payload":{"roomId":"123"}}),
+            json!({"kind":"eventReceived","payload":event("a", "u", 1_000, "旧索引")}),
+        );
+        std::fs::write(&journal, &body).unwrap();
+        history
+            .connection
+            .execute(
+                "INSERT INTO journal_imports VALUES(?1,?2,?3)",
+                params![journal.as_os_str().as_encoded_bytes(), body.len() as i64, &Sha256::digest(body.as_bytes())[..]],
+            )
+            .unwrap();
+        history.import_journal(&journal).unwrap();
+        let stored: Vec<u8> = history
+            .connection
+            .query_row("SELECT digest FROM journal_imports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored.first(), Some(&PREFIX_FINGERPRINT_VERSION));
+        history.import_journal(&journal).unwrap();
     }
 
     #[test]

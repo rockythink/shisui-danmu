@@ -45,13 +45,13 @@ const featureRows = [
   },
   {
     number: "06",
-    title: "本机 AI 助手，先审核再发送",
-    description: "接入用户已安装并认证的宿主，候选回复默认先进入审核；基础 TUI 免费，模型调用费用由所选服务决定。内置 ACP Runner 目前仅支持 Unix。",
+    title: "轻量 AI 助手，先审核再发送",
+    description: "未发布源码直连 OpenAI 兼容、Anthropic API 或官方 ChatGPT 订阅 preview，无需本地 coding CLI。候选先审核；没有默认免费模型或自动付费回退。",
   },
   {
     number: "07",
     title: "少空转，也看得见为什么",
-    description: "连续空回复会短时合批，减少无效调用；轮次诊断区分等待、零候选、原生无正文与真实错误。",
+    description: "连续空回复会短时合批，减少无效调用；每轮完整装配资料、历史与送达事实，诊断区分等待、内容拒绝、搜索不可用与真正错误。",
   },
 ];
 
@@ -68,7 +68,8 @@ const featureRows = [
         <span>DANMU</span>
       </a>
       <nav aria-label="主要导航">
-        <a class="guide-link" href="/guide/">GUIDE</a>
+        <a class="primary-link" href="/guide/">GUIDE</a>
+        <a class="primary-link" href="/changelog/">更新日志</a>
         <a href="https://github.com/rockythink/shisui-danmu/releases/latest" target="_blank" rel="noreferrer">RELEASES</a>
         <a href="#features">FEATURES</a>
         <a class="icon-link" href="https://github.com/rockythink/shisui-danmu" target="_blank" rel="noreferrer" aria-label="GitHub">
@@ -148,7 +149,7 @@ const featureRows = [
         </div>
 
         <div class="stage-caption">
-          <span>B站直播间基础功能实录 · 不代表已展示 v0.5.0 AI 助手流程</span>
+          <span>B站直播间基础功能实录 · 不代表已展示未发布 HTTP 助手流程</span>
           <a href="/danmu-product-demo.mp4" download>下载视频 ↓</a>
         </div>
       </section>
@@ -165,7 +166,7 @@ const featureRows = [
           </div>
           <div class="install-platforms">
             <span><i></i>macOS</span><span><i></i>Linux</span><span><i></i>Windows</span>
-            <small>原生二进制 · 无需云端账号</small>
+            <small>原生二进制 · 公开监看无需登录</small>
           </div>
         </section>
       </div>
@@ -174,7 +175,7 @@ const featureRows = [
         <header class="feature-header">
           <div class="section-kicker"><span></span>功能亮点</div>
           <h2 id="features-title">不是多一块屏幕。<br />是少错过一个人。</h2>
-          <p>把 B站直播间里和“人”有关的信号留在同一条时间线上，让主播看见谁来了、谁在问、谁在支持，以及上一句话从哪里开始。</p>
+          <p>把 B站直播间里和“人”有关的信号留在同一条时间线上，让主播看见谁来了、谁在问、谁在支持，以及上一句话从哪里开始。最新正式版仍为 v0.5.1；下列 HTTP 助手说明属于未发布源码，安装渠道尚未包含。<a href="/guide/#模型连接与密钥">查看连接、密钥与订阅说明 →</a></p>
         </header>
 
         <div class="relationship-band">
@@ -211,7 +212,8 @@ const featureRows = [
       </div>
       <div class="footer-meta">
         <a href="https://github.com/rockythink/shisui-danmu" target="_blank" rel="noreferrer"><span>◆</span> MPL-2.0 · OPEN SOURCE</a>
-        <a class="guide-link" href="/guide/">使用手册</a>
+        <a class="primary-link" href="/guide/">使用手册</a>
+        <a class="primary-link" href="/changelog/">更新日志</a>
         <a class="footer-recording" href="/danmu-product-demo.mp4" target="_blank" rel="noreferrer">观看实机录屏</a>
         <span class="footer-platforms">MACOS · LINUX · WINDOWS</span>
       </div>

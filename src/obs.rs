@@ -2,7 +2,7 @@ mod meter;
 
 pub use meter::MicrophoneLevel;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use futures_util::StreamExt;
 use meter::{LevelSmoother, SILENCE_DB, peak_db};
 use obws::{Client, client::ConnectConfig, events::Event, requests::EventSubscription};
@@ -49,63 +49,132 @@ impl ObsConfiguration {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
-        Ok(())
+        let path = std::path::absolute(path)?;
+        crate::persistence::check_path(&path)?;
+        crate::workspace_config::check_file(&path)?;
+        let parent = path.parent().context("OBS 配置路径没有父目录")?;
+        crate::bridge::wire::private_root(parent)?;
+        crate::storage::write_private_atomic(&path, &serde_json::to_vec_pretty(self)?)
     }
 }
 
 const OBS_PASSWORD_FILENAME: &str = "obs-password";
+const MAX_OBS_PASSWORD: u64 = 16 * 1024;
 
-fn obs_password_path(configuration_path: &Path) -> PathBuf {
-    configuration_path.with_file_name(OBS_PASSWORD_FILENAME)
+/// Host-owned credential storage. Errors are authoritative: callers must not fall
+/// back to another store (in particular, from Keychain to a plaintext file).
+pub trait ObsPasswordStore: Send + Sync {
+    fn read(&self, host: &str, port: u16) -> Result<Option<String>>;
+    fn write(&self, host: &str, port: u16, password: &str) -> Result<()>;
 }
 
-pub(crate) fn save_obs_password(configuration_path: &Path, password: &str) -> Result<()> {
-    let path = obs_password_path(configuration_path);
-    if password.is_empty() {
-        return match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+/// The TUI's existing environment → private-file policy. Desktop hosts inject
+/// their own store instead; isolated/local hosts disable environment inheritance.
+pub struct FileObsPasswordStore {
+    configuration_path: PathBuf,
+    allow_environment: bool,
+}
+
+impl FileObsPasswordStore {
+    pub fn new(configuration_path: PathBuf, allow_environment: bool) -> Self {
+        Self {
+            configuration_path,
+            allow_environment,
+        }
+    }
+
+    fn path(&self, create: bool) -> Result<Option<PathBuf>> {
+        let path = std::path::absolute(
+            self.configuration_path
+                .with_file_name(OBS_PASSWORD_FILENAME),
+        )?;
+        crate::persistence::check_path(&path)?;
+        let parent = path.parent().context("OBS 密码路径没有父目录")?;
+        if !create && !parent.try_exists()? {
+            return Ok(None);
+        }
+        crate::bridge::wire::private_root(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            ensure!(
+                std::fs::metadata(parent)?.uid() == unsafe { libc::geteuid() },
+                "OBS 密码目录须属于当前用户"
+            );
+        }
+        crate::workspace_config::check_file(&path).context("OBS 密码文件不安全")?;
+        Ok(Some(path))
+    }
+}
+
+impl ObsPasswordStore for FileObsPasswordStore {
+    fn read(&self, _host: &str, _port: u16) -> Result<Option<String>> {
+        use std::io::Read;
+        if self.allow_environment
+            && let Some(password) = std::env::var("OBS_API_PASSWORD")
+                .ok()
+                .filter(|password| !password.is_empty())
+        {
+            ensure!(
+                password.len() as u64 <= MAX_OBS_PASSWORD,
+                "OBS 密码超过16KiB"
+            );
+            return Ok(Some(password));
+        }
+        let Some(path) = self.path(false)? else {
+            return Ok(None);
         };
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("读取 OBS 密码文件失败"),
+        };
+        let metadata = file.metadata()?;
+        ensure!(metadata.is_file(), "OBS 密码必须为普通文件");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            ensure!(
+                metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.nlink() == 1
+                    && metadata.mode() & 0o077 == 0,
+                "OBS 密码文件须由当前用户独占且仅本人可访问（0600）"
+            );
+        }
+        let mut password = String::new();
+        file.take(MAX_OBS_PASSWORD + 1)
+            .read_to_string(&mut password)
+            .context("读取 OBS 密码文件失败")?;
+        ensure!(
+            password.len() as u64 <= MAX_OBS_PASSWORD,
+            "OBS 密码超过16KiB"
+        );
+        Ok((!password.is_empty()).then_some(password))
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(password.as_bytes())?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    std::fs::write(path, password)?;
-    Ok(())
-}
-
-fn load_obs_password(configuration_path: &Path) -> Result<Option<String>> {
-    if let Some(password) = std::env::var("OBS_API_PASSWORD")
-        .ok()
-        .filter(|password| !password.is_empty())
-    {
-        return Ok(Some(password));
-    }
-    match std::fs::read_to_string(obs_password_path(configuration_path)) {
-        Ok(password) if password.is_empty() => Ok(None),
-        Ok(password) => Ok(Some(password)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+    fn write(&self, _host: &str, _port: u16, password: &str) -> Result<()> {
+        ensure!(
+            password.len() as u64 <= MAX_OBS_PASSWORD,
+            "OBS 密码超过16KiB"
+        );
+        let Some(path) = self.path(!password.is_empty())? else {
+            return Ok(());
+        };
+        if password.is_empty() {
+            return match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            };
+        }
+        crate::storage::write_private_atomic(&path, password.as_bytes())
     }
 }
 
@@ -136,6 +205,7 @@ pub struct ObsStatus {
 struct ObsConnectionState {
     configuration: ObsConfiguration,
     client: Option<Arc<Client>>,
+    password_generation: u64,
 }
 
 #[derive(Clone)]
@@ -143,16 +213,23 @@ pub struct ObsController {
     state: Arc<Mutex<ObsConnectionState>>,
     connect_lock: Arc<Mutex<()>>,
     configuration_path: PathBuf,
+    passwords: Arc<dyn ObsPasswordStore>,
 }
 
 impl ObsController {
-    pub fn new(configuration: ObsConfiguration, configuration_path: PathBuf) -> Self {
+    pub fn new(
+        configuration: ObsConfiguration,
+        configuration_path: PathBuf,
+        passwords: Arc<dyn ObsPasswordStore>,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(ObsConnectionState {
                 configuration,
                 client: None,
+                password_generation: 0,
             })),
             configuration_path,
+            passwords,
             connect_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -167,9 +244,22 @@ impl ObsController {
     }
 
     pub async fn set_password(&self, password: &str) -> Result<()> {
+        let configuration = self.configuration().await;
+        let passwords = Arc::clone(&self.passwords);
+        let host = configuration.host.clone();
+        let port = configuration.port;
+        let password = password.to_owned();
+        tokio::task::spawn_blocking(move || passwords.write(&host, port, &password))
+            .await
+            .context("OBS 密码存储任务失败")??;
         let _connect_guard = self.connect_lock.lock().await;
-        save_obs_password(&self.configuration_path, password)?;
-        self.state.lock().await.client = None;
+        let mut state = self.state.lock().await;
+        state.password_generation = state.password_generation.wrapping_add(1);
+        if state.configuration.host == configuration.host
+            && state.configuration.port == configuration.port
+        {
+            state.client = None;
+        }
         Ok(())
     }
 
@@ -427,17 +517,33 @@ impl ObsController {
                 return Ok(Arc::clone(client));
             }
         }
-        let _connect_guard = self.connect_lock.lock().await;
         loop {
-            let configuration = {
+            let (configuration, password_generation) = {
                 let state = self.state.lock().await;
                 if let Some(client) = &state.client {
                     return Ok(Arc::clone(client));
                 }
-                state.configuration.clone()
+                (state.configuration.clone(), state.password_generation)
             };
-            let password =
-                load_obs_password(&self.configuration_path).context("读取 OBS 本地密码失败")?;
+            let passwords = Arc::clone(&self.passwords);
+            let host = configuration.host.clone();
+            let port = configuration.port;
+            let password = tokio::task::spawn_blocking(move || passwords.read(&host, port))
+                .await
+                .context("OBS 密码存储任务失败")?
+                .context("读取 OBS 密码失败")?;
+            let _connect_guard = self.connect_lock.lock().await;
+            {
+                let state = self.state.lock().await;
+                if let Some(client) = &state.client {
+                    return Ok(Arc::clone(client));
+                }
+                if state.configuration != configuration
+                    || state.password_generation != password_generation
+                {
+                    continue;
+                }
+            }
             let password_configured = password.is_some();
             let connect = Client::connect_with_config(ConnectConfig {
                 host: configuration.host.clone(),
@@ -464,12 +570,14 @@ impl ObsController {
                     if password_configured {
                         target
                     } else {
-                        format!("{target}；OBS 已启用认证时，请运行 /obs config password 保存密码")
+                        format!("{target}；OBS 已启用认证时，请在 OBS 设置中保存连接密码")
                     }
                 })?;
             let client = Arc::new(client);
             let mut state = self.state.lock().await;
-            if state.configuration != configuration {
+            if state.configuration != configuration
+                || state.password_generation != password_generation
+            {
                 continue;
             }
             if let Some(existing) = &state.client {
@@ -623,7 +731,7 @@ mod tests {
 
     #[test]
     fn configuration_round_trips_without_external_cli_fields() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let path = temp.path().join("obs.json");
         let configuration = ObsConfiguration {
             host: "192.168.1.20".into(),
@@ -637,7 +745,7 @@ mod tests {
 
     #[test]
     fn legacy_external_cli_field_is_ignored_when_loading_configuration() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let path = temp.path().join("obs.json");
         std::fs::write(
             &path,
@@ -655,20 +763,21 @@ mod tests {
     }
     #[test]
     fn password_round_trips_in_private_app_file() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let configuration_path = temp.path().join("obs-control.json");
 
-        save_obs_password(&configuration_path, "secret-value").unwrap();
+        let passwords = FileObsPasswordStore::new(configuration_path.clone(), false);
+        passwords.write("localhost", 4455, "secret-value").unwrap();
 
         assert_eq!(
-            load_obs_password(&configuration_path).unwrap().as_deref(),
+            passwords.read("localhost", 4455).unwrap().as_deref(),
             Some("secret-value"),
         );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                std::fs::metadata(obs_password_path(&configuration_path))
+                std::fs::metadata(configuration_path.with_file_name(OBS_PASSWORD_FILENAME))
                     .unwrap()
                     .permissions()
                     .mode()
@@ -677,6 +786,239 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn private_password_store_bounds_reads_and_clears_only_its_file() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let configuration = root.path().join("obs.json");
+        let passwords = FileObsPasswordStore::new(configuration, false);
+        assert!(passwords.read("localhost", 4455).unwrap().is_none());
+        passwords
+            .write("localhost", 4455, "synthetic-password")
+            .unwrap();
+        assert_eq!(
+            passwords.read("localhost", 4455).unwrap().as_deref(),
+            Some("synthetic-password")
+        );
+        let path = root.path().join(OBS_PASSWORD_FILENAME);
+        crate::storage::write_private_atomic(&path, &vec![b'x'; MAX_OBS_PASSWORD as usize + 1])
+            .unwrap();
+        assert!(passwords.read("localhost", 4455).is_err());
+        assert!(
+            passwords
+                .write(
+                    "localhost",
+                    4455,
+                    &"x".repeat(MAX_OBS_PASSWORD as usize + 1)
+                )
+                .is_err()
+        );
+        passwords.write("localhost", 4455, "").unwrap();
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_password_store_rejects_links_and_unsafe_permissions_without_touching_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for hard_link in [false, true] {
+            let root = crate::test_support::private_tempdir().unwrap();
+            let outside = crate::test_support::private_tempdir().unwrap();
+            let target = outside.path().join("original");
+            crate::storage::write_private_atomic(&target, b"preserve-original").unwrap();
+            let path = root.path().join(OBS_PASSWORD_FILENAME);
+            if hard_link {
+                std::fs::hard_link(&target, &path).unwrap();
+            } else {
+                symlink(&target, &path).unwrap();
+            }
+            let passwords = FileObsPasswordStore::new(root.path().join("obs.json"), false);
+            assert!(passwords.read("localhost", 4455).is_err());
+            assert!(passwords.write("localhost", 4455, "replacement").is_err());
+            assert!(passwords.write("localhost", 4455, "").is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"preserve-original");
+        }
+        let root = crate::test_support::private_tempdir().unwrap();
+        let passwords = FileObsPasswordStore::new(root.path().join("obs.json"), false);
+        passwords.write("localhost", 4455, "private").unwrap();
+        std::fs::set_permissions(
+            root.path().join(OBS_PASSWORD_FILENAME),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(passwords.read("localhost", 4455).is_err());
+        assert!(passwords.write("localhost", 4455, "replacement").is_err());
+        std::fs::set_permissions(
+            root.path().join(OBS_PASSWORD_FILENAME),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(passwords.read("localhost", 4455).is_err());
+        assert!(passwords.write("localhost", 4455, "replacement").is_err());
+        assert_eq!(
+            std::fs::read(root.path().join(OBS_PASSWORD_FILENAME)).unwrap(),
+            b"private"
+        );
+    }
+
+    #[tokio::test]
+    async fn password_callback_uses_frozen_endpoint_without_holding_controller_locks() {
+        struct BlockingStore {
+            started: Mutex<Option<tokio::sync::oneshot::Sender<(String, u16)>>>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl ObsPasswordStore for BlockingStore {
+            fn read(&self, _host: &str, _port: u16) -> Result<Option<String>> {
+                Ok(None)
+            }
+            fn write(&self, host: &str, port: u16, _password: &str) -> Result<()> {
+                self.started
+                    .blocking_lock()
+                    .take()
+                    .unwrap()
+                    .send((host.into(), port))
+                    .unwrap();
+                self.release.blocking_lock().recv()?;
+                Ok(())
+            }
+        }
+        let root = crate::test_support::private_tempdir().unwrap();
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let controller = ObsController::new(
+            ObsConfiguration {
+                host: "old-host".into(),
+                port: 4456,
+                ..ObsConfiguration::default()
+            },
+            root.path().join("obs.json"),
+            Arc::new(BlockingStore {
+                started: Mutex::new(Some(started)),
+                release: Mutex::new(wait),
+            }),
+        );
+        let writer = controller.clone();
+        let write = tokio::spawn(async move { writer.set_password("synthetic").await });
+        assert_eq!(observed.await.unwrap(), ("old-host".into(), 4456));
+        timeout(
+            Duration::from_secs(2),
+            controller.set_host("new-host".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        release.send(()).unwrap();
+        write.await.unwrap().unwrap();
+        assert_eq!(controller.configuration().await.host, "new-host");
+    }
+
+    #[tokio::test]
+    async fn password_read_does_not_lock_configuration_or_connect_a_stale_endpoint() {
+        struct BlockingRead {
+            started: Mutex<Option<tokio::sync::oneshot::Sender<(String, u16)>>>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            endpoints: Mutex<Vec<(String, u16)>>,
+        }
+        impl ObsPasswordStore for BlockingRead {
+            fn read(&self, host: &str, port: u16) -> Result<Option<String>> {
+                self.endpoints.blocking_lock().push((host.into(), port));
+                if let Some(started) = self.started.blocking_lock().take() {
+                    started.send((host.into(), port)).unwrap();
+                    self.release.blocking_lock().recv()?;
+                }
+                Ok(None)
+            }
+            fn write(&self, _host: &str, _port: u16, _password: &str) -> Result<()> {
+                bail!("unexpected password write")
+            }
+        }
+        let root = crate::test_support::private_tempdir().unwrap();
+        let old_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_port = old_listener.local_addr().unwrap().port();
+        let new_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let new_port = new_listener.local_addr().unwrap().port();
+        let server = spawn_fake_obs(new_listener);
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let passwords = Arc::new(BlockingRead {
+            started: Mutex::new(Some(started)),
+            release: Mutex::new(wait),
+            endpoints: Mutex::new(Vec::new()),
+        });
+        let controller = ObsController::new(
+            ObsConfiguration {
+                host: "127.0.0.1".into(),
+                port: old_port,
+                ..ObsConfiguration::default()
+            },
+            root.path().join("obs.json"),
+            passwords.clone(),
+        );
+        let connector = controller.clone();
+        let connect = tokio::spawn(async move { connector.client().await });
+        assert_eq!(observed.await.unwrap(), ("127.0.0.1".into(), old_port));
+        timeout(Duration::from_secs(2), controller.set_port(new_port))
+            .await
+            .unwrap()
+            .unwrap();
+        release.send(()).unwrap();
+        timeout(Duration::from_secs(2), connect)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            *passwords.endpoints.lock().await,
+            [
+                ("127.0.0.1".into(), old_port),
+                ("127.0.0.1".into(), new_port)
+            ]
+        );
+        assert!(
+            timeout(Duration::from_millis(10), old_listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_password_store_errors_never_fall_back_to_the_local_password_file() {
+        struct UnavailableStore;
+        impl ObsPasswordStore for UnavailableStore {
+            fn read(&self, _host: &str, _port: u16) -> Result<Option<String>> {
+                bail!("synthetic storage unavailable")
+            }
+            fn write(&self, _host: &str, _port: u16, _password: &str) -> Result<()> {
+                bail!("synthetic storage unavailable")
+            }
+        }
+        let root = crate::test_support::private_tempdir().unwrap();
+        let path = root.path().join("obs.json");
+        let file = FileObsPasswordStore::new(path.clone(), false);
+        file.write("localhost", 4455, "preserve-local-password")
+            .unwrap();
+        let controller = ObsController::new(
+            ObsConfiguration::default(),
+            path,
+            Arc::new(UnavailableStore),
+        );
+        assert!(
+            controller
+                .client()
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("读取 OBS 密码失败")
+        );
+        assert!(controller.set_password("replacement").await.is_err());
+        assert_eq!(
+            file.read("localhost", 4455).unwrap().as_deref(),
+            Some("preserve-local-password")
+        );
+    }
+
     #[test]
     fn host_validation_matches_obws_host_and_port_contract() {
         assert_eq!(normalize_obs_host(" localhost ").unwrap(), "localhost");
@@ -696,7 +1038,7 @@ mod tests {
         let new_port = new_listener.local_addr().unwrap().port();
         let old_server = spawn_fake_obs(old_listener);
         let new_server = spawn_fake_obs(new_listener);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let configuration_path = temp.path().join("obs.json");
         let controller = ObsController::new(
             ObsConfiguration {
@@ -706,9 +1048,10 @@ mod tests {
                 default_live_scene: "直播".into(),
             },
             configuration_path.clone(),
+            Arc::new(FileObsPasswordStore::new(configuration_path.clone(), false)),
         );
 
-        save_obs_password(&configuration_path, "secret-value").unwrap();
+        controller.set_password("secret-value").await.unwrap();
         controller.client().await.unwrap();
         old_server.await.unwrap();
         controller.set_port(new_port).await.unwrap();
@@ -722,14 +1065,18 @@ mod tests {
         assert_eq!(saved.microphone_input_name, "主播麦克风");
         assert_eq!(saved.default_live_scene, "直播");
         assert_eq!(
-            load_obs_password(&configuration_path).unwrap().as_deref(),
+            controller
+                .passwords
+                .read("localhost", new_port)
+                .unwrap()
+                .as_deref(),
             Some("secret-value")
         );
     }
 
     #[tokio::test]
     async fn concurrent_endpoint_updates_do_not_lose_each_other() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let configuration_path = temp.path().join("obs.json");
         let controller = ObsController::new(
             ObsConfiguration {
@@ -738,6 +1085,7 @@ mod tests {
                 ..ObsConfiguration::default()
             },
             configuration_path.clone(),
+            Arc::new(FileObsPasswordStore::new(configuration_path.clone(), false)),
         );
 
         let (host_result, port_result) = tokio::join!(
@@ -762,7 +1110,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = spawn_fake_obs(listener);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let configuration_path = temp.path().join("obs.json");
         let original = ObsConfiguration {
             host: "127.0.0.1".into(),
@@ -771,8 +1119,13 @@ mod tests {
             default_live_scene: "直播".into(),
         };
         original.save(&configuration_path).unwrap();
-        save_obs_password(&configuration_path, "secret-value").unwrap();
-        let controller = ObsController::new(original.clone(), configuration_path.clone());
+        let passwords = Arc::new(FileObsPasswordStore::new(configuration_path.clone(), false));
+        passwords.write("127.0.0.1", port, "secret-value").unwrap();
+        let controller = ObsController::new(
+            original.clone(),
+            configuration_path.clone(),
+            passwords.clone(),
+        );
         let cached = controller.client().await.unwrap();
         server.await.unwrap();
 
@@ -792,7 +1145,7 @@ mod tests {
         assert_eq!(controller.configuration().await, original);
         assert!(Arc::ptr_eq(&cached, &controller.client().await.unwrap()));
         assert_eq!(
-            load_obs_password(&configuration_path).unwrap().as_deref(),
+            passwords.read("127.0.0.1", port).unwrap().as_deref(),
             Some("secret-value")
         );
     }

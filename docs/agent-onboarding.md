@@ -1,8 +1,58 @@
 # 弹幕助手接入向导
 
-当前适用 v0.5.1。面向用户的任务式操作见[使用手册](https://danmu.elazer.wang/guide/)；本文保留开发接入与历史验证记录，历史构建号及旧轮次行为不代表当前版本。`/settings` 是“设置与操作”总菜单；主界面原生拖选后用终端快捷键复制，旧弹幕标识为↶。当前宿主与认证约束见[九宿主接入与认证边界](#九宿主接入与认证边界)。
+当前正式版为 v0.5.1；当前接入章节描述未发布 HTTP/订阅源码，不是正式版行为。用户任务式操作见[使用手册](https://danmu.elazer.wang/guide/)；历史构建、测试数和 ACP/Pi 证据保留当轮事实，不适用于新链路。认证见[双 API 与官方 ChatGPT 订阅](#双-api-与官方-chatgpt-订阅)。
 
-## 本轮：Windows 终端启动与退出恢复（v0.5.1）
+## 未发布：轻量 HTTP 助手与设置精简（当前源码）
+
+唯一内置链路：本地选新消息和记忆 → 单飞 HTTP → 必要时一次 Exa 搜索和一次补全 → 整批校验 → 原 Bridge 审核/许可/发送。ACP Runner、九宿主发现、原生参数同步、`danmu setup pi`、`/ai reset`退役；不需 coding CLI、Pi、Node 或适配器。外部资料维护、五操作 CLI/MCP 和 `script/agent_config.py`保留，不是内置依赖。
+
+- `/settings`仍为账号、OBS、AI助手、系统四类，外观走Tab与`/display`；AI助手为模型、发送策略、人设与资料、维护。本场范围/主题保留，维护仅处理可见弹幕/结束。
+- 三方案一次保存十项，不改账号/模型/许可/续用意图、不启动推理；感谢默认关，感谢方案不含点赞，方案关闭联网搜索。开麦让位、有限修复、公开简介与PROJECT引用固定开启，旧false仅内存归一化。资料8KiB、显式选技能且只读文本不变。
+- `assistant.json`改format=4，旧source/binary/native_preferences不再是运行时字段；不继承宿主模型、OAuth或自动发送授权。workspace/skills/preferences仍为文件级启动配置，外部修改后重启。
+
+### 本次源码与验收边界
+
+本文依据当前Runner/settings/api/subscription/responses/terminal源码描述接口，不将下方历史测试数、安装哈希、ACP/Pi实证当作本轮HTTP/订阅验收。真实模型、官方浏览器授权、Plus/Pro实际额度、公共Exa可用性以及Windows/Linux新设置与授权UI尚未在本文宣称验收。最新正式版仍为v0.5.1，本次未发布、不承诺下一版本号。
+
+### 最新本机修复验收：订阅大SSE流与警告消退（2026-10-06）
+
+- `RUST_TEST_THREADS=1 ./script/verify.sh`通过fmt、Clippy `-D warnings`、488项测试（1个既有订阅PTY入口默认ignored）、Release与CLI。证据：`/tmp/danmu-sse-notice-final-verify.log`。回归覆盖256KiB单事件、8MiB解压流、4096数据事件的含界限/超限、chunked/gzip、CRLF/BOM/UTF-8分块、完整EOF、断流、取消/截止和迟到非法事件；HTTP错误仍限256KiB。
+- 安装路径两种API Key协议的Release真实PTY各9次模型请求，无失败、退出0；订阅使用同源码的隔离cfg(test)TUI入口及安装版CLI/MCP，合成OAuth+559093字节SSE正常产出小终态候选，10次模型请求、无失败、退出0。错误文字15秒后消退，worker仍暂停、许可撤销、诊断/Journal保留错误、Unicode草稿不变。结果：`/tmp/danmu-sse-notice-installed-openai_chat/results.json`、`/tmp/danmu-sse-notice-installed-anthropic_messages/results.json`、`/tmp/danmu-sse-notice-installed-chatgpt_subscription/results.json`；同目录保留VT画面。所有验证为loopback与合成凭据，不读取真实账号，不访问模型/直播平台；端点移除、进程回收及凭据泄露扫描通过。
+- `~/.local/bin/danmu`已安装，与Release SHA-256一致：`ff637b94e27ec6b56bbc8b039a089fe1eb81d7a644fcec95a246eb88bb4a2e7d`；仍为未发布源码版本0.5.1，安装不更新运行中的TUI。
+- 网站`npm run build`通过，Astro检查零错误/警告/hints；构建仍报告既有docs→404缺失警告。已在本地Chromium检查使用手册与changelog桌面/390px移动端，未见页面错误；网站未部署。
+
+### 历史本机修复验收：大目录与自动接入（2026-10-06）
+
+- `RUST_TEST_THREADS=1 ./script/verify.sh`通过fmt、Clippy `-D warnings`、476项测试（1个订阅PTY入口默认ignored）、Release与CLI；日志：`/tmp/danmu-catalog-auto-verify.log`。目录回归涵盖8MiB含界限/超限、解压、未知元数据非法Unicode及严格JSON、隐藏/可见项数量限制，推理和HTTP错误256KiB限制不放宽。
+- 真实订阅PTY使用合成签名OAuth和大于256KiB的双模型目录：登录后直接选择、有效重登录保留、刷新、配额暂停、取消/换场、记忆与送达闭环通过；2次自动目录读取、10次模型请求，无失败、正常退出0。证据：`/tmp/danmu-catalog-auto-pty-02/results.json`及同目录VT画面。单独loopback回归覆盖目录失败手动再读、失效模型清空与迟到目录拒绝；不冒充真实官方账号验收。
+- 已安装`~/.local/bin/danmu`，与Release SHA-256一致：`848c1dac854440ca80c2bf6737e84906faabf897d3a19df7ec826c811068610f`。仍为未发布源码构建`0.5.1`，安装不更新运行中的TUI。
+- 安装路径两种API Key协议真实PTY均通过，各9次模型请求、零失败、退出0；endpoint移除、进程回收及合成凭据泄露扫描通过。证据：`/tmp/danmu-catalog-auto-installed-openai_chat/results.json`、`/tmp/danmu-catalog-auto-installed-anthropic_messages/results.json`。
+- 官网`npm run build`通过，Astro检查零错误/警告/hints；已在本地Chromium核对新自动接入正文，无页面错误，并目视检查订阅PTY首次双模型列表和重登录“当前”标记。仅更新本地源码与构建，未部署。
+
+### 历史本机门禁与安装：HTTP切换初次验收（2026-10-06）
+
+- `RUST_TEST_THREADS=1 ./script/verify.sh`通过fmt、Clippy `-D warnings`、471项测试、Release和CLI；1个订阅真实PTY入口默认ignored，由smoke脚本显式运行。包括跨进程writer/reader-openai/reader-anthropic记忆、完整资料、实际分段送达与有限修复回归。门禁日志：`/tmp/danmu-http-final-verify.log`。
+- `./script/install_cli.sh`安装至`~/.local/bin/danmu`；Release与安装版SHA-256相同：`b73bdf1bc8c83848de9e18fef02da10e0d7fef1e59d99db9a7cb10bcbb6f7644`。版本号仍为`0.5.1`，不是新正式发布。
+- 最终Release与安装路径两协议真实PTY均通过，各9次模型HTTP，无失败；配置/键鼠入口/Key遮罩与保存失败保留/Unicode光标、前问与已确认回复、坏候选后继续、未知送达不重发、在途取消/换场、搜索不可用强制待审及外部caller边界已验证。Release证据：`/tmp/danmu-http-release-final-openai_chat/results.json`、`/tmp/danmu-http-release-final-anthropic_messages/results.json`；安装证据：`/tmp/danmu-http-final-openai_chat/results.json`、`/tmp/danmu-http-final-anthropic_messages/results.json`。
+- 订阅使用同一产品代码的cfg(test)真实PTY入口与loopback签名/OAuth/Responses端点，通过初次授权、模型目录显式选择、按轮刷新并持久旋转、429共享额度暂停撤权且保Token/无API计费回退、本机退出但远端撤销失败如实报告、按原host/client/subject重新登录。证据：`/tmp/danmu-http-final-chatgpt_subscription/results.json`，10次模型请求、1次显式目录请求；不冒充真实官方账号验收。
+- 上述实例均退出0、endpoint移除、自有进程回收，合成Key/Token泄露扫描通过。已目视检查实际VT导出的已配置两协议、秘密遮罩/保存失败、候选、搜索诊断与订阅配额/重登录画面。七类外部配置只运行生成的danmu stdio命令，不启动原生宿主。ANSI/HTML/cells、脱敏请求和本地送达事实保留在各证据目录；私有凭据文件不得对外打包。
+- 官网Node.js 24下`npm run build`通过，Astro检查零错误/警告/hints；构建仍提示docs→404条目不存在。本地Chromium已查看首页、guide与未发布changelog，以及390px移动首页；35个内部链接/锚点检查无断链、无页面错误。仅本地构建与呈现，未部署。
+- 验证均使用私有临时目录、合成凭据和loopback；未调用真实模型、官方账号额度、公共Exa或B站公开发送，未操作用户直播/OBS/终端。OAuth与Key为权限保护的明文文件，不是加密保险箱。安装不升级运行中进程，由用户完全退出并重新打开TUI。
+
+### 历史：上一轮设置精简与 OMP 身份识别
+
+上一轮OMP18.6.0回报ACP名称`omp`，当时修复接纳`omp`与`oh-my-pi`，其余身份拒绝。下方保留当时事实；原生链路现已退役，不作为当前接入说明。
+
+
+### 历史本机验证（设置精简候选，非本次 HTTP 迁移）
+
+- `RUST_TEST_THREADS=1 ./script/verify.sh` 通过格式、Clippy、374 项测试、Release 与 CLI：`/tmp/danmu-settings-final-verify.log`。`npm --prefix website run build` 通过，Astro 检查零错误、零警告；本地 Chromium 已检查四类设置与未发布说明的实际页面，未部署网站。
+- `./script/install_cli.sh` 已安装候选；Release 与 `~/.local/bin/danmu` 的 SHA-256 均为 `f773b26cdb77198137dd1d6d375c29a49e661037c30e8797411acd3fa693e223`。版本号仍为 `0.5.1`，不冒充新正式发布。
+- 安装版实际 PTY 验证四类设置、回复方案保存、本场范围不写回长期方案、维护页、主题及移除命令：`/tmp/danmu-settings-smoke-pwveq19x/` 的 ANSI 与逐页文本记录；正常退出 0。
+- 安装版连接真实 OMP，初始化回执确认为 `omp 18.6.0`，创建 ACP 会话并显示原生模型选项；诊断为“助手未启用、已交模型 0”。证据：`/tmp/danmu-settings-smoke-znfox1l7/results.json`、同目录画面与 `/tmp/danmu-omp-smoke-bin/` 的方法/身份记录。没有 `session/prompt`；正常退出 0。
+- 仅使用新建 local 私有实例；未连接真实直播间、未调用模型推理、未公开发送、未操作 OBS。临时验证脚本和依赖已清理，证据保留。由用户自行完全退出并重启旧 TUI；运行中实例不会因安装自动升级。
+
+## 历史：Windows 终端启动与退出恢复（v0.5.1）
 
 - 对应 [GitHub issue #1](https://github.com/rockythink/shisui-danmu/issues/1)：v0.5.0 Windows 启动报错 `Initial console modes not set`。源码定位到未开启鼠标捕获就执行关闭；Crossterm 0.29 的 Windows 后端此时尚未保存原始模式。该后端还明确拒绝 Kitty 键盘增强命令，不能只修鼠标后留下第二个启动错误。
 - Windows 启动不再执行未配对的鼠标关闭或 Kitty Push/Pop；Unix 既有初始化保留。退出仅关闭当前持有的鼠标捕获，再恢复普通输入；粘贴、键盘和备用屏幕清理分别尝试，避免前一项失败阻断后续恢复。不吞运行期鼠标命令错误。
@@ -219,65 +269,76 @@ Pi验收脚本已迁移到同一AI设置入口。安装版真实Pi0.85.1/适配�
 
 历史原生Pi0.84.3 / Node24.4.1 / pi-acp0.0.33的12项闭环位于`.local-archive/pi-native-installed-1e94a1f3/results.json`；无效默认0HTTP证据为`.local-archive/pi-invalid-installed-1e94a1f3/results.json`。使用隔离HOME、虚构凭据、仅loopback网络；所有自有进程退出，endpoint移除。新版真实Pi0.85.1免费搜索链路另已通过`.local-archive/pi-search-native-proof-04/results.json`：仅Exa为真实外网搜索，推理仍为loopback，不读取用户凭据。
 
-重跑：`python3 -B script/verify_pi.py --binary ~/.local/bin/danmu --adapter <pi-acp入口> --output <新证据目录>`。`--invalid-default-only`验证未知默认不回退；`--search-live`只允许内置搜索、一次真实免费Exa查询，推理仍用loopback。脚本不安装依赖、不读用户凭据；Pi/Node不在PATH时用`--pi`/`--node`指定。其他原生安全检查见`script/verify-native-text-hosts.py`与`script/check_amp_native_policy.py`。
+上述 verify_pi、verify-native-text-hosts 与 check_amp_native_policy 是已退役原生链路的历史重跑方法，不再作为当前源码入口。当前验证见下文；旧一次外网 Exa 查询不是新 HTTP 搜索验收。
 
 安装版另验PATH中没有pi-acp、仅应用私有适配器存在时仍可发现并保存Pi选择，且不启动原生进程：`.local-archive/pi-private-discovery-installed-1e94a1f3/results.json`。本机已运行 `danmu setup pi`并验证重复调用只复用，无全局安装或Pi配置改写。
 
 ## 正常路径：在danmu里设置助手
 
-1. 输入 /settings 打开“设置与操作”：设置分组为外观与显示、B站账号与直播间、OBS、AI助手、系统与关于；当前操作可进入本场 AI、重点消息、关键词搜索归档、指令搜索和退出。方向键、Enter、Esc导航，F1或?说明；/settings reading、account、obs、ai、system仍可直达。/commands或Ctrl-O中文搜索并保留人工草稿和光标，Ctrl-G/P/C仍可用。
-   历史索引支持Swift v1与现行Rust归档，包括恢复旧场次后追加的混合记录；保留旧主播UID并按房间隔离。不需要删除历史文件来解决`missing field roomId`。
-2. “AI助手”分工作区、模型、发送策略、人设与资料、Agent配置；`/ai workspace [路径]`、`/ai model`、`/ai replies`、`/ai materials`、`/ai advanced`可直达。只在进入模型工具选择时扫描宿主；连接仅读取实际原生选项，不推理、不值班、不授权。本场启动/暂停、范围、主题和待审回复仍由`/ai`管理，不写入下次默认。
-3. “发送账号”只跳转“B站账号与直播间”，不复制账号设置。“系统与关于”提供诊断、帮助、版本0.5.0、创始人Elazer及官网https://danmu.elazer.wang；退出位于总菜单，OBS拥有独立分类。公开助手回复每段带标记且不超过40字素。
-直达显示命令为 `/display theme`、`/display names on`、`/display names off`、`/display time on`、`/display time off`、`/display layout chat`、`/display layout list`；直播间资料命令为 `/room title [文本]`、`/room cover [本地路径]`；OBS连接配置增加 `/obs config host [主机]`、`/obs config port [端口]`，并保留现有mic/password/scene与连接、静音、推流控制；`/about`直达关于。可选参数省略时打开编辑器或选择器，给出参数时直接提交，但只有校验通过且收到真实保存/服务回执后才显示成功。标题和封面写入前必须验证当前B站主账号就是房主；平台受理后仍可能待审核，不称已经展示。
-4. OMP默认使用私有设置目录与执行目录，仅复用原生认证，不继承全局规则或聊天；显式选中profile才主动增加其人格/模型上下文。除单独允许的搜索，其他工具、hooks、插件、自动skills、记忆扩展与MCP禁用。用户项目中明确选中的技能仅作为文本读取，不执行代码。
-5. OMP也可选择现有UTF-8 system规则文件绝对路径：读取非空且最多32KiB内容，生成本场私有快照并经`--system-prompt`加载，不把路径当提示词、不执行脚本或目录。底层加载效果未获模型实证，其他宿主不伪造该能力。
-6. 默认逐条发送。进入“发送模式”显式选择自动/逐条，或用 `/ai auto on|off`；自动选项旁固定展示公开发送及同房间同账号记住的后果，无额外确认。有效身份校验后才保存范围授权；不会暗中启动模型。相同房间/发送UID重启后台核验后恢复，换房间或账号须重新授权。关闭先撤权再保存；显式暂停、账号变化和登出清除记录，旧回复不跨场补发。
-7. 普通切换选中后按Enter直接保存；选中当前值不重复提交。原生选项仅完整ACK后更新，高亮不是当前值，未知/不支持项只读。方案一次保存十项偏好，F1“说明”可展开差异；仅暂停且无在途轮次可用，不改账号、模型、自动模式和续用意图。文本编辑用Enter保存、Esc取消，保存失败保留内容。
-8. 待审页显示全文。E编辑，编辑中Enter或Shift-Enter只保存；Delete丢弃，Tab下一条，Esc退出。完整看过正文后Shift-Enter批准当前版本；长文未看完时只展开。另有 a 全部发送、d 全部丢弃：当前批次显式批准或丢弃，不授全场权限，不包括后来新到候选，不重发在途/不确定结果。批次审批先完整校验，失败不部分批准；身份/场次变化需重新查看。按Press/Repeat区分新按下与长按，不以丢失的Release永久锁键；覆盖层与编辑焦点隔离底层操作。
-9. 无有效范围授权的旧续用意图不再阻塞启动，显示“AI已暂停”和“继续AI”；执行 /ai start 一次启动，但不把旧automatic偏好当许可。有效同范围授权仍后台核验后恢复。主界面核验和连接阶段显示轮转“AI启动中”，真正就绪后显示 ✦：绿色逐条确认、黄色偏好自动但未授权、红色已授权自动；未启动/暂停则无符号和占位，Ctrl-G仍显示完整说明。
-10. 只有 `/obs stop` 二次确认，默认取消，确认后仍有3秒可取消倒计时；退出弹幕台不会停止推流。其他启动、结束、重建、退出账号单次执行，危险动作有红色动词和后果说明。`/help`持久可滚动，Ctrl-P/Ctrl-C仍有效；粘贴不执行或发送，扫码/停止确认不收粘贴。人工失败不再需要手动解锁；旧任务和未发尾段不重放，后续新输入仍须通过身份检查。
+1. `/settings`打开“设置与操作”，四类及`/settings account`、`/settings obs`、`/settings ai`、`/settings system`直达入口保留。方向键/Enter/Esc导航，F1或?说明；`/commands`或Ctrl-O搜索并保留草稿/光标，Ctrl-G开运行面板，Ctrl-P暂停。旧弹幕↶不进AI队列。
+2. AI助手 → 模型或`/ai model`选连接。API Key协议填写基址/模型，用“设置/更换 Key”或`/ai key`打开隐藏输入；命令不收明文参数，旧Key不回填、不进普通字段/Journal。Enter只保存，Esc恢复Unicode草稿与光标；失败保留秘密输入，空值不是清除。“清除 Key”另选保留/清除。
+3. 订阅页由本人完成Continue with ChatGPT浏览器授权；登录保存后或显式选已保存账号，自动单次读取目录并打开模型选择。首次明确选一次；同注册重登录保留仍可用的模型并定位当前项，已不可用的选择清空后再选。读取失败保留登录与已有选择，手动“读取账号模型”用于刷新/重读，无自动重试或计费回退；不自动选新模型、启动或授发送权。取消、换场、发送账号变化或许可门禁变化后的迟到目录不应用。操作待完成不换连接、不重复登录；取消只终止本地任务，不称远端取消。
+4. `/ai start`准备本地资料/历史/凭据/worker，无新消息零模型HTTP、不隐式读模型列表、不做付费连接测试。“本机就绪/等待新消息”不表示远端鉴权已验证。`/ai visible`纳入未消费可见消息，不重放旧批；`/pause`取消轮次并撤权，`/ai stop`另释放驱动，清退完成后再启动。
+5. 更换API配置、Key、订阅账号或联网开关要求已暂停、无flight、无清退、无账号/模型操作、无发送许可；TUI待续用也拒绝，先`/pause`。重选当前协议不重置地址/模型，换协议恢复官方基址并清空模型，不删除或跨作用域发送旧Key。普通偏好/方案保存不推理、不授权。
+6. 发送模式或`/ai auto on`须本人明确允许公开发送，`/ai auto off`立即撤权。同房间/发送UID核验通过、automatic与resume_on_start允许才续用；旧迁移关闭两者，不继承授权。换房/身份变化/失效/暂停撤权；独立助手号失效不回退主号，B站发送身份与模型OAuth分离。
+7. `/review`显示全文，E编辑、Delete丢弃、Tab下一条、Esc退出；编辑中Enter/Shift-Enter只保存，全文看完Shift-Enter批准当前版本。a/d仅当前待审批次、不授未来许可，不重发在途/不确定结果，批量先整批校验。人工草稿保留。
+8. `/ai replies`仅方案/联网搜索/屏蔽词，`/ai materials`仅名字/人设，`/ai advanced`仅处理可见弹幕/结束；`/ai range`、`/ai topic`仅本场，`/ai workspace`与`/ai reset`删除。外观仍走Tab及`/display`，低频文件项修改后重启。
+9. OBS独立：`/obs stop`默认取消、确认后3秒内可Esc取消；退出不停止推流。`/room title [文本]`和`/room cover [本地路径]`写入须核验B站主号为房主，平台受理不称已经展示，local拒绝真实写入。主界面终端原生拖选复制，不改变草稿或授权。
 
-联网在“发送策略”单独开启，默认关闭。OMP/Gemini使用各自服务与额度；Pi内置web_search使用Exa免费公共入口，每轮一次、三条、4000字符、20秒；失败不重试、不跳转、不转付费。保存联网选项不会开启自动发送。
+联网默认关闭，选方案后重置关闭。每轮最多一次Exa/三条来源/4000个Unicode标量/20秒且受全轮deadline约束；程序只发送冻结本批完整公开Danmu/SC正文，不扩写私有资料/历史，不带UID/昵称。工具参数只能message_id，额外query/多个调用/未知工具/旧ID整批拒绝、零搜索。Unavailable只补全一次，候选强制待审，不重试/付费回退，不承诺公共额度或永久免费。
 
-有限改写只允许明确内容拒绝或用户已知词命中，最多一次，只改写未确认尾段。接口返回但缺少真实回显属于结果不确定，不自动改写或重发；仅隔离这一条及未发送尾段，保留后续新消息的现有发送许可。AI的POST传输未知、账号失效、换场、手动暂停等其他安全停发条件保持。原对象、场次、许可与最低审核要求保留；先审后发仍需重新批准。提示按发送生命周期更新，原Result及诊断保留用于核对。
+有限修复固定开启：仅明确内容拒绝或已知词命中，最多一次、只改写未确认尾段，repair无搜索。未知送达/缺回显/POST超时不改写不重发，确认段仍为真实送达事实，保留原结果与retry_of/confirmed_segments/unconfirmed_segments/duplicate_risk；仍受原审核/许可约束，不给外部caller修复权。
 
-### 回复积极性：允许不参与
+## HTTP 协议、依赖与传输
 
-在“助手回复”切换积极性：谨慎（默认，明确叫助手/追问为主）、均衡（也答明确独立知识问题）、积极（可有用补充）。不是固定比例或速度。“开麦让位”“静音补位”默认都开，可各自关闭，保留基础档位。
+使用现有 reqwest/tokio/serde_json 和普通enum分派，不依赖 ACP/供应商coding SDK或通用Agent框架。Rust≥1.89；本节未重新实编MSRV。模型/搜索客户端独立于B站Cookie客户端，禁重定向、底层重试，loopback禁代理，不转发Cookie/Bridge token/宿主认证/开发环境Key。
 
-所有档位都允许不回；观众可能在与主播语音交流，闲聊接话、情绪表达或意图不明优先留给主播。没有合适对象返回空candidates，正常结束本轮，不报生成失败、不凑答案、不补发。档位保存后下一轮生效，不回放已跳过弹幕、不改在途快照、不授权自动发送；感谢仍受独立互动开关控制。语境判断取决于所选模型，不声称程序能听到主播或保证每次判断准确。
+| 连接 | 契约 |
+| --- | --- |
+| `openai_chat` | 基址追加`/chat/completions`，Bearer Key、stream:false、system=应用CONTRACT/user=本轮JSON；只发选定max_completion_tokens或max_tokens。要求object=chat.completion、唯一choice index=0/assistant，stop正文准入；length/content_filter/refusal整批拒绝。不含Responses、Azure认证或所有厂商变体 |
+| `anthropic_messages` | 基址追加`/messages`，x-api-key/anthropic-version:2023-06-01、stream:false、顶层system/user本轮JSON、固定max_tokens；要求type=message/assistant，end_turn合并text；max_tokens/refusal整批拒绝，无thinking/beta/server tools |
+| `chatgpt_subscription` | 固定官方`https://api.openai.com/v1/responses`、OAuth Bearer、instructions=CONTRACT/input=user本轮JSON、store:false/stream:true；无previous_response_id，不发preview不支持的输出上限/temperature等字段。只有正确归属完整response.completed终态整体准入，delta不入队，reasoning不当候选 |
 
-每轮附带当前批及最多12条/4KiB之前对话，用UID区分已知主播、助手和观众；昵称不能认证，原生回复目标仅为名称，不伪造@/被回复消息ID。要求区分助手、主播、其他观众或未知对象；上下文不回放成新候选。Mic只采用5秒内OBS静音观察，未知/过期不猜；未静音不是正在说话，没有ASR或说话人识别。对未知口播不补全事实。动态策略在途改变时，旧候选只能待审，不自动发送。模型语义效果仍需本人实际使用评估。
+CONTRACT+已序列化本轮JSON合计≤24KiB UTF-8字节，不是token量；推理HTTP请求另限48KiB，两种非流式API及HTTP错误解压响应≤256KiB。订阅成功SSE逐chunk/逐行处理，仅保存当前事件和待EOF终态：单事件含字段/注释/换行≤256KiB、全流≤8MiB、最多4096个数据事件（含终态与[DONE]），不将重复增量全流误当单条正文；终态后非法事件、断流或取消仍不准入。账号模型目录成功响应独立限8MiB解压后字节、1024项/256可见项，严格单遍投影。连接10秒；普通轮次共用最早原消息120秒与180秒操作上限，含搜索和补全；普通到期expired并继续新消息，repair超时暂停撤权。
 
-## 官方SDK、依赖与传输
+无正文/零候选正常结束，空轮5–10秒合批保留。完整可归属envelope中候选格式/轮次/目标/数量/正文错误或越权工具整批rejected，不重试，保留旧候选及有效许可。HTTP非2xx、DNS/TLS/断流、外层JSON/协议不匹配、超限、worker归属/真实存储故障明确暂停撤权，处理后显式启动；不吞成无答，不自动重启/模型或协议回退。诊断只有稳定类别/有界安全摘要，不回显原始模型正文、headers、prompt或错误响应。
 
-使用官方Rust crate `agent-client-protocol = "=2.1.0"`，Apache-2.0，默认features关闭、解析feature集合为空；配套schema 1.7.0，稳定ACP协议v1。SDK负责JSON-RPC请求关联、类型化请求/响应/通知、错误与连接调度，不再保留手写JSON-RPC客户端，也不回退print/exec/HTTP内部助手。
+底部Info/Success提示3秒、Warning/Error警告或错误15秒消退，Progress保留到操作完成；expire_notice_at仅清临时文字，不清runner.note、/diag、Journal、待审或Unicode草稿，不恢复已停worker/发送许可/续用意图，也不跳过OBS停止确认。
 
-项目MSRV保持1.89；SDK声明MSRV1.88。实际本机编译使用rustc/cargo 1.98.0；依赖metadata未发现声明MSRV高于1.89的包，但**没有用1.89编译实测**。新增29个锁定包及许可证/MSRV信息见04依赖证据；不自动安装工具链。`tokio-util = "=0.7.19"`的codec用于边界，`futures-util`启用sink。
+Exa MCP固定`https://mcp.exa.ai/mcp?tools=web_search_exa`，initialize → initialized → web_search_exa（numResults=3）。每响应96KiB，JSON/SSE按完整事件/请求ID解析，不把网络chunk当事件；失败、无结果、超限为Unavailable。唯一工具只允许message_id，模型不提供query；关闭/无合格目标/repair不提供工具，最多一次搜索与第二模型请求，第二次移除工具。tool result是非可信数据、不升为system指令。
 
-使用SDK Channel/TransportFrame接自有有界tokio行codec，而非SDK无总量上限的ByteStreams：单行256KiB、连接输入4MiB/4096帧（进入SDK队列前限制）、输出4MiB、聚合正文256KiB、stderr 2MiB。超限、坏帧、EOF、写入超时均退役连接，不吞成空候选；资源上限故障不伪装成正常上下文轮换。
-
-不广告文件/terminal能力，所有原生权限请求仍返回cancelled。只有开启搜索时，已核实的OMP Fetch或Gemini Search通知才可按本轮ID/参数/状态接纳；未知工具、换身份、跨轮重放、未完成搜索上的候选均拒绝。工具前解释不拼进最终候选JSON。通知校验不是执行沙箱：原生注册表与拒绝默认策略才是执行前边界。
-
-官方来源：[Rust SDK](https://github.com/agentclientprotocol/rust-sdk)、[crate 2.1.0](https://crates.io/crates/agent-client-protocol/2.1.0)、[协议](https://agentclientprotocol.com/protocol/overview)、[注册表](https://github.com/agentclientprotocol/registry)。具体版本调查是03的来源证据，04实证是锁定依赖编译和受控管道，不冒充真实宿主模型验证。
+官方参考：[Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)、[Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create)、[Sign in with ChatGPT OSS/local](https://developers.openai.com/siwc/token-sharing-open-source)。
 
 ## 动态配置与上下文边界
 
-非敏感assistant.json位于私有配置旁，format=3；保存长期偏好、两个动态开关、续用意图和按宿主/程序/来源分组的native_preferences，本场主题不持久化。旧配置的两个动态开关默认true；旧格式备份、损坏/未知字段不覆盖。模型与thinking按完整回执保存和依赖顺序恢复，失效不降档。自动发送只有本人明确保存过的同房间/发送UID授权且恢复检查通过时才续用，不从历史快照恢复权限。`.danmu/config/`仅白名单观察，锁内记录历史、原子更新current；相同内容去重，不含认证/端点token，审计失败不否认已成功保存的设置。
+非敏感`assistant.json`与实际`config.toml`同目录，当前format=4。最小合法文件如下（模型/凭据未配齐，不能启动；其余字段采用默认，不将Key写入本文件）：
 
-- `configOptions: []`表示明确无选项，不回退旧mode；仅字段缺失才允许Agent报告的旧mode。category只决定展示，不代表权限。
-- `session/config_option_update`以及设置完整回执替换整份选项列表；不合并旧依赖。请求值须仍在最新选项中。Boolean使用布尔值而非字符串。
-- 原生ID逐宿主映射：OMP model/thinking；Claude与OpenCode model/effort；Codex、Copilot、DSH model/reasoning_effort；Pi model/thought_level；Amp amp-mode。模型改变重建上下文，思考强度原地更新，避免恢复思考参数时重置模型。仅允许已核实选项；权限/mode/Boolean不会因被报告就获准修改。Gemini旧模型接口会改写全局配置，当前只继承原生默认。
-- 设置请求单飞，当前轮结束才执行；回执前不称生效。回执当前值仅为Agent报告，不等于底层provider已证实；请求被拒绝或回执不匹配则暂停，不静默降档。
-- 换模型先新建ACP会话再验证/设置；恢复时先模型后思考强度。宿主/程序/profile/system/搜索变更在本轮结束后重建；候选、草稿、同场主题保留。人设及其他偏好影响后续轮，已知词还在发送前检查。
-- 默认先审后发；自动排队要求当前策略与本轮快照都允许自动发送、本场显式许可仍有效且本轮选项未变化，不把Agent报告冒充provider证明。
+```json
+{
+  "format": 4,
+  "api": {
+    "protocol": "openai_chat",
+    "base_url": "https://api.openai.com/v1",
+    "model": "",
+    "max_output_tokens": 4096,
+    "openai_token_limit": "max_completion_tokens",
+    "chatgpt_account": null
+  }
+}
+```
+
+协议另可为anthropic_messages/chatgpt_subscription；Anthropic官方默认基址为`https://api.anthropic.com/v1`。基址含版本路径，trim后经url库唯一规范化host/IDNA/默认端口/IPv6/尾斜线，不丢前缀；≤2048字节，禁止认证/query/fragment/控制字符，仅HTTPS或127.0.0.0/8、::1字面量HTTP，localhost不例外。模型trim后1..256字节/无控制字符；分步保存可空地址/模型，启动要求齐备。max_output_tokens=256..8192，OpenAI只发选定token字段、不遇400偷换；Anthropic固定max_tokens。订阅基址固定官方，chatgpt_account仅本地注册ID，模型须显式选账号目录；两个输出字段保留结构但订阅不发。
+
+加载≤32KiB、不写盘，未知版本/字段/嵌套字段、错类型或损坏拒绝，不静默覆盖。无format/format2/3按各自严格schema迁移：无版本style/scope沿旧规则合并preferences，format2旧topic丢弃，format2/3业务字段按规定逐项保留。host/binary/source/native_preferences、模型/thinking/OAuth仅解析后退休，不发现宿主、不读原生规则。automatic/resume_on_start/web_search迁移为false，format4日常加载不重置三者。首次显式保存先将原始字节存`assistant.pre-api.json`，同内容可复用，不同内容拒绝覆盖；备份失败不提交，设置私有原子写入成功才更新内存。旧备份/Journal/SQLite/资料保留。
+
+workspace/skills/preferences与输出项为文件级启动读取，外部修改后重启。use_profile（公开简介，不是OMP profile）/use_project/dynamic_host_priority/repair_blocked固定true，旧false仅内存归一化。必要原生规则由本人放入既有SYSTEM/人设/PROJECT/preferences，不自动扫描复制。自动许可仍独立按房间/发送UID核验，不由配置观察恢复；普通偏好本轮冻结/下轮生效，自动排队须当前策略与冻结快照均准许且permit有效。
+
 
 ### 用户可编辑项目与能力边界
 
-“工作区与记忆”显示默认`~/Projects/danmu-assistant/`及实际状态。AGENTS.md自动维护带标记规则块并保留自定义区，拒绝损坏标记、链接/硬链接与越界，不覆写用户资料；WORKSPACE.md为人类入口。SYSTEM、选定人设默认加载，PROJECT/公开简介/skills显式启用，技能默认空。选中文本总量8KiB、技能16项，不读`.danmu`作为指令、不扫描其他文件。
+默认工作区为`~/Projects/danmu-assistant/`，实际路径及状态见`/diag`；路径改为由`assistant.json`的`workspace`在启动时读取，不再提供“工作区与记忆”菜单或`/ai workspace`。AGENTS.md自动维护带标记规则块并保留自定义区，拒绝损坏标记、链接/硬链接与越界，不覆写用户资料；准备自有工作区的原权限不变，WORKSPACE.md为人类入口。SYSTEM、选定人设及已有PROJECT默认引用，已有公开简介由程序按原有边界提供；`use_project`、`use_profile`固定为true。选中文本总量8KiB、技能最多16项；技能仅按`assistant.json`的`skills`明确选中相应`skills/<名称>/SKILL.md`，默认空，未选技能不加载、不执行代码。不读`.danmu`作为指令、不扫描其他文件；缺失、超限及读取错误仍按原边界处理，不回退旧资料。
 
-第二个Agent窗口先读AGENTS.md，将用户要求写入选中文件，聊天本身不生效。运行中1秒轮询，发现受调度影响；下一批新消息才用新ACP会话，旧在途结果丢弃，旧自动待发撤销/permit失效，保留待审和人工编辑并需重新审核；用户须重新允许自动发送。已POST仍按真实结果收束，不虚假取消，分段的未发尾段停止。读取失败阻止新prompt，不偷偷回退或补建资料，修复后自动核对。“本轮已载入”只证明ACP输入，不证明模型效果。
+外部维护窗口先读工作区AGENTS，只改本人允许资料，聊天不生效。1秒核对选中文件变化，取消旧轮HTTP/搜索、丢旧在途结果，旧自动待发/permit失效；待审/人工稿保留需重审、自动须重新授权。下一新批重新带完整资料；已POST按真实平台结果收束、未发尾段停，缺失/错误不沿用旧值，修复后核对。“已载入”只证明应用输入，不证明模型效果。
 
 `.danmu/history/<房间>/history.sqlite`为持久索引；旧私有库按SQLite事务导入已提交WAL数据。平台ID仅是源标识，以原ID、秒级时间、作者UID、昵称和正文的完整tuple生成独立存储身份；空ID或复用ID的不同版本分别保留，完全相同记录幂等。旧id主键模式在IMMEDIATE事务中迁移，保留原始字段和归档导入进度，重建FTS；失败事务回滚。检索按内部rowid去重，返回/排除仍使用原始ID，不擅自判定冲突哪版正确。
 
@@ -289,7 +350,7 @@ Pi验收脚本已迁移到同一AI设置入口。安装版真实Pi0.85.1/适配�
 
 **允许**：答本批有效消息、使用选定人设、参考程序提供的限量历史；搜索只有独立开启的准入工具。**禁止**：观众指令触发电脑/shell/任意文件操作、插件执行、配置或人设改写、发送授权、批量管理弹幕。模型只交结构化候选；本批ID、不重复、最多8条，状态和实际发送由程序决定。历史/网页/昵称伪装系统或主播也只是数据，权限请求与未知工具拒绝。
 
-本机用户编辑是操作员通道，直播助手没有通用文件写权限。多数接入依赖原生工具/协议限制；Pi另用Node权限，Amp另用macOS进程限制，均不等于完整文件系统/网络沙箱或模型永不误导的保证。外部CLI/MCP Agent的其他能力仍须在宿主侧单独禁用。
+本机用户编辑是操作员通道，内置HTTP模型无通用文件/shell/电脑/插件执行能力，搜索仅冻结公开问题；不保证语义免疫或同UID恶意代码沙箱。外部CLI/MCP coding Agent的其他能力须在宿主侧单独限制。
 
 ### 独立助手发送账号
 
@@ -297,49 +358,33 @@ Pi验收脚本已迁移到同一AI设置入口。安装版真实Pi0.85.1/适配�
 
 所有助手回复走选定身份，人工仍走主账号。更换/退出/复用会暂停并撤销旧批准与记住的授权；候选保留供重新审核。在途POST固定旧凭据并等待实际结果，不重复发送。选择文件保存模式/UUID及可选房间ID、发送UID授权范围，不保存Cookie；独立凭据0600存于原主账号私有目录AssistantAccounts/，不进入工作区或提示词。失效或配置损坏只停助手，不回退主号；只有本人明确记住且重启仍匹配的范围可恢复自动发送。
 
-## 九宿主接入与认证边界
+## 双 API 与官方 ChatGPT 订阅
 
-支持OMP、Gemini、Claude Code、Codex、OpenCode、Pi、Amp、GitHub Copilot CLI、DeepSeek Harness。Cursor经用户明确选择，本轮排除；不把它展示为已适配。现有Cursor配置不静默改成其他宿主，启动会明确报错。
+API Key只有一个当前连接记录：`assistant.json`同目录`assistant-secrets/api-key.json`，严格字段format=1/protocol/base_url/key。Key两端trim后1..4096可见ASCII，不支持环境展开/shell/URL内认证。按协议+唯一规范化base_url作用域匹配，模型不参与；同服务换模型可用，换地址/协议不发送旧Key。不匹配/文件缺失才是未设置，损坏/不安全路径明确报错；界面只缓存已设置/未设置/文件错误，旧值永不显示。
 
-“CLI已安装”“ACP入口已发现”“已连接”是不同状态。选择仅保存偏好，不启动、不安装、不登录。需要适配器的宿主不会把普通claude/codex/pi/amp当ACP程序执行。
+API Key和OAuth Token都是权限保护的**明文**，不是钥匙串/加密保险箱。Unix父目录须当前UID所有且组/其他人不可写（可保留0755）；固定父真实路径，私有根assistant-secrets须本人0700、文件0600/单链接/普通文件，无符号链接。打开用O_NOFOLLOW/O_NONBLOCK并fstat复核、有界读，写用私有原子替换、失败保旧；宽权限拒绝，不自动chmod。Windows沿既有安全能力，不声称Unix等价ACL，不防同UID恶意进程。禁止提交/同步/给外部Agent读凭据，不进工作区或Journal。
 
-| 宿主 | 已核入口/版本 | 原生安全与认证边界 |
-| --- | --- | --- |
-| OMP | `omp acp`；18.1.15 | 无工具或仅web_search；禁扩展、规则、skills、LSP、PTY等；原生认证与可选profile不变 |
-| Gemini | `gemini --acp`；0.35.3 | 明确system-settings覆盖，不依赖错误的临时cwd；hooks/skills关闭，MCP互补允许/拒绝列表封闭所有名称，admin-policy默认拒绝。使用私有上下文文件名，避免空数组回退GEMINI.md。存在企业系统策略不覆盖 |
-| Claude Code | `@agentclientprotocol/claude-agent-acp@0.75.1` | SAFE_MODE及会话`tools:[]`、无settingSources、strictMcpConfig、禁hooks。保留SDK原生API/console认证；当前上游不支持claude.ai订阅认证，不能承诺订阅通用 |
-| Codex | `@agentclientprotocol/codex-acp@1.10.0` + 原生`codex-cli 0.153.4` | 官方ACP不变；私有原生app-server安全代理强制`environments:[]`、read-only/never，关闭skills/MCP/hooks等，防止上游read-only模式实际映射workspaceWrite。仅链接原auth.json；不承诺不同CODEX_HOME下的keychain-only认证 |
-| OpenCode | 原生`opencode acp`；1.2.15、1.18.30+的1.x | 私有HOME/XDG和只读配置阻止安装，默认danmu agent全工具deny；仅链接个人api/oauth认证，不带账户数据库或组织引导。wellknown/系统管理配置拒绝。旧版依赖下载型认证插件的登录需升级 |
-| Pi | `pi-acp@0.0.33` + 官方Node版Pi；新增实测Pi0.85.1 / Node24.4.1 | 私有启动器禁文件/shell、全局扩展/模板/自动上下文，Node禁止子进程；原auth引用，安全快照models/defaults；仅明确联网时加载内置免费搜索扩展，不执行命令型凭据 |
-| Amp | `amp-acp@0.9.0` + 原生Amp；当前仅macOS | `tools.disable:["*"]`，不能用会恢复默认工具的空enable列表。私有HOME/XDG；macOS禁止fork、浏览器/插件子进程与AppleEvents，阻止远程global-skills物化。缺既存认证时直接提示本人登录 |
-| GitHub Copilot CLI | 原生`@github/copilot@1.0.83 --acp --stdio` | 独立CLI，不是VS Code扩展。私有设置禁hooks/plugins/MCP；随机保留名称的原生白名单产生空工具集，不能用空参数。复用原生gh已存认证，不继承混存认证与执行设置的旧config.json |
-| DeepSeek Harness | 官方`@deepseek-ai/dsh@0.1.5-alpha.1`；`dsh --profile shisui-text` | 私有DSH_HOME，bundles为空且明确最小官方插件组合，无文件/shell/MCP工具实现；credentials插件引用原`~/.dsh/.credentials.yaml`，不启动Web UI |
+保存/更换Key替换唯一记录，清除只删该文件，不删目录/旧宿主认证/订阅账号；成功失效旧idle handle，下次启动重新读取。运行中Key为启动快照，手工编辑/删除不实时改变已发请求：先暂停清退后启动，服务端撤销另行处理。取消本机future不证明远端推理或收费停止。
 
-关键npm入口在执行前核对真实package.json、bin路径和已验证版本：Claude、Codex、Pi、Amp、DSH不接受普通CLI或任意shell包装器。它防止入口误选，不是发布者签名验证。Claude/Codex/Copilot握手版本也限定上述已核契约；Codex原生版本在代理中校验，旧版可能静默忽略无环境设置，不能放行。OMP/Gemini沿用协议和功能契约；新选项仍须单独审核权限语义。
+ChatGPT采用官方OSS/local **Sign in with ChatGPT preview**，不是旧Codex/ACP OAuth、不是读取用户原生宿主凭据。当前官方资格面向Plus/Pro，实际以账号授权`chatgpt.tokens.use.direct`及服务返回为准：登录可保存但缺该scope不能推理，不保证所有账号/地区/模型可用。模型由本人显式GET官方`/v1/models`选visibility=list目录，不捏造目录、不自动付费fallback；账号模型缓存不跨账号。额度与ChatGPT共享并受每应用限制，见[Usage](https://chatgpt.com/settings/usage)；不承诺无限额度、永久preview或读取旧聊天历史。
 
-适配器与认证需显式准备，不自动全局安装或改变账号。Pi可运行 `danmu setup pi`：通过npm显式安装已核定的pi-acp@0.0.33到应用私有 `adapters/pi/`，禁安装脚本；完整匹配版本直接复用，旧版/损坏/越界链接不覆盖。发现优先PATH，再查私有入口；仍须安装官方Pi与兼容Node，原生CLI和适配器缺失分开提示。选择或启动助手不会下载依赖，不改Pi原配置或登录态。
+OAuth固定官方auth/OpenID/JWKS端点，loopback随机端口回调、fresh state/nonce、PKCE S256、签名/issuer/aud/exp/subject验证，保留issued client与账号绑定。稳定host ID和隔离多注册明文存在`assistant-secrets/chatgpt.json`；跨进程锁串行refresh及旋转Token原子替换，不从环境读Token，Token/授权URL（含id_token_hint）不进日志。本人在系统浏览器授权，应用不替用户同意；登录任务完成后先生命周期门禁再提交。失败/取消保旧；若Token已提交但设置保存失败需说明部分落盘，不能假称全回滚。
 
-Pi读取原生 `~/.pi/agent/`（或显式绝对路径PI_CODING_AGENT_DIR）的声明式provider/model定义、modelOverrides及defaultProvider/defaultModel/defaultThinkingLevel；支持原生行注释、尾逗号与BOM。TUI已保存的该宿主模型/档位优先。私有快照不带全局packages/extensions/skills/模板/上下文；apiKey和headers中的`!command`、动态OAuth配置及任意请求体覆盖拒绝，不转发父进程API-key环境变量。原生auth存储仍由Pi负责；依赖扩展注册的provider不在此文本接入承诺内。
+退出当前账号清本地Token但保注册映射/host ID，远端revocation是否确认按实际结果显示，可另在ChatGPT设置管理授权。不把“本机退出”写成“官方已撤销”。401/403/429/503、刷新/资格/共享额度等错误安全暂停撤权，保留原始稳定错误和清理失败；额度错误保Token，提示Usage，刷新失效提示重新登录。只有白名单code/HTTP/request ID安全摘要，无raw detail，无同批重试/模型回退/API计费 fallback。
 
-对Pi显式默认或TUI已保存模型，启动前在Rust内存固定预期；建会话时要求原生当前模型属于实际可用列表且匹配预期。不能以Pi可回写的settings文件作为校验基准，也不放行Pi按未知ID合成的模型。无效默认的真实回归在主动注入事件后保持0次模型请求。
+## 无状态轮次、取消与恢复
 
-Pi原生选项来自真实ACP回执。当前适配器提供off/minimal/low/medium/high/xhigh六档，不按模型裁剪列表；非推理模型原生回落off。请求与实际档位不一致时不保存该请求；原生默认max明确拒绝，不假报medium。其他宿主仍仅显示其回报选项；未保存时使用安全接入下的原生默认，不承诺继承隔离的模型/插件配置。旧vs_code迁移为独立copilot时清空编辑器路径与旧原生参数，首次保存备份assistant.pre-hosts.json。
+一条应用driver、单飞有界worker，未发新消息不请求模型，不保存供应商会话或跨轮messages；只有同轮搜索续接携带唯一已准入tool call/result。取消包围整个HTTP/搜索/刷新future，排队取消零HTTP，迟到结果、代次/场次错归属、暂停后结果不入队。pause先停分流、递增generation并撤权，再停止自有worker；保留业务场次、待审与人工草稿，stop另释放driver，shutdown等待自有任务，无原生进程树或“重建上下文”要求。不能宣称远端推理/计费已停止。
 
-原生证据：OMP真实initialize/new成功；Gemini真实initialize及认证缺失错误，实际Config初始化验证无工具/仅google_web_search、hooks/skills关闭、MCP全拒绝及不读取GEMINI.md。DSH/OpenCode真实initialize/new通过。Pi/Claude/Codex/Copilot使用虚构凭据和loopback模型服务，验证真实原生文本、空工具集、强制读写拒绝、取消与EOF清退；没有调用付费模型或公开发送。Pi额外验证声明式provider、原生默认high、切换非推理模型后的off、失败档位不保存及空候选；强制工具可能先收到原生“Tool … not found”并产生一次错误续轮，产品退役该轮、无候选与工具副作用，不宣称原生不会续轮。Amp事件后不再运行其原生登录/工具枚举，仅执行真实二进制纯策略函数和无害OS拒绝探针，未声称真实模型往返已验。
+每轮完整operator_context、名字/preferences、人设、topic、audio_available=false、本批问题、房间公开信息、近期对话、相关历史与actual_delivery_results；不做静态资料unchanged省略。资料8KiB、本批≤8条/12KiB、近期≤12条/4KiB、相关历史共4KiB（观众≤3KiB，每UID≤3条、全批≤8条、每条240字符），均受24KiB应用预算，优先去最旧近期参考，不截断当前问题凑预算。UID/房间精确隔离，只取本批之前；数据库损坏/读取失败不伪装空记忆。
 
-来源：[Claude ACP](https://github.com/agentclientprotocol/claude-agent-acp)、[Codex ACP](https://github.com/agentclientprotocol/codex-acp)、[OpenCode](https://opencode.ai/docs/acp/)、[Pi ACP](https://github.com/svkozak/pi-acp)、[Amp ACP](https://github.com/tao12345666333/amp-acp)、[Amp插件](https://ampcode.com/docs/customize/plugins)、[Copilot CLI](https://github.com/github/copilot-cli)、[官方DSH](https://github.com/deepseek-ai/deepseek-harness)。
+Confirmed段无论整体状态Confirmed或部分Rejected都是真实已发，Uncertain/未确认段不能说送达；待审/丢弃候选不当assistant发言。Journal和SQLite继续本地保存，不迁到供应商会话。history::import_journal仅索引SessionStarted/EventReceived，不导入AutoReply；跨进程既有观众/场次历史与Journal回复保留，但不保证所有旧助手发言进检索。仅在原生宿主未归档的聊天不迁移。
 
-## 长连接、取消与恢复
-
-一个助手驱动、一个专用ACP连接；initialize协商v1，session/new给出明确ID，单飞复用。每轮最多8条新消息/24KiB、180秒；每个上下文最多8轮、累计应用输入最多64KiB，下一轮预留完整24KiB，不足时安全轮换。问答与一次性改写均计入，不把应用输入字节等同模型总token。驱动所有权、本场队列、候选、在途发送与仍有效授权保留，已处理弹幕不重放；暂停或撤权不会被轮换覆盖。完整end_turn无正文与合法零候选分别诊断；有正文时严格校验本轮/本批ID，不认模型自述送达。未知或重复本批目标整批拒绝后继续新消息；真实协议、连接与资源错误仍停止。
-
-取消使用`session/cancel`，等待原prompt终态，最长6秒宽限；未收敛清退本次独占进程组。取消请求已发不等于模型已停止；UI先显示处理中。取消/失败轮退役连接且须确认新上下文，结果代次失效。普通空闲暂停可继续同会话。只在前后Agent共同声明能力时精确resume或load；load回放不入候选，resume不接收回放，不用latest或当前开发会话。
-
-进程只继承HOME/PATH/语言/代理等基础环境，不转发开发API-key/会话变量。需要隔离时仅链接或引用原生认证存储，不复制凭据进配置项目；宿主负责认证刷新。项目与房间索引持久保存，私有运行目录退出清理；OpenCode只读目录先恢复自有目录权限，不删除用户宿主历史。进程树清退要求POSIX；Amp额外要求macOS，Windows不宣称通过。
+round_completed写api_protocol/requested_model/returned_model/search_state及原轮次/outcome/耗时/输入字节/受理事实，错误未知值null，旧Journal不改写；assistantStopped新记录只有reason，不写native_session。配置观察仅白名单协议/模型/输出项，不含base_url/Key/Token/凭据路径；不能据观察恢复授权。候选先round journal落盘再take_ready发送，写失败显式停撤权，不改真实已确认结果。
 
 ## 业务通道与独立CLI/MCP
 
-SDK发起本轮后才对选中弹幕或已启用互动标Processing黄；自己/本地回流、未选中与禁用事件不标。无答灰、生成失败红，候选/在途/实际结果优先；暂停取消收束，不跨场次污染。只有真实发送确认才能绿。
+worker实际Started本轮后才将选中消息标Processing；自己/本地回流、未选中/禁用事件不标，无答灰/真实生成失败红。候选/在途/实际结果优先，取消不跨场污染，只有真实发送确认才能绿。
 
 候选与修复均进入原Bridge和共享发送队列。Confirmed才算确认，网络不确定不重试；有依据的可修复失败才新建一次候选，原终态不改写，附diagnosis、retry_of、分段记录与重复风险。外部caller不能获得Runner模型修复权，真人仍独立。
 
@@ -351,9 +396,9 @@ Runner持有时`status.driver=runner`；只排斥同一内置助手caller `danmu
 
 获本人授权后：`/实际固定/danmu --instance /全新绝对私有目录 local --assistant`仅打开面板。本人输入`/event 姓名 正文`、`/local confirmed|uncertain|rejected`、`/session new|end`，`/quit`或SIGINT正常退出；禁止房间、登录、OBS、生产配置混用。
 
-以下04/FIX01记录为历史证据，不代表当前二进制。当前额外通过受控ACP搜索生命周期、11场景有限修复、真实隔离PTY的快捷审核/开关授权/原生参数回执；仍未调用真实模型、真实搜索或B站发送。开发者自动化不是用户本人直播验收。
+当前验证应运行真实loopback HTTP/搜索/OAuth/Responses回归及真实PTY，再统一门禁/安装哈希；没有本轮完整证据前不记通过。官方登录/真实推理与搜索仅本人另行明确授权后做，不读或消耗既有原生账号额度。以下04/FIX01仅历史，不是当前HTTP链路验收；开发自动化不是真人直播验收。
 
-## FIX01：G5现有入口事实与独立验证边界
+## 历史 FIX01：G5现有入口事实与独立验证边界
 
 **不存在现成的固定产品非键鼠ACP完整控制接缝，G5及相关独立L继续阻塞。**
 

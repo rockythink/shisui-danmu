@@ -14,3 +14,4 @@
 # Retired orchestration state and private evidence backups
 /.maestri/
 /.local-archive/
+__pycache__/

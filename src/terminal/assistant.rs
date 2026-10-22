@@ -1,10 +1,12 @@
 use super::settings::ExternalField;
 use super::*;
 use crate::runner::{
-    acp::{Change, Choice},
-    hosts,
-    settings::{Discovery, Host, Persona, ReplyActivity, ReplyPreset, Source},
+    KeyStatus,
+    responses::ModelChoice,
+    settings::{ApiProtocol, Persona, ReplyActivity, ReplyPreset},
+    subscription::AccountInfo,
 };
+use crate::runtime::diagnostics::{account_label, diagnostics_details};
 use anyhow::Context;
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -12,7 +14,6 @@ enum Page {
     #[default]
     Home,
     Settings,
-    Reading,
     Account,
     Obs,
     AiSettings,
@@ -22,12 +23,9 @@ enum Page {
     Assistant,
     Materials,
     Advanced,
-    ReplyRange {
-        scene: bool,
-    },
+    ReplyRange,
     Themes,
     Presets,
-    Agents,
     More,
     Candidates,
     Diagnostics,
@@ -37,7 +35,6 @@ impl Page {
         match self {
             Self::Home => "AI",
             Self::Settings => "设置与操作",
-            Self::Reading => "外观与显示",
             Self::Account => "B站账号与直播间",
             Self::Obs => "OBS",
             Self::AiSettings => "AI助手",
@@ -46,12 +43,10 @@ impl Page {
             Self::Models => "模型",
             Self::Assistant => "发送策略",
             Self::Materials => "人设与资料",
-            Self::Advanced => "Agent配置",
-            Self::ReplyRange { scene: true } => "本场范围",
-            Self::ReplyRange { scene: false } => "默认范围",
+            Self::Advanced => "维护",
+            Self::ReplyRange => "本场范围",
             Self::Themes => "主题",
             Self::Presets => "回复方案",
-            Self::Agents => "AI 工具",
             Self::More => "更多",
             Self::Candidates => "待审回复",
             Self::Diagnostics => "诊断",
@@ -61,38 +56,28 @@ impl Page {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Field {
     External(ExternalField),
-    Binary,
-    Profile,
-    Prompt,
     Name,
-    Preferences,
     Topic,
     BlockedWords,
-    HistorySeconds,
-    Workspace,
-    Skills,
     ArchiveSearch,
+    ApiBaseUrl,
+    ApiModel,
 }
 impl Field {
     fn label(self) -> &'static str {
         match self {
             Self::External(field) => field.label(),
-            Self::Binary => "ACP 程序",
-            Self::Profile => "OMP profile",
-            Self::Prompt => "规则文件",
             Self::Name => "AI 名字",
-            Self::Preferences => "补充要求",
             Self::Topic => "本场主题",
             Self::BlockedWords => "屏蔽词",
-            Self::HistorySeconds => "回到最新（秒）",
-            Self::Workspace => "工作区路径",
-            Self::Skills => "Skills",
             Self::ArchiveSearch => "搜索归档",
+            Self::ApiBaseUrl => "API 基址",
+            Self::ApiModel => "模型名",
         }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Action {
+pub(crate) enum Action {
     Run,
     Review,
     EditCandidate,
@@ -102,46 +87,31 @@ pub(super) enum Action {
     ApproveAllCandidates,
     DiscardAllCandidates,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Row {
     Preset(ReplyPreset),
     Group(&'static str),
-    ToggleThanks,
-    AdvancedGroup(u8),
     Command(&'static str),
-    DynamicHostPriority,
-    DynamicMutedSupport,
-    DynamicStrategy,
     Action(Action),
     Page(Page),
-    Host(Host),
+    ApiProtocol,
+    ApiKey,
+    ClearApiKey,
+    ChatgptAccount,
+    ChatgptLogin,
+    ChatgptRelogin,
+    ChatgptSignOut,
+    ChatgptModels,
+    ChatgptModel,
     Edit(Field),
     Permission,
-    ReplyActivity,
-    Activity {
-        activity: ReplyActivity,
-        scene: bool,
-    },
+    Activity(ReplyActivity),
     RestoreTopic,
-    UseProfile,
-    UseProject,
-    ThankGifts,
-    ThankLikes,
-    ThankFollows,
-    ThankShares,
-    MentionSender,
     Persona,
-    RepairBlocked,
     RepairHistory,
     WebSearch,
-    DefaultSource,
-    Option(usize),
     Theme(usize),
     ReloadThemes,
-    Layout,
-    Usernames,
-    Timestamps,
-    ConnectOptions,
     Login,
     Logout,
     ReuseMain,
@@ -149,7 +119,6 @@ enum Row {
     CancelAssistantLogin,
     SignOutIndependent,
     Visible,
-    Context,
     Stop,
 }
 #[derive(Clone, Copy)]
@@ -159,55 +128,91 @@ struct HistoryEntry {
     scroll: u16,
     list_offset: usize,
     expanded: bool,
-    thanks_expanded: bool,
-    advanced_group: Option<u8>,
 }
-pub(super) struct Panel {
+pub(crate) struct Panel {
     page: Page,
     row: usize,
     editor: Option<(Field, EditorInput)>,
     choices: Option<Choices>,
-    discovered: Vec<Discovery>,
+    pub(crate) accounts: Vec<AccountInfo>,
+    pub(crate) models: Vec<ModelChoice>,
     error: Option<String>,
     scroll: u16,
     history: Vec<HistoryEntry>,
     list_offset: usize,
     menu_height: usize,
+    menu_hit: Option<(Page, Rect, usize)>,
+    menu_rows: Vec<Row>,
     expanded: bool,
-    thanks_expanded: bool,
-    advanced_group: Option<u8>,
     pending_save: Option<uuid::Uuid>,
     obs_configuration: Option<crate::obs::ObsConfiguration>,
 }
 struct Choices {
-    id: Option<String>,
-    values: Vec<Choice>,
+    kind: ChoiceKind,
+    values: Vec<String>,
     selected: usize,
 }
-const SETTINGS_PAGES: [Page; 5] = [
-    Page::Reading,
-    Page::Account,
-    Page::Obs,
-    Page::AiSettings,
-    Page::System,
+#[derive(Clone, Copy)]
+enum ChoiceKind {
+    Sending,
+    ApiProtocol,
+    ClearApiKey,
+    ChatgptAccount,
+    ChatgptModel,
+}
+const API_PROTOCOLS: [ApiProtocol; 3] = [
+    ApiProtocol::OpenaiChat,
+    ApiProtocol::AnthropicMessages,
+    ApiProtocol::ChatgptSubscription,
 ];
+const SETTINGS_PAGES: [Page; 4] = [Page::Account, Page::Obs, Page::AiSettings, Page::System];
 
 impl Panel {
+    pub(crate) fn clear_chatgpt_models(&mut self) {
+        self.models.clear();
+        if self
+            .choices
+            .as_ref()
+            .is_some_and(|choices| matches!(choices.kind, ChoiceKind::ChatgptModel))
+        {
+            self.choices = None;
+        }
+    }
+    fn choose_chatgpt_model(&mut self, selected_model: &str) -> Result<()> {
+        anyhow::ensure!(!self.models.is_empty(), "请重新读取此账号的可用模型");
+        self.choices = Some(Choices {
+            kind: ChoiceKind::ChatgptModel,
+            values: self
+                .models
+                .iter()
+                .map(|model| format!("{} · {}", model.display_name, model.slug))
+                .collect(),
+            selected: self
+                .models
+                .iter()
+                .position(|model| model.slug == selected_model)
+                .unwrap_or(0),
+        });
+        self.list_offset = 0;
+        self.scroll = 0;
+        Ok(())
+    }
     fn new() -> Self {
         Self {
             page: Page::Home,
             row: 0,
             editor: None,
             choices: None,
-            discovered: Vec::new(),
+            accounts: Vec::new(),
+            models: Vec::new(),
             error: None,
             scroll: 0,
             history: Vec::new(),
             list_offset: 0,
             menu_height: 5,
+            menu_hit: None,
+            menu_rows: Vec::new(),
             expanded: false,
-            thanks_expanded: false,
-            advanced_group: None,
             pending_save: None,
             obs_configuration: None,
         }
@@ -219,10 +224,9 @@ impl Panel {
             scroll: self.scroll,
             list_offset: self.list_offset,
             expanded: self.expanded,
-            thanks_expanded: self.thanks_expanded,
-            advanced_group: self.advanced_group,
         });
         self.page = page;
+        self.menu_hit = None;
         self.row = 0;
         self.list_offset = 0;
         self.scroll = 0;
@@ -236,19 +240,16 @@ impl Panel {
             scroll,
             list_offset: offset,
             expanded,
-            thanks_expanded: thanks,
-            advanced_group: advanced,
         }) = self.history.pop()
         else {
             return true;
         };
         self.page = page;
+        self.menu_hit = None;
         self.row = row;
         self.scroll = scroll;
         self.list_offset = offset;
         self.expanded = expanded;
-        self.thanks_expanded = thanks;
-        self.advanced_group = advanced;
         self.error = None;
         false
     }
@@ -259,23 +260,22 @@ impl Panel {
                 .iter()
                 .any(|entry| entry.page == Page::Settings)
     }
-    pub(super) fn is_editing(&self) -> bool {
+    pub(crate) fn is_editing(&self) -> bool {
         self.editor.is_some()
     }
 
-    fn rows(&self, app: &TerminalApp) -> Vec<Row> {
+    fn rows(&self, app: &RuntimeState) -> Vec<Row> {
         match self.page {
             Page::Home => vec![
                 Row::Action(Action::Run),
                 Row::Permission,
-                Row::Page(Page::ReplyRange { scene: true }),
+                Row::Page(Page::ReplyRange),
                 Row::Edit(Field::Topic),
                 Row::Action(Action::Review),
                 Row::Page(Page::Settings),
             ],
             Page::Settings => vec![
                 Row::Group("设置"),
-                Row::Page(Page::Reading),
                 Row::Page(Page::Account),
                 Row::Page(Page::Obs),
                 Row::Page(Page::AiSettings),
@@ -288,7 +288,6 @@ impl Panel {
                 Row::Command("/quit"),
             ],
             Page::AiSettings => vec![
-                Row::Edit(Field::Workspace),
                 Row::Page(Page::Models),
                 Row::Page(Page::Assistant),
                 Row::Page(Page::Materials),
@@ -318,13 +317,6 @@ impl Panel {
                 Row::Command("/help"),
             ],
             Page::About => Vec::new(),
-            Page::Reading => vec![
-                Row::Page(Page::Themes),
-                Row::Layout,
-                Row::Usernames,
-                Row::Timestamps,
-                Row::Edit(Field::HistorySeconds),
-            ],
             Page::Account => {
                 let mut rows = vec![
                     Row::Group("直播间"),
@@ -355,89 +347,46 @@ impl Panel {
                 rows
             }
             Page::Models => {
-                let mut rows = vec![Row::Page(Page::Agents)];
-                if !app.runner.report.connected {
-                    rows.push(Row::ConnectOptions)
-                } else {
-                    rows.extend(
-                        (0..app.runner.report.options.config.as_ref().map_or(
-                            usize::from(app.runner.report.options.modes.is_some()),
-                            Vec::len,
-                        ))
-                            .map(Row::Option),
-                    );
-                }
-                rows
-            }
-            Page::Assistant => {
-                let mut rows = vec![
-                    Row::Page(Page::Presets),
-                    Row::ReplyActivity,
-                    Row::Edit(Field::Preferences),
-                    Row::WebSearch,
-                    Row::MentionSender,
-                    Row::ToggleThanks,
-                ];
-                if self.thanks_expanded {
+                let mut rows = vec![Row::ApiProtocol];
+                if app.runner.settings.api.protocol == ApiProtocol::ChatgptSubscription {
                     rows.extend([
-                        Row::ThankGifts,
-                        Row::ThankLikes,
-                        Row::ThankFollows,
-                        Row::ThankShares,
+                        Row::ChatgptAccount,
+                        Row::ChatgptLogin,
+                        Row::ChatgptRelogin,
+                        Row::ChatgptSignOut,
+                        Row::ChatgptModels,
+                        Row::ChatgptModel,
+                    ]);
+                } else {
+                    rows.extend([
+                        Row::Edit(Field::ApiBaseUrl),
+                        Row::Edit(Field::ApiModel),
+                        Row::ApiKey,
+                        Row::ClearApiKey,
                     ]);
                 }
                 rows
             }
-            Page::Materials => vec![
-                Row::Edit(Field::Name),
-                Row::Persona,
-                Row::UseProfile,
-                Row::UseProject,
+            Page::Assistant => vec![
+                Row::Page(Page::Presets),
+                Row::WebSearch,
+                Row::Edit(Field::BlockedWords),
             ],
-            Page::Advanced => {
-                let mut rows = Vec::new();
-                for group in 0..3 {
-                    rows.push(Row::AdvancedGroup(group));
-                    if self.advanced_group == Some(group) {
-                        match group {
-                            0 => rows.extend([
-                                Row::DefaultSource,
-                                Row::Edit(Field::Profile),
-                                Row::Edit(Field::Prompt),
-                                Row::Edit(Field::Skills),
-                                Row::Edit(Field::BlockedWords),
-                                Row::RepairBlocked,
-                                Row::Edit(Field::Binary),
-                            ]),
-                            1 => rows.extend([
-                                Row::DynamicHostPriority,
-                                Row::DynamicMutedSupport,
-                                Row::DynamicStrategy,
-                            ]),
-                            _ => rows.extend([Row::Visible, Row::Context, Row::Stop]),
-                        }
-                    }
-                }
-                rows
-            }
-            Page::ReplyRange { scene } => [
+            Page::Materials => vec![Row::Edit(Field::Name), Row::Persona],
+            Page::Advanced => vec![Row::Visible, Row::Stop],
+            Page::ReplyRange => [
                 ReplyActivity::Cautious,
                 ReplyActivity::Balanced,
                 ReplyActivity::Active,
             ]
             .into_iter()
-            .map(|activity| Row::Activity { activity, scene })
+            .map(Row::Activity)
             .collect(),
             Page::Themes => (0..app.config.themes.entries().count())
                 .map(Row::Theme)
                 .chain([Row::ReloadThemes])
                 .collect(),
             Page::Presets => ReplyPreset::ALL.into_iter().map(Row::Preset).collect(),
-            Page::Agents => self
-                .discovered
-                .iter()
-                .map(|entry| Row::Host(entry.host))
-                .collect(),
             Page::More => vec![
                 Row::Page(Page::Obs),
                 Row::Command("/diag"),
@@ -455,11 +404,11 @@ impl Panel {
         }
     }
 }
-impl TerminalApp {
-    pub(super) fn open_settings(&mut self) -> Result<()> {
+impl RuntimeState {
+    pub(crate) fn open_settings(&mut self) -> Result<()> {
         anyhow::ensure!(
             self.candidate_edit.is_none()
-                && !self.secret_mode
+                && self.secret_target.is_none()
                 && self.stop_flow.is_none()
                 && self.login_qr.is_none(),
             "请先完成当前编辑或弹窗；人工草稿保留"
@@ -476,9 +425,14 @@ impl TerminalApp {
         panel.page = page;
         panel.row = 0;
         panel.history.clear();
+        if page == Page::Models {
+            let mut panel = self.assistant_panel.take().expect("刚打开设置");
+            self.refresh_model_panel(&mut panel);
+            self.assistant_panel = Some(panel);
+        }
         Ok(())
     }
-    pub(super) fn open_archive_search(&mut self) -> Result<()> {
+    pub(crate) fn open_archive_search(&mut self) -> Result<()> {
         self.open_settings()?;
         let mut panel = self.assistant_panel.take().expect("刚打开设置");
         panel.history.clear();
@@ -486,17 +440,17 @@ impl TerminalApp {
         self.assistant_panel = Some(panel);
         Ok(())
     }
-    pub(super) fn open_more(&mut self) -> Result<()> {
+    pub(crate) fn open_more(&mut self) -> Result<()> {
         self.open_direct(Page::More)
     }
-    pub(super) fn open_ai_range(&mut self) -> Result<()> {
+    pub(crate) fn open_ai_range(&mut self) -> Result<()> {
         self.open_assistant()?;
         let p = self.assistant_panel.as_mut().unwrap();
-        p.page = Page::ReplyRange { scene: true };
+        p.page = Page::ReplyRange;
         p.history.clear();
         Ok(())
     }
-    pub(super) fn open_ai_topic(&mut self) -> Result<()> {
+    pub(crate) fn open_ai_topic(&mut self) -> Result<()> {
         self.open_assistant()?;
         let mut p = self.assistant_panel.take().unwrap();
         p.page = Page::Home;
@@ -505,10 +459,10 @@ impl TerminalApp {
         self.assistant_panel = Some(p);
         Ok(())
     }
-    pub(super) fn open_assistant(&mut self) -> Result<()> {
+    pub(crate) fn open_assistant(&mut self) -> Result<()> {
         anyhow::ensure!(
             self.candidate_edit.is_none()
-                && !self.secret_mode
+                && self.secret_target.is_none()
                 && self.stop_flow.is_none()
                 && self.login_qr.is_none(),
             "请先完成当前编辑或弹窗；人工草稿保留"
@@ -518,21 +472,20 @@ impl TerminalApp {
         self.assistant_panel = Some(Panel::new());
         Ok(())
     }
-    pub(super) fn open_diagnostics(&mut self) -> Result<()> {
+    pub(crate) fn open_diagnostics(&mut self) -> Result<()> {
         self.open_direct(Page::Diagnostics)
     }
-    pub(super) fn open_settings_section(&mut self, section: &str) -> Result<()> {
+    pub(crate) fn open_settings_section(&mut self, section: &str) -> Result<()> {
         let target = match section {
             "account" => Page::Account,
             "obs" => Page::Obs,
             "ai" => Page::AiSettings,
             "system" => Page::System,
-            "reading" => Page::Reading,
             _ => anyhow::bail!("未知设置分类"),
         };
         self.open_direct(target)
     }
-    pub(super) fn open_ai_section(&mut self, section: &str) -> Result<()> {
+    pub(crate) fn open_ai_section(&mut self, section: &str) -> Result<()> {
         self.open_direct(match section {
             "model" => Page::Models,
             "replies" => Page::Assistant,
@@ -541,7 +494,7 @@ impl TerminalApp {
             _ => anyhow::bail!("未知AI设置"),
         })
     }
-    pub(super) fn open_about(&mut self) -> Result<()> {
+    pub(crate) fn open_about(&mut self) -> Result<()> {
         self.open_direct(Page::About)?;
         self.assistant_panel.as_mut().unwrap().expanded = true;
         Ok(())
@@ -576,11 +529,11 @@ impl TerminalApp {
                 .unwrap_or_default(),
         }
     }
-    pub(super) async fn open_external_editor(
+    pub(crate) async fn open_external_editor(
         &mut self,
         field: ExternalField,
         value: Option<&str>,
-        tx: mpsc::Sender<UiEvent>,
+        tx: mpsc::Sender<CoreEvent>,
     ) -> Result<()> {
         anyhow::ensure!(
             self.local_transport.is_none(),
@@ -611,43 +564,17 @@ impl TerminalApp {
         self.assistant_panel = Some(panel);
         result
     }
-    pub(super) fn edit_workspace(
-        &mut self,
-        value: Option<&str>,
-        tx: mpsc::Sender<UiEvent>,
-    ) -> Result<()> {
-        self.open_direct(Page::AiSettings)?;
-        let mut panel = self.assistant_panel.take().unwrap();
-        let result = self
-            .apply_assistant_row(Row::Edit(Field::Workspace), &mut panel)
-            .and_then(|_| {
-                if let Some(value) = value {
-                    panel.editor = Some((Field::Workspace, EditorInput::from(value.to_owned())));
-                    self.save_assistant_editor(&mut panel, tx)?;
-                }
-                Ok(())
-            });
-        if let Err(error) = &result {
-            panel.error = Some(error.to_string());
-        }
-        self.assistant_panel = Some(panel);
-        result
-    }
-    pub(super) async fn open_obs_settings(&mut self) -> Result<()> {
+    pub(crate) async fn open_obs_settings(&mut self) -> Result<()> {
         self.open_direct(Page::Obs)?;
         self.assistant_panel.as_mut().unwrap().obs_configuration =
             Some(self.obs.configuration().await);
         Ok(())
     }
-    pub(super) fn finish_setting_save(
+    pub(crate) fn project_setting_save(
         &mut self,
         token: uuid::Uuid,
-        result: std::result::Result<settings::SavedSetting, String>,
+        result: &std::result::Result<settings::SavedSetting, String>,
     ) {
-        if self.settings_operation != Some(token) {
-            return;
-        }
-        self.settings_operation = None;
         if let Some(panel) = self
             .assistant_panel
             .as_mut()
@@ -665,12 +592,8 @@ impl TerminalApp {
                 Err(error) => panel.error = Some(format!("保存失败：{error}（内容保留）")),
             }
         }
-        match result {
-            Ok(saved) => self.set_notice(saved.message, saved.level),
-            Err(error) => self.set_notice(format!("保存失败：{error}"), NoticeLevel::Error),
-        }
     }
-    pub(super) fn configure_display(&mut self, setting: &str, value: &str) -> Result<()> {
+    pub(crate) fn configure_display(&mut self, setting: &str, value: &str) -> Result<()> {
         let (key, enabled) = match (setting, value) {
             ("names", "on" | "off") => ("show_name", value == "on"),
             ("time", "on" | "off") => ("show_time", value == "on"),
@@ -687,14 +610,14 @@ impl TerminalApp {
         self.set_notice("显示设置已保存", NoticeLevel::Success);
         Ok(())
     }
-    pub(super) fn open_theme_settings(&mut self) -> Result<()> {
+    pub(crate) fn open_theme_settings(&mut self) -> Result<()> {
         self.open_direct(Page::Themes)
     }
-    pub(super) fn open_candidate_review(&mut self) -> Result<()> {
+    pub(crate) fn open_candidate_review(&mut self) -> Result<()> {
         self.open_direct(Page::Candidates)
     }
 
-    pub(super) fn paste_assistant(&mut self, text: &str) {
+    pub(crate) fn paste_assistant(&mut self, text: &str) {
         if let Some((_, editor)) = self
             .assistant_panel
             .as_mut()
@@ -708,91 +631,31 @@ impl TerminalApp {
             }
         }
     }
-    pub(super) fn start_assistant(&mut self, visible: bool, rebuild: bool) -> Result<()> {
-        self.resume_pending = false;
-        let rebuild = rebuild || self.runner.needs_rebuild;
-        if self.runner.running && !rebuild {
-            return Ok(());
-        }
-        if !self.runner.has_saved_settings() {
-            let discovered: Vec<_> = Host::ALL.into_iter().map(Host::discovery).collect();
-            let available: Vec<_> = discovered
-                .iter()
-                .filter_map(|e| e.program.clone().map(|p| (e.host, p)))
-                .collect();
-            if available.len() != 1 {
-                self.open_direct(Page::Agents)?;
-                let panel = self.assistant_panel.as_mut().unwrap();
-                panel.discovered = discovered;
-                panel.error = Some(
-                    if available.is_empty() {
-                        "未发现可用 AI 工具；可安装适配器或指定 ACP 程序"
-                    } else {
-                        "发现多个 AI 工具，请明确选择"
-                    }
-                    .into(),
-                );
-                return Ok(());
-            }
-            let mut s = self.runner.settings.clone();
-            if s.binary.as_os_str().is_empty() {
-                s.host = available[0].0;
-                s.binary = available[0].1.clone()
-            }
-            self.runner.save(s, &self.bridge, false)?
-        }
-        if let Err(error) = self.runner.settings.program() {
-            self.open_direct(Page::Models)?;
-            self.assistant_panel.as_mut().expect("模型页已打开").error =
-                Some(format!("AI 工具未就绪：{error}"));
-            return Ok(());
-        }
-        self.runner.start(&self.bridge, visible, rebuild)?;
-        self.set_notice("AI启动请求已提交", NoticeLevel::Info);
-        Ok(())
-    }
-    pub(super) fn stop_assistant(&mut self) {
-        self.pause_assistant();
-        self.runner.stop(&self.bridge);
-    }
     fn apply_assistant_row(&mut self, row: Row, panel: &mut Panel) -> Result<bool> {
         if let Some(reason) = readonly_reason(row, self) {
             anyhow::bail!("只读：{reason}")
         }
         match row {
-            Row::Group(_) | Row::DynamicStrategy => {}
-            Row::ToggleThanks => {
-                panel.thanks_expanded = !panel.thanks_expanded;
-                panel.row = panel.row.min(panel.rows(self).len().saturating_sub(1));
-            }
-            Row::AdvancedGroup(group) => {
-                panel.advanced_group = if panel.advanced_group == Some(group) {
-                    None
-                } else {
-                    Some(group)
-                };
-                panel.row = panel
-                    .rows(self)
-                    .iter()
-                    .position(|r| matches!(r,Row::AdvancedGroup(g) if *g==group))
-                    .unwrap_or(0);
-            }
+            Row::Group(_) => {}
             Row::Command(_) => anyhow::bail!("指令须经统一执行入口"),
             Row::Preset(preset) => {
                 anyhow::ensure!(!self.runner.running, "请先暂停 AI");
                 anyhow::ensure!(!self.runner.in_flight(), "等待当前回复结束后再换方案");
                 let mut s = self.runner.settings.clone();
                 preset.apply(&mut s);
+                if s.web_search != self.runner.settings.web_search {
+                    self.check_model_change()?;
+                }
                 if s != self.runner.settings {
-                    self.runner.save(s, &self.bridge, false)?;
+                    self.runner.save(s, &self.bridge)?;
                 }
                 panel.back();
             }
             Row::Page(page) => {
-                if page == Page::Agents && panel.discovered.is_empty() {
-                    panel.discovered = Host::ALL.into_iter().map(Host::discovery).collect()
-                }
                 panel.navigate(page);
+                if page == Page::Models {
+                    self.refresh_model_panel(panel);
+                }
                 if panel
                     .rows(self)
                     .first()
@@ -800,83 +663,104 @@ impl TerminalApp {
                 {
                     self.move_assistant_selection(panel, true);
                 }
-                if let Page::ReplyRange { scene } = page {
-                    let current = if scene {
-                        self.runner.effective_reply_activity()
-                    } else {
-                        self.runner.settings.reply_activity
-                    };
+                if page == Page::ReplyRange {
+                    let current = self.runner.effective_reply_activity();
                     panel.row = panel
                         .rows(self)
                         .iter()
-                        .position(|r| matches!(r,Row::Activity{activity,..} if *activity==current))
+                        .position(|r| matches!(r, Row::Activity(activity) if *activity == current))
                         .unwrap_or(0)
                 }
             }
-            Row::Host(host) => {
-                if host == self.runner.settings.host
-                    && !self.runner.settings.binary.as_os_str().is_empty()
-                {
-                    if !self.runner.has_saved_settings() {
-                        self.runner
-                            .save(self.runner.settings.clone(), &self.bridge, true)?
-                    }
-                } else {
-                    let mut s = self.runner.settings.clone();
-                    s.host = host;
-                    s.binary = panel
-                        .discovered
+            Row::ApiProtocol => {
+                self.check_model_change()?;
+                panel.choices = Some(Choices {
+                    kind: ChoiceKind::ApiProtocol,
+                    values: API_PROTOCOLS
                         .iter()
-                        .find(|e| e.host == host)
-                        .and_then(|e| e.program.clone())
-                        .unwrap_or_default();
-                    s.source = Source::Default;
-                    self.runner.save(s, &self.bridge, true)?
-                }
-                panel.back();
+                        .map(|p| (*p).label().to_owned())
+                        .collect(),
+                    selected: API_PROTOCOLS
+                        .iter()
+                        .position(|p| *p == self.runner.settings.api.protocol)
+                        .unwrap_or(0),
+                });
+            }
+            Row::ApiKey => {
+                self.begin_assistant_api_key()?;
+            }
+            Row::ClearApiKey => {
+                self.check_model_change()?;
+                panel.choices = Some(Choices {
+                    kind: ChoiceKind::ClearApiKey,
+                    values: vec!["保留 Key".into(), "清除 Key".into()],
+                    selected: 0,
+                });
+            }
+            Row::ChatgptAccount => {
+                self.check_model_change()?;
+                anyhow::ensure!(
+                    !panel.accounts.is_empty(),
+                    "没有已保存账号，请先 Continue with ChatGPT"
+                );
+                panel.choices = Some(Choices {
+                    kind: ChoiceKind::ChatgptAccount,
+                    values: panel.accounts.iter().map(account_choice_label).collect(),
+                    selected: panel
+                        .accounts
+                        .iter()
+                        .position(|a| {
+                            Some(&a.id) == self.runner.settings.api.chatgpt_account.as_ref()
+                        })
+                        .unwrap_or(0),
+                });
+            }
+            Row::ChatgptLogin => {
+                self.begin_chatgpt_login(None)?;
+            }
+            Row::ChatgptRelogin => {
+                let id = self
+                    .runner
+                    .settings
+                    .api
+                    .chatgpt_account
+                    .clone()
+                    .context("请先选择已保存账号")?;
+                self.begin_chatgpt_login(Some(&id))?;
+            }
+            Row::ChatgptSignOut => {
+                let id = self
+                    .runner
+                    .settings
+                    .api
+                    .chatgpt_account
+                    .clone()
+                    .context("请先选择账号")?;
+                self.begin_chatgpt_sign_out(&id)?;
+            }
+            Row::ChatgptModels => {
+                self.begin_chatgpt_models()?;
+            }
+            Row::ChatgptModel => {
+                self.check_model_change()?;
+                panel.choose_chatgpt_model(&self.runner.settings.api.model)?;
             }
             Row::Edit(field) => {
                 let s = &self.runner.settings;
                 let value = match field {
                     Field::ArchiveSearch => String::new(),
                     Field::External(field) => self.external_setting_value(field, panel),
-                    Field::Binary => s.binary.display().to_string(),
-                    Field::HistorySeconds => self.config.history_idle_seconds.to_string(),
-                    Field::Workspace => self.runner.workspace_path()?.display().to_string(),
-                    Field::Skills => s.skills.join("，"),
                     Field::Name => s.name.clone(),
-                    Field::Preferences => s.preferences.clone(),
+                    Field::ApiBaseUrl => s.api.base_url.clone(),
+                    Field::ApiModel => s.api.model.clone(),
                     Field::BlockedWords => s.blocked_words.join("，"),
                     Field::Topic => self
                         .runner
                         .topic_override()
                         .unwrap_or(self.runner.effective_topic())
                         .to_owned(),
-                    Field::Profile => {
-                        if let Source::OmpProfile(v) = &s.source {
-                            v.clone()
-                        } else {
-                            String::new()
-                        }
-                    }
-                    Field::Prompt => {
-                        if let Source::NativePrompt(v) = &s.source {
-                            v.display().to_string()
-                        } else {
-                            String::new()
-                        }
-                    }
                 };
                 panel.editor = Some((field, EditorInput::from(value)));
-            }
-            Row::Layout => {
-                self.configure_display("layout", if self.layout_chat { "list" } else { "chat" })?
-            }
-            Row::Usernames => {
-                self.configure_display("names", if self.show_name { "off" } else { "on" })?
-            }
-            Row::Timestamps => {
-                self.configure_display("time", if self.show_time { "off" } else { "on" })?
             }
             Row::Theme(index) => {
                 let id = self
@@ -902,63 +786,43 @@ impl TerminalApp {
                 self.record_reading_config()
             }
             Row::Login | Row::Logout => {
-                anyhow::ensure!(self.local_transport.is_none(), "本地模式禁止账号操作");
-                if matches!(row, Row::Logout) {
-                    self.cancel_main_login();
-                    let forgotten = self.assistant_accounts.main_changed();
-                    self.bridge.identity_changed();
-                    self.runner.pause(&self.bridge);
-                    self.review_frame = None;
-                    self.account.sign_out()?;
-                    self.account_status = AccountStatus::SignedOut;
-                    forgotten?
-                }
+                self.account_command(if matches!(row, Row::Login) {
+                    crate::runtime::AccountCommand::BeginLogin {
+                        identity: crate::runtime::Identity::Main,
+                    }
+                } else {
+                    crate::runtime::AccountCommand::SignOut {
+                        identity: crate::runtime::Identity::Main,
+                    }
+                })?;
             }
             Row::ReuseMain | Row::SignOutIndependent => {
-                self.bridge.identity_changed();
-                self.runner.pause(&self.bridge);
-                self.review_frame = None;
-                match row {
-                    Row::ReuseMain => self.assistant_accounts.reuse_main()?,
-                    Row::SignOutIndependent => self.assistant_accounts.sign_out_independent()?,
-                    _ => unreachable!(),
-                }
+                self.account_command(if matches!(row, Row::ReuseMain) {
+                    crate::runtime::AccountCommand::UseMainForAssistant
+                } else {
+                    crate::runtime::AccountCommand::SignOut {
+                        identity: crate::runtime::Identity::Assistant,
+                    }
+                })?;
             }
             Row::AssistantLogin => {
-                anyhow::ensure!(self.local_transport.is_none(), "本地模式禁止账号操作");
-                self.bridge.identity_changed();
-                self.runner.pause(&self.bridge);
-                self.review_frame = None
+                self.account_command(crate::runtime::AccountCommand::BeginLogin {
+                    identity: crate::runtime::Identity::Assistant,
+                })?;
             }
-            Row::CancelAssistantLogin => self.assistant_accounts.cancel_login(),
+            Row::CancelAssistantLogin => {
+                self.account_command(crate::runtime::AccountCommand::CancelLogin)?;
+            }
             Row::Permission => {
-                let on = Choice {
-                    value: true.into(),
-                    name: "自动发送".into(),
-                };
-                let off = Choice {
-                    value: false.into(),
-                    name: "逐条发送".into(),
-                };
                 panel.choices = Some(Choices {
-                    id: Some("__sending__".into()),
-                    values: vec![off, on],
+                    kind: ChoiceKind::Sending,
+                    values: vec!["逐条发送".into(), "自动发送".into()],
                     selected: usize::from(self.runner.settings.automatic),
-                })
+                });
             }
-            Row::ReplyActivity => {
-                return self
-                    .apply_assistant_row(Row::Page(Page::ReplyRange { scene: false }), panel);
-            }
-            Row::Activity { activity, scene } => {
-                if scene {
-                    if activity != self.runner.effective_reply_activity() {
-                        self.runner.set_reply_activity_override(activity)
-                    }
-                } else if activity != self.runner.settings.reply_activity {
-                    let mut s = self.runner.settings.clone();
-                    s.reply_activity = activity;
-                    self.runner.save(s, &self.bridge, false)?
+            Row::Activity(activity) => {
+                if activity != self.runner.effective_reply_activity() {
+                    self.runner.set_reply_activity_override(activity)
                 }
                 panel.back();
             }
@@ -968,90 +832,20 @@ impl TerminalApp {
                     Persona::Assistant => Persona::Broadcaster,
                     Persona::Broadcaster => Persona::Assistant,
                 };
-                self.runner.save(s, &self.bridge, false)?
+                self.runner.save(s, &self.bridge)?
             }
             Row::RestoreTopic => self.runner.set_topic_override(String::new())?,
             Row::WebSearch => {
+                self.check_model_change()?;
                 let mut s = self.runner.settings.clone();
-                anyhow::ensure!(
-                    s.web_search || hosts::supports_search(s.host),
-                    "该工具不支持联网搜索"
-                );
                 s.web_search = !s.web_search;
-                self.runner.save(s, &self.bridge, true)?
-            }
-            Row::UseProfile
-            | Row::UseProject
-            | Row::ThankGifts
-            | Row::ThankLikes
-            | Row::ThankFollows
-            | Row::ThankShares
-            | Row::MentionSender
-            | Row::RepairBlocked
-            | Row::DynamicHostPriority
-            | Row::DynamicMutedSupport => {
-                let mut s = self.runner.settings.clone();
-                let enabled = match row {
-                    Row::UseProfile => &mut s.use_profile,
-                    Row::UseProject => &mut s.use_project,
-                    Row::ThankGifts => &mut s.thank_gifts,
-                    Row::ThankLikes => &mut s.thank_likes,
-                    Row::ThankFollows => &mut s.thank_follows,
-                    Row::ThankShares => &mut s.thank_shares,
-                    Row::MentionSender => &mut s.mention_sender,
-                    Row::RepairBlocked => &mut s.repair_blocked,
-                    Row::DynamicHostPriority => &mut s.dynamic_host_priority,
-                    Row::DynamicMutedSupport => &mut s.dynamic_muted_support,
-                    _ => unreachable!(),
-                };
-                *enabled = !*enabled;
-                self.runner.save(s, &self.bridge, false)?
-            }
-            Row::DefaultSource => {
-                if self.runner.settings.source != Source::Default {
-                    let mut s = self.runner.settings.clone();
-                    s.source = Source::Default;
-                    self.runner.save(s, &self.bridge, true)?;
-                }
-            }
-            Row::ConnectOptions => self.runner.connect_options()?,
-            Row::Option(index) => {
-                anyhow::ensure!(
-                    !self.runner.configuring && self.runner.pending.is_none(),
-                    "等待上一配置回执"
-                );
-                let (id, values, current) =
-                    if let Some(options) = &self.runner.report.options.config {
-                        let o = options.get(index).context("选项已刷新")?;
-                        anyhow::ensure!(!o.unsupported, "未知选项类型");
-                        (Some(o.id.clone()), o.choices.clone(), o.current.clone())
-                    } else {
-                        let (current, choices) = self
-                            .runner
-                            .report
-                            .options
-                            .modes
-                            .as_ref()
-                            .context("未报告可选项")?;
-                        (
-                            None,
-                            choices.clone(),
-                            crate::runner::acp::SettingValue::value_id(current.clone()),
-                        )
-                    };
-                anyhow::ensure!(!values.is_empty(), "未提供可选值");
-                let selected = values.iter().position(|v| v.value == current).unwrap_or(0);
-                panel.choices = Some(Choices {
-                    id,
-                    values,
-                    selected,
-                })
+                self.runner.save(s, &self.bridge)?;
             }
             Row::Action(Action::Run) => {
                 if self.runner.running || self.resume_pending {
                     self.pause_assistant()
                 } else {
-                    self.start_assistant(false, false)?
+                    self.start_assistant(false)?
                 }
             }
             Row::Action(Action::Review) => panel.navigate(Page::Candidates),
@@ -1078,8 +872,7 @@ impl TerminalApp {
                 ))?;
                 return Ok(true);
             }
-            Row::Visible => self.start_assistant(true, true)?,
-            Row::Context => self.start_assistant(false, true)?,
+            Row::Visible => self.start_assistant(true)?,
             Row::Stop => {
                 self.stop_assistant();
                 return Ok(true);
@@ -1091,7 +884,7 @@ impl TerminalApp {
     fn save_assistant_editor(
         &mut self,
         panel: &mut Panel,
-        tx: mpsc::Sender<UiEvent>,
+        tx: mpsc::Sender<CoreEvent>,
     ) -> Result<()> {
         let Some((field, editor)) = panel.editor.as_ref() else {
             return Ok(());
@@ -1110,33 +903,23 @@ impl TerminalApp {
             panel.error = None;
             return Ok(());
         }
-        if field == Field::HistorySeconds {
-            let seconds: u32 = value.trim().parse().context("请输入非负整数秒数")?;
-            self.config
-                .save_value("history_idle_seconds", i64::from(seconds).into())?;
-            self.config.history_idle_seconds = seconds;
-            self.record_reading_config();
-            self.last_user_activity = Instant::now()
-        } else if field == Field::Workspace {
-            self.runner
-                .set_workspace(value.trim().into(), &self.bridge)?
-        } else if field == Field::Topic {
+        if field == Field::Topic {
             self.runner.set_topic_override(value)?
         } else {
             let mut s = self.runner.settings.clone();
             match field {
-                Field::Binary => s.binary = value.trim().into(),
-                Field::Profile => s.source = Source::OmpProfile(value.trim().into()),
-                Field::Prompt => s.source = Source::NativePrompt(value.trim().into()),
                 Field::Name => s.name = value,
-                Field::Preferences => s.preferences = value,
-                Field::Skills => {
-                    s.skills = value
-                        .split([',', '，', ';', '；', '\n'])
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                        .map(str::to_owned)
-                        .collect()
+                Field::ApiBaseUrl => {
+                    self.check_model_change()?;
+                    s.api.base_url = if value.trim().is_empty() {
+                        String::new()
+                    } else {
+                        crate::runner::settings::normalize_base_url(&value)?
+                    };
+                }
+                Field::ApiModel => {
+                    self.check_model_change()?;
+                    s.api.model = value.trim().to_owned();
                 }
                 Field::BlockedWords => {
                     s.blocked_words = value
@@ -1148,7 +931,7 @@ impl TerminalApp {
                 }
                 _ => unreachable!(),
             }
-            self.runner.save(s, &self.bridge, true)?
+            self.runner.save(s, &self.bridge)?
         }
         panel.editor = None;
         panel.error = None;
@@ -1157,33 +940,88 @@ impl TerminalApp {
     }
     fn select_assistant_choice(&mut self, panel: &mut Panel, index: usize) -> Result<()> {
         let choices = panel.choices.as_ref().context("选项已关闭")?;
-        let value = choices
-            .values
-            .get(index)
-            .context("选项已刷新")?
-            .value
-            .clone();
-        let id = choices.id.clone();
-        if id.as_deref() == Some("__sending__") {
-            let allow = value == true.into();
+        choices.values.get(index).context("选项已刷新")?;
+        let kind = choices.kind;
+        if matches!(kind, ChoiceKind::Sending) {
+            let allow = index == 1;
             if allow != self.bridge.sending_enabled() || allow != self.runner.settings.automatic {
-                self.set_automatic_permission(allow)?
+                self.set_automatic_permission(allow)?;
             }
-            panel.choices = None;
-            return Ok(());
+        } else {
+            self.check_model_change()?;
+            let mut settings = self.runner.settings.clone();
+            match kind {
+                ChoiceKind::ApiProtocol => {
+                    let protocol = *API_PROTOCOLS.get(index).context("连接选项已刷新")?;
+                    if protocol != settings.api.protocol {
+                        settings.api.protocol = protocol;
+                        settings.api.base_url = protocol.default_base_url().to_owned();
+                        settings.api.model.clear();
+                        settings.api.chatgpt_account = None;
+                        self.runner.save(settings, &self.bridge)?;
+                        panel.models.clear();
+                        self.refresh_model_panel(panel);
+                    }
+                }
+                ChoiceKind::ClearApiKey => {
+                    if index == 1 {
+                        self.runner.clear_api_key(&self.bridge)?;
+                    }
+                }
+                ChoiceKind::ChatgptAccount => {
+                    let account = panel.accounts.get(index).context("账号列表已刷新")?;
+                    if settings.api.chatgpt_account.as_deref() != Some(&account.id) {
+                        settings.api.chatgpt_account = Some(account.id.clone());
+                        settings.api.model.clear();
+                        self.runner.save(settings, &self.bridge)?;
+                        panel.models.clear();
+                    }
+                    panel.choices = None;
+                    self.begin_chatgpt_models()?;
+                }
+                ChoiceKind::ChatgptModel => {
+                    settings.api.model = panel
+                        .models
+                        .get(index)
+                        .context("模型列表已刷新")?
+                        .slug
+                        .clone();
+                    self.runner.save(settings, &self.bridge)?;
+                }
+                ChoiceKind::Sending => unreachable!(),
+            }
         }
-        if choice_is_current(self, id.as_deref(), &value) {
-            panel.choices = None;
-            return Ok(());
-        }
-        let new_context = hosts::permit_option(self.runner.settings.host, id.as_deref(), &value)?;
-        self.runner.change(Change {
-            id,
-            value,
-            new_context,
-        })?;
         panel.choices = None;
         Ok(())
+    }
+    fn check_model_change(&self) -> Result<()> {
+        self.check_assistant_connection_change()
+    }
+    pub(crate) fn project_models(&mut self, models: Vec<ModelChoice>) -> Result<()> {
+        let mut panel = self.assistant_panel.take().unwrap_or_else(Panel::new);
+        if panel.page != Page::Models {
+            panel.navigate(Page::Models);
+        }
+        self.refresh_model_panel(&mut panel);
+        panel.editor = None;
+        panel.error = None;
+        panel.models = models;
+        panel.choose_chatgpt_model(&self.runner.settings.api.model)?;
+        self.assistant_panel = Some(panel);
+        Ok(())
+    }
+    fn refresh_model_panel(&mut self, panel: &mut Panel) {
+        self.runner.refresh_key_status();
+        if self.runner.settings.api.protocol != ApiProtocol::ChatgptSubscription {
+            return;
+        }
+        match self.runner.chatgpt_accounts() {
+            Ok(accounts) => panel.accounts = accounts,
+            Err(error) => {
+                panel.accounts.clear();
+                panel.error = Some(error.to_string());
+            }
+        }
     }
     fn move_assistant_selection(&self, panel: &mut Panel, forward: bool) {
         let rows = panel.rows(self);
@@ -1210,7 +1048,7 @@ impl TerminalApp {
         &mut self,
         index: usize,
         panel: &mut Panel,
-        tx: mpsc::Sender<UiEvent>,
+        tx: mpsc::Sender<CoreEvent>,
     ) -> Result<bool> {
         let row = *panel
             .rows(self)
@@ -1225,19 +1063,15 @@ impl TerminalApp {
             return Ok(matches!(raw, "/help" | "/quit"));
         }
         let close = self.apply_assistant_row(row, panel)?;
-        if matches!(row, Row::AssistantLogin) {
-            self.cancel_main_login();
-            self.assistant_accounts.start_login(tx.clone())
-        }
-        if matches!(row, Row::Login) {
-            self.set_notice("正在创建 B 站登录二维码…", NoticeLevel::Progress);
-            self.start_login(tx)
-        }
         Ok(close)
     }
 
-    pub(super) async fn assistant_key(&mut self, key: KeyEvent, tx: mpsc::Sender<UiEvent>) -> bool {
-        if self.candidate_edit.is_some() {
+    pub(crate) async fn assistant_key(
+        &mut self,
+        key: KeyEvent,
+        tx: mpsc::Sender<CoreEvent>,
+    ) -> bool {
+        if self.candidate_edit.is_some() || self.secret_target.is_some() {
             return false;
         }
         let Some(mut panel) = self.assistant_panel.take() else {
@@ -1377,8 +1211,6 @@ impl TerminalApp {
                     panel.list_offset = 0;
                     panel.scroll = 0;
                     panel.expanded = false;
-                    panel.thanks_expanded = false;
-                    panel.advanced_group = None;
                     panel.error = None;
                 }
                 KeyCode::BackTab if SETTINGS_PAGES.contains(&panel.page) => {
@@ -1392,8 +1224,6 @@ impl TerminalApp {
                     panel.list_offset = 0;
                     panel.scroll = 0;
                     panel.expanded = false;
-                    panel.thanks_expanded = false;
-                    panel.advanced_group = None;
                     panel.error = None;
                 }
                 KeyCode::Up | KeyCode::Left | KeyCode::BackTab if !rows.is_empty() => {
@@ -1435,7 +1265,52 @@ impl TerminalApp {
         }
         true
     }
-    pub(super) fn assistant_mouse(&mut self, event: MouseEvent) -> bool {
+    /// Select a row from the last rendered list; activation stays in the shared key path.
+    pub(crate) fn assistant_click(&mut self, event: MouseEvent) -> bool {
+        if self.secret_target.is_some()
+            || self.candidate_edit.is_some()
+            || self.stop_flow.is_some()
+            || self.login_qr.is_some()
+            || event.kind != MouseEventKind::Down(crossterm::event::MouseButton::Left)
+            || !event.modifiers.is_empty()
+        {
+            return false;
+        }
+        let Some(panel) = self.assistant_panel.as_ref() else {
+            return false;
+        };
+        if panel.editor.is_some() || panel.choices.is_some() || panel.pending_save.is_some() {
+            return false;
+        }
+        let Some((page, rect, offset)) = panel.menu_hit else {
+            return false;
+        };
+        if page != panel.page
+            || event.column < rect.x
+            || event.column >= rect.right()
+            || event.row < rect.y
+            || event.row >= rect.bottom()
+        {
+            return false;
+        }
+        let index = offset + usize::from(event.row - rect.y);
+        let rows = panel.rows(self);
+        let Some(row) = rows.get(index).copied() else {
+            return false;
+        };
+        if panel.menu_rows.get(index) != Some(&row) {
+            return false;
+        }
+        if readonly_reason(row, self).is_some() {
+            return false;
+        }
+        self.assistant_panel.as_mut().expect("菜单仍打开").row = index;
+        true
+    }
+    pub(crate) fn assistant_mouse(&mut self, event: MouseEvent) -> bool {
+        if self.secret_target.is_some() {
+            return false;
+        }
         let Some(mut panel) = self.assistant_panel.take() else {
             return false;
         };
@@ -1472,12 +1347,12 @@ const ASSISTANT_STARTUP_FRAMES: [&str; 4] =
 const ASSISTANT_STARTUP_SHORT_FRAMES: [&str; 4] = ["◐ 启动中", "◓ 启动中", "◑ 启动中", "◒ 启动中"];
 const ASSISTANT_STARTUP_TINY_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
 
-// Startup includes the pre-connection identity check, not just the ACP process.
-pub(super) fn compact(app: &TerminalApp, width: u16) -> Span<'static> {
+// The startup animation is only the local identity-resume check, not remote authentication.
+pub(crate) fn compact(app: &RuntimeState, width: u16) -> Span<'static> {
     if (!app.runner.running && !app.resume_pending) || width == 0 {
         return Span::raw("");
     }
-    if app.resume_pending || !app.runner.report.connected || app.runner.report.session.is_none() {
+    if app.resume_pending {
         let frame = app.animation_tick as usize % ASSISTANT_STARTUP_FRAMES.len();
         let label = if width >= 11 {
             ASSISTANT_STARTUP_FRAMES[frame]
@@ -1510,7 +1385,7 @@ pub(super) fn compact(app: &TerminalApp, width: u16) -> Span<'static> {
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )
 }
-pub(super) fn run_label(app: &TerminalApp) -> &'static str {
+pub(crate) fn run_label(app: &RuntimeState) -> &'static str {
     if app.runner.running || app.resume_pending {
         "暂停 AI"
     } else if app.runner.has_context() {
@@ -1519,7 +1394,7 @@ pub(super) fn run_label(app: &TerminalApp) -> &'static str {
         "启动 AI"
     }
 }
-pub(super) fn policy_label(app: &TerminalApp) -> &'static str {
+pub(crate) fn policy_label(app: &RuntimeState) -> &'static str {
     if !app.runner.settings.automatic {
         "逐条确认后发送"
     } else if app.bridge.sending_enabled() {
@@ -1532,29 +1407,21 @@ fn on_off(enabled: bool) -> &'static str {
     if enabled { "开启" } else { "关闭" }
 }
 
-fn account_label(status: &AccountStatus) -> String {
-    match status {
-        AccountStatus::SignedOut => "未登录".into(),
-        AccountStatus::SignedIn {
-            display_name,
-            user_id,
-        } => format!("{display_name} · UID {user_id}"),
-    }
-}
-
-fn workspace_status(app: &TerminalApp) -> &'static str {
-    use crate::runner::WorkspaceContextStatus;
-    match app.runner.workspace_context_status() {
-        WorkspaceContextStatus::Unread => "尚未读取",
-        WorkspaceContextStatus::Pending => "待下轮载入",
-        WorkspaceContextStatus::Loaded => "本轮已载入",
-        WorkspaceContextStatus::Error(_) => "资料读取失败",
-    }
-}
-
-fn readonly_reason(row: Row, app: &TerminalApp) -> Option<String> {
-    let s = &app.runner.settings;
+fn readonly_reason(row: Row, app: &RuntimeState) -> Option<String> {
     match row {
+        Row::ApiProtocol
+        | Row::ApiKey
+        | Row::ClearApiKey
+        | Row::WebSearch
+        | Row::ChatgptAccount
+        | Row::ChatgptLogin
+        | Row::ChatgptRelogin
+        | Row::ChatgptSignOut
+        | Row::ChatgptModels
+        | Row::ChatgptModel
+        | Row::Edit(Field::ApiBaseUrl | Field::ApiModel) => {
+            app.check_model_change().err().map(|e| e.to_string())
+        }
         Row::Edit(Field::External(_)) if app.local_transport.is_some() => {
             Some("本地模式禁止真实账号与OBS操作".into())
         }
@@ -1577,14 +1444,8 @@ fn readonly_reason(row: Row, app: &TerminalApp) -> Option<String> {
             | Action::ApproveAllCandidates
             | Action::DiscardAllCandidates,
         ) if app.bridge.candidate_count() == 0 => Some("暂无待审回复".into()),
-        Row::Group(_) | Row::DynamicStrategy => Some("只读信息".into()),
-        Row::Edit(Field::Profile | Field::Prompt) if s.host != Host::Omp => {
-            Some("当前工具不支持此规则来源".into())
-        }
+        Row::Group(_) => Some("只读信息".into()),
         Row::RepairHistory if app.runner.history_repair_running() => Some("重建中".into()),
-        Row::WebSearch if !s.web_search && !hosts::supports_search(s.host) => {
-            Some("当前工具不支持联网搜索".into())
-        }
         Row::Login | Row::Logout | Row::AssistantLogin if app.local_transport.is_some() => {
             Some("本地模式禁止真实账号操作".into())
         }
@@ -1593,14 +1454,11 @@ fn readonly_reason(row: Row, app: &TerminalApp) -> Option<String> {
         }
         Row::Preset(_) if app.runner.running => Some("请先暂停 AI".into()),
         Row::Preset(_) if app.runner.in_flight() => Some("等待当前回复结束".into()),
-        Row::Option(_) if app.runner.pending.is_some() || app.runner.configuring => {
-            Some("设置中".into())
-        }
         _ => None,
     }
 }
 
-fn row_columns(row: Row, app: &TerminalApp, panel: &Panel) -> (String, String) {
+fn row_columns(row: Row, app: &RuntimeState, panel: &Panel) -> (String, String) {
     let s = &app.runner.settings;
     match row {
         Row::Group("人工发送") => ("人工发送".into(), account_label(&app.account_status)),
@@ -1623,42 +1481,6 @@ fn row_columns(row: Row, app: &TerminalApp, panel: &Panel) -> (String, String) {
                 .unwrap_or_else(|| app.obs_error.clone().unwrap_or_else(|| "未连接".into())),
         ),
         Row::Group(name) => (name.into(), String::new()),
-        Row::ToggleThanks => (
-            "互动感谢".into(),
-            if panel.thanks_expanded {
-                "收起"
-            } else {
-                "展开"
-            }
-            .into(),
-        ),
-        Row::AdvancedGroup(0) => (
-            "规则".into(),
-            if panel.advanced_group == Some(0) {
-                "收起"
-            } else {
-                "展开"
-            }
-            .into(),
-        ),
-        Row::AdvancedGroup(1) => (
-            "运行策略".into(),
-            if panel.advanced_group == Some(1) {
-                "收起"
-            } else {
-                "展开"
-            }
-            .into(),
-        ),
-        Row::AdvancedGroup(_) => (
-            "维护".into(),
-            if panel.advanced_group == Some(2) {
-                "收起"
-            } else {
-                "展开"
-            }
-            .into(),
-        ),
         Row::Command("/obs") => ("OBS".into(), "推流指令".into()),
         Row::Command("/diag") => ("诊断".into(), "连接与历史".into()),
         Row::Command("/help") => ("帮助".into(), String::new()),
@@ -1670,14 +1492,13 @@ fn row_columns(row: Row, app: &TerminalApp, panel: &Panel) -> (String, String) {
             .find(|s| s.completion.trim() == raw)
             .map(|s| (s.usage.into(), s.description.into()))
             .unwrap_or_else(|| (raw.into(), String::new())),
-        Row::Page(Page::Reading) => ("外观与显示".into(), "主题、布局、阅读".into()),
         Row::Page(Page::Account) if panel.page == Page::AiSettings => (
             "发送账号".into(),
             app.assistant_accounts.label(&app.account_status),
         ),
         Row::Page(Page::Account) => ("B站账号与直播间".into(), "账号、标题、封面".into()),
         Row::Page(Page::Obs) => ("OBS".into(), "连接配置与当前控制".into()),
-        Row::Page(Page::AiSettings) => ("AI助手".into(), "工作空间、Agent、发送策略".into()),
+        Row::Page(Page::AiSettings) => ("AI助手".into(), "模型、发送策略与维护".into()),
         Row::Page(Page::System) => ("系统与关于".into(), "工具信息、诊断与修复".into()),
         Row::Page(Page::Home) => ("本场 AI".into(), policy_label(app).into()),
         Row::Edit(Field::External(field)) => (
@@ -1686,60 +1507,18 @@ fn row_columns(row: Row, app: &TerminalApp, panel: &Panel) -> (String, String) {
         ),
         Row::Edit(Field::ArchiveSearch) => ("搜索归档".into(), "输入关键词".into()),
         Row::Page(Page::Models) => ("模型".into(), configuration_status(app).into()),
-        Row::Page(Page::Assistant) => ("发送策略".into(), "默认范围、互动与回复".into()),
-        Row::Page(Page::Materials) => ("人设与资料".into(), "名字、身份与上下文".into()),
-        Row::Page(Page::Advanced) => ("Agent配置".into(), "规则、运行策略与维护".into()),
+        Row::Page(Page::Assistant) => ("发送策略".into(), "方案、联网搜索与屏蔽词".into()),
+        Row::Page(Page::Materials) => ("人设与资料".into(), "AI名字与人设".into()),
+        Row::Page(Page::Advanced) => ("维护".into(), "可见弹幕与结束".into()),
         Row::Page(Page::Themes) => ("主题".into(), app.config.theme_name.clone()),
-        Row::Page(Page::Agents) => ("AI 工具".into(), s.host.label().into()),
         Row::Page(Page::Presets) => ("方案".into(), "选择后立即保存".into()),
-        Row::Page(Page::ReplyRange { scene }) => (
-            if scene {
-                "本场范围"
-            } else {
-                "默认范围"
-            }
-            .into(),
-            if scene {
-                app.runner.effective_reply_activity()
-            } else {
-                s.reply_activity
-            }
-            .label()
-            .into(),
+        Row::Page(Page::ReplyRange) => (
+            "本场范围".into(),
+            app.runner.effective_reply_activity().label().into(),
         ),
         Row::Page(page) => (page.title().into(), "打开".into()),
         Row::Preset(v) => (v.label().into(), String::new()),
-        Row::DynamicHostPriority => (
-            "开麦主播优先".into(),
-            on_off(s.dynamic_host_priority).into(),
-        ),
-        Row::DynamicMutedSupport => (
-            "静音文字补位".into(),
-            on_off(s.dynamic_muted_support).into(),
-        ),
-        Row::DynamicStrategy => (
-            "当前策略".into(),
-            app.runner.dynamic_reply_strategy().label().into(),
-        ),
-        Row::Edit(Field::Workspace) => (
-            "工作区".into(),
-            self_or(
-                app.runner
-                    .workspace_path()
-                    .ok()
-                    .map(|p| p.display().to_string()),
-                "未设置",
-            ),
-        ),
         Row::Edit(Field::Name) => ("AI 名字".into(), s.name.clone()),
-        Row::Edit(Field::Preferences) => (
-            "补充要求".into(),
-            if s.preferences.is_empty() {
-                "默认".into()
-            } else {
-                s.preferences.clone()
-            },
-        ),
         Row::Edit(Field::Topic) => (
             "本场主题".into(),
             if app.runner.effective_topic().is_empty() {
@@ -1748,52 +1527,12 @@ fn row_columns(row: Row, app: &TerminalApp, panel: &Panel) -> (String, String) {
                 app.runner.effective_topic().into()
             },
         ),
-        Row::Edit(Field::HistorySeconds) => (
-            "回到最新".into(),
-            if app.config.history_idle_seconds == 0 {
-                "关闭".into()
-            } else {
-                format!("{} 秒", app.config.history_idle_seconds)
-            },
-        ),
-        Row::Edit(Field::Profile) => (
-            "OMP profile".into(),
-            if let Source::OmpProfile(v) = &s.source {
-                v.clone()
-            } else {
-                "未选用".into()
-            },
-        ),
-        Row::Edit(Field::Prompt) => (
-            "规则文件".into(),
-            if let Source::NativePrompt(v) = &s.source {
-                v.display().to_string()
-            } else {
-                "未选用".into()
-            },
-        ),
-        Row::Edit(Field::Skills) => (
-            "Skills".into(),
-            if s.skills.is_empty() {
-                "未设置".into()
-            } else {
-                s.skills.join("，")
-            },
-        ),
         Row::Edit(Field::BlockedWords) => (
             "屏蔽词".into(),
             if s.blocked_words.is_empty() {
                 "未设置".into()
             } else {
                 s.blocked_words.join("，")
-            },
-        ),
-        Row::Edit(Field::Binary) => (
-            "ACP 程序".into(),
-            if s.binary.as_os_str().is_empty() {
-                "自动发现".into()
-            } else {
-                s.binary.display().to_string()
             },
         ),
         Row::Permission => (
@@ -1807,16 +1546,9 @@ fn row_columns(row: Row, app: &TerminalApp, panel: &Panel) -> (String, String) {
             }
             .into(),
         ),
-        Row::ReplyActivity => ("默认范围".into(), s.reply_activity.label().into()),
-        Row::Activity { activity, scene } => (
+        Row::Activity(activity) => (
             activity.label().into(),
-            if activity
-                == if scene {
-                    app.runner.effective_reply_activity()
-                } else {
-                    s.reply_activity
-                }
-            {
+            if activity == app.runner.effective_reply_activity() {
                 "当前"
             } else {
                 "选择"
@@ -1824,15 +1556,7 @@ fn row_columns(row: Row, app: &TerminalApp, panel: &Panel) -> (String, String) {
             .into(),
         ),
         Row::RestoreTopic => ("用直播标题".into(), String::new()),
-        Row::UseProfile => ("主播简介".into(), on_off(s.use_profile).into()),
-        Row::UseProject => ("项目资料".into(), on_off(s.use_project).into()),
-        Row::ThankGifts => ("礼物与上舰".into(), on_off(s.thank_gifts).into()),
-        Row::ThankLikes => ("点赞".into(), on_off(s.thank_likes).into()),
-        Row::ThankFollows => ("关注".into(), on_off(s.thank_follows).into()),
-        Row::ThankShares => ("分享".into(), on_off(s.thank_shares).into()),
-        Row::MentionSender => ("问答时 @ 对方".into(), on_off(s.mention_sender).into()),
         Row::Persona => ("人设".into(), s.persona.label().into()),
-        Row::RepairBlocked => ("拒绝时改写".into(), on_off(s.repair_blocked).into()),
         Row::RepairHistory => (
             "重建历史".into(),
             if app.runner.history_repair_running() {
@@ -1843,7 +1567,6 @@ fn row_columns(row: Row, app: &TerminalApp, panel: &Panel) -> (String, String) {
             .into(),
         ),
         Row::WebSearch => ("联网搜索".into(), on_off(s.web_search).into()),
-        Row::DefaultSource => ("默认规则".into(), "使用工具默认值".into()),
         Row::Theme(i) => {
             let e = app.config.themes.entries().nth(i);
             (
@@ -1860,20 +1583,49 @@ fn row_columns(row: Row, app: &TerminalApp, panel: &Panel) -> (String, String) {
             )
         }
         Row::ReloadThemes => ("重载主题".into(), "读取 themes.json".into()),
-        Row::Layout => (
-            "布局".into(),
-            if app.layout_chat { "聊天" } else { "列表" }.into(),
-        ),
-        Row::Usernames => ("昵称".into(), on_off(app.show_name).into()),
-        Row::Timestamps => ("时间".into(), on_off(app.show_time).into()),
-        Row::ConnectOptions => (
-            "读取模型".into(),
-            if app.runner.configuring {
-                "读取中"
-            } else {
-                "未连接"
+        Row::ApiProtocol => ("连接方式".into(), (s.api.protocol).label().into()),
+        Row::Edit(Field::ApiBaseUrl) => ("API 基址".into(), s.api.base_url.clone()),
+        Row::Edit(Field::ApiModel) => ("模型名".into(), s.api.model.clone()),
+        Row::ApiKey => (
+            "设置/更换 Key".into(),
+            match &app.runner.key_status {
+                KeyStatus::Set => "已设置",
+                KeyStatus::Unset => "未设置",
+                KeyStatus::Error(_) => "文件错误",
             }
             .into(),
+        ),
+        Row::ClearApiKey => ("清除 Key".into(), "需确认".into()),
+        Row::ChatgptAccount => (
+            "ChatGPT 账号".into(),
+            selected_account(app, panel)
+                .map(account_choice_label)
+                .unwrap_or_else(|| "未选择".into()),
+        ),
+        Row::ChatgptLogin => ("Continue with ChatGPT".into(), "系统浏览器授权".into()),
+        Row::ChatgptRelogin => ("重新登录当前账号".into(), "保留注册绑定".into()),
+        Row::ChatgptSignOut => ("退出当前账号".into(), "清除本机 Token".into()),
+        Row::ChatgptModels => (
+            "读取账号模型".into(),
+            if app.runner.connection_busy() {
+                "账号/目录操作中"
+            } else {
+                "刷新/失败后重读"
+            }
+            .into(),
+        ),
+        Row::ChatgptModel => (
+            "选择账号模型".into(),
+            if s.api.model.is_empty() {
+                if app.runner.connection_busy() {
+                    "等待目录"
+                } else {
+                    "尚未选择"
+                }
+                .into()
+            } else {
+                s.api.model.clone()
+            },
         ),
         Row::Login => ("登录".into(), account_label(&app.account_status)),
         Row::Logout => ("退出人工账号".into(), account_label(&app.account_status)),
@@ -1902,47 +1654,9 @@ fn row_columns(row: Row, app: &TerminalApp, panel: &Panel) -> (String, String) {
         Row::Action(Action::DiscardAllCandidates) => {
             ("全部丢弃".into(), "不影响在途或结果不确定的回复".into())
         }
-        Row::Host(h) => (
-            h.label().into(),
-            if h == s.host { "当前" } else { "选择" }.into(),
-        ),
-        Row::Option(i) => {
-            if let Some(o) = app
-                .runner
-                .report
-                .options
-                .config
-                .as_ref()
-                .and_then(|v| v.get(i))
-            {
-                (
-                    o.name.clone(),
-                    o.choices
-                        .iter()
-                        .find(|v| v.value == o.current)
-                        .map(|v| v.name.clone())
-                        .unwrap_or_else(|| crate::runner::acp::value_label(&o.current)),
-                )
-            } else {
-                (
-                    "运行模式".into(),
-                    app.runner
-                        .report
-                        .options
-                        .modes
-                        .as_ref()
-                        .map(|v| v.0.clone())
-                        .unwrap_or_else(|| "继承".into()),
-                )
-            }
-        }
-        Row::Visible => ("处理可见弹幕".into(), "重建上下文".into()),
-        Row::Context => ("重建上下文".into(), "从后续弹幕开始".into()),
+        Row::Visible => ("处理可见弹幕".into(), "仅未消费的消息".into()),
         Row::Stop => ("结束 AI".into(), "清除续用与发送权".into()),
     }
-}
-fn self_or(v: Option<String>, fallback: &str) -> String {
-    v.unwrap_or_else(|| fallback.into())
 }
 
 // Width is measured in terminal cells, never UTF-8 bytes or Rust's scalar padding.
@@ -1957,37 +1671,45 @@ fn column_line(name: &str, value: &str, width: usize, label_width: usize) -> Str
     )
 }
 
-fn choice_is_current(
-    app: &TerminalApp,
-    id: Option<&str>,
-    selected: &crate::runner::acp::SettingValue,
-) -> bool {
-    if let Some(id) = id {
-        app.runner
-            .report
-            .options
-            .config
-            .as_ref()
-            .and_then(|options| options.iter().find(|o| o.id == id))
-            .is_some_and(|o| o.current == *selected)
+fn account_choice_label(account: &AccountInfo) -> String {
+    format!(
+        "{} · {}",
+        sanitize_input(account.label.clone()),
+        if !account.signed_in {
+            "已退出"
+        } else if !account.plan_enabled {
+            "未获订阅推理权限"
+        } else {
+            "已登录"
+        }
+    )
+}
+fn selected_account<'a>(app: &RuntimeState, panel: &'a Panel) -> Option<&'a AccountInfo> {
+    panel
+        .accounts
+        .iter()
+        .find(|a| Some(&a.id) == app.runner.settings.api.chatgpt_account.as_ref())
+}
+fn configuration_status(app: &RuntimeState) -> &'static str {
+    if app.runner.connection_busy() {
+        "账号/模型操作进行中"
+    } else if app.runner.settings.api.base_url.is_empty()
+        || app.runner.settings.api.model.is_empty()
+        || (app.runner.settings.api.protocol == ApiProtocol::ChatgptSubscription
+            && app.runner.settings.api.chatgpt_account.is_none())
+    {
+        "连接配置尚未齐备"
+    } else if app.runner.settings.api.protocol == ApiProtocol::ChatgptSubscription {
+        "已选择账号与模型；启动时检查登录"
     } else {
-        app.runner.report.options.modes.as_ref().is_some_and(|(current, _)| {
-            matches!(selected, crate::runner::acp::SettingValue::ValueId { value } if value.0.as_ref() == current.as_str())
-        })
+        match &app.runner.key_status {
+            KeyStatus::Set => "本机配置齐备；未验证远端鉴权",
+            KeyStatus::Unset => "尚未设置当前连接 Key",
+            KeyStatus::Error(_) => "Key 文件错误",
+        }
     }
 }
-fn configuration_status(app: &TerminalApp) -> &'static str {
-    if app.runner.pending.is_some() {
-        "设置等待生效"
-    } else if app.runner.configuring {
-        "等待AI工具确认设置"
-    } else if !app.runner.report.connected {
-        "尚未读取模型设置"
-    } else {
-        "显示AI工具已确认的设置"
-    }
-}
-fn selected_details(app: &TerminalApp, panel: &Panel) -> String {
+fn selected_details(app: &RuntimeState, panel: &Panel) -> String {
     let Some(row) = panel.rows(app).get(panel.row).copied() else {
         return if panel.page == Page::Diagnostics {
             diagnostics_details(app)
@@ -1996,12 +1718,6 @@ fn selected_details(app: &TerminalApp, panel: &Panel) -> String {
         };
     };
     match row {
-        Row::ToggleThanks => "关注、礼物与上舰、点赞、分享各有3句个体与3句集体文案轮换。每批收集5秒：不超过5名不同观众逐人原生@，更多时集体感谢；全局至少15秒，每批完成后同类再冷却（关注30秒、礼物与上舰15秒、点赞与分享60秒）。已开始批次冻结，仍保留过期、审核与本场授权。".into(),
-        Row::ThankGifts => "礼物与上舰由代码在个体/集体各3句文案中轮换：5秒收集；不超过5名不同观众时逐人原生@，更多时发集体文案；全局15秒，每批完成后同类冷却15秒。已开始批次不被后来事件改变，仍保留过期、审核与本场授权。".into(),
-        Row::ThankFollows => "关注由代码在个体/集体各3句文案中轮换：5秒收集；不超过5名不同观众时逐人原生@，更多时发集体文案；全局15秒，每批完成后同类冷却30秒。已开始批次不被后来事件改变，仍保留过期、审核与本场授权。".into(),
-        Row::ThankLikes => "点赞由代码在个体/集体各3句文案中轮换：5秒收集；不超过5名不同观众时逐人原生@，更多时发集体文案；全局15秒，每批完成后同类冷却60秒。已开始批次不被后来事件改变，仍保留过期、审核与本场授权。".into(),
-        Row::ThankShares => "分享由代码在个体/集体各3句文案中轮换：5秒收集；不超过5名不同观众时逐人原生@，更多时发集体文案；全局15秒，每批完成后同类冷却60秒。已开始批次不被后来事件改变，仍保留过期、审核与本场授权。".into(),
-        Row::MentionSender => "只控制普通问答是否原生@提问者；互动感谢按人数规则独立决定是否逐人@，不受此开关影响。".into(),
         Row::Edit(Field::External(field)) => field.description().into(),
         Row::Preset(preset) => {
             use std::fmt::Write;
@@ -2073,35 +1789,20 @@ fn selected_details(app: &TerminalApp, panel: &Panel) -> String {
             app.assistant_accounts.label(&app.account_status),
             app.session.room_id
         ),
-        Row::Edit(Field::Workspace) => format!(
-            "资料状态：{}\n{}\n{}",
-            workspace_status(app),
-            app.runner
-                .workspace_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|e| e.to_string()),
-            app.runner.workspace_context_note()
-        ),
-        Row::UseProfile => app.profile_summary(),
-        Row::Host(host) => {
-            let found = panel.discovered.iter().find(|e| e.host == host);
-            format!(
-                "{}\nACP：{}\n原生 CLI：{}",
-                host.description(),
-                found
-                    .and_then(|e| e.program.as_ref())
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "未发现".into()),
-                found
-                    .and_then(|e| e.native.as_ref())
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "未发现".into())
-            )
+        Row::ApiProtocol => "三种明确连接协议，不探测、不回退。更换协议会设置官方基址并清空模型；重选当前协议保留自定义地址与模型。旧作用域 Key 不会发送到新服务，也不会自动删除。API 可能计费；ChatGPT 为官方 preview，共享订阅额度并受每应用限制。".into(),
+        Row::Edit(Field::ApiBaseUrl) => "包含版本路径的服务根，例如 https://api.openai.com/v1。仅 HTTPS 或 loopback IP HTTP；不得含认证、query 或 fragment。换地址后需为新作用域设置 Key；先暂停并撤销发送权。".into(),
+        Row::Edit(Field::ApiModel) | Row::ChatgptModel => format!(
+            "{}\n模型名必须明确选择，不自动回退。文件级 max_output_tokens={}，openai_token_limit={:?}；外部编辑 assistant.json 后重启读取。{}",
+            app.runner.settings.api.model, app.runner.settings.api.max_output_tokens,
+            app.runner.settings.api.openai_token_limit,
+            if app.runner.settings.api.protocol == ApiProtocol::ChatgptSubscription { "订阅忽略这两个输出字段，不发送到 Responses。" }
+            else { "OpenAI 只发所选 token 字段；Anthropic 固定 max_tokens。" }),
+        Row::ApiKey | Row::ClearApiKey => {
+            let error = match &app.runner.key_status { KeyStatus::Error(e) => format!("\n文件错误：{e}"), _ => String::new() };
+            format!("Key 是本机私有权限保护的明文，不是系统保险箱。设置/更换只打开隐藏输入，不回填旧 Key；替换唯一 Key 记录。清除需明确确认，空输入不是清除。运行或已有发送权时禁止修改。{error}")
         }
-        Row::DefaultSource | Row::Edit(Field::Profile | Field::Prompt) => {
-            app.runner.settings.source.description()
-        }
-        Row::DynamicStrategy => "由 OBS 麦克风状态与两个开关决定；不接收或识别语音。".into(),
+        Row::ChatgptAccount | Row::ChatgptLogin | Row::ChatgptRelogin | Row::ChatgptSignOut | Row::ChatgptModels => "Continue with ChatGPT 在系统浏览器由本人授权。登录保存或显式切换账号后自动读取一次模型目录，成功后直接选择；同注册仍可用的已选模型保留。目录失败不清除登录，可手动重新读取，无需重登录，不自动重试、推理或发送；认证失效按错误提示处理。OAuth Token 在私有文件明文保存；退出不删除注册，远端撤销结果按实际回报。官方 preview 共享订阅额度、每应用限制，可在 https://chatgpt.com/settings/usage 查看；不读取 ChatGPT 旧聊天、不自动转 API 计费。".into(),
+        Row::WebSearch => "只把被选中的本批完整公开问题正文发送到 Exa；不发送私有资料或历史扩写查询。每轮最多一次搜索、最多3条来源；可能限流或不可用，不承诺永久免费。不可用时候选强制待审；模型 API 本身可能收费。".into(),
         Row::RepairHistory => format!(
             "先备份派生历史副本，再从私有原件重建；原件不变。{}",
             app.runner
@@ -2109,92 +1810,15 @@ fn selected_details(app: &TerminalApp, panel: &Panel) -> String {
                 .map(|v| format!("\n上次结果：{v}"))
                 .unwrap_or_default()
         ),
-        Row::Visible => "新建上下文并处理当前可见弹幕；可能消耗模型额度，不开启自动发送。".into(),
-        Row::Context => "丢弃旧上下文，从后续弹幕重建；不开启自动发送。".into(),
-        Row::Stop => "结束专用进程，清除续用意图和自动发送权；候选与人工草稿保留。".into(),
-        Row::Option(index) => {
-            if let Some(o) = app
-                .runner
-                .report
-                .options
-                .config
-                .as_ref()
-                .and_then(|v| v.get(index))
-            {
-                format!(
-                    "原生选项 {}（{}）。当前值：{}。未知或受宿主策略禁止的值保持只读；修改后等待原生 ACK。",
-                    o.name,
-                    o.id,
-                    crate::runner::acp::value_label(&o.current)
-                )
-            } else {
-                "由 AI 工具原生报告的运行模式；修改后等待原生 ACK，未报告时保持继承。".into()
-            }
-        }
+        Row::Visible => "显式处理当前可见且尚未消费的消息；可能消耗模型额度，不开启自动发送、不重放旧批。".into(),
+        Row::Stop => "停止本机模型 worker，清除续用意图和自动发送权；候选与人工草稿保留。不声称远端推理或收费已停止。".into(),
         _ => {
             let (name, value) = row_columns(row, app, panel);
             format!("{name}：{value}")
         }
     }
 }
-fn diagnostics_details(app: &TerminalApp) -> String {
-    let room = app
-        .runner
-        .room_context()
-        .map(|r| {
-            format!(
-                "房间 {} · 主播 {} · 标题 {}",
-                r.room_id,
-                r.broadcaster_id,
-                if r.title.is_empty() {
-                    "未获取"
-                } else {
-                    &r.title
-                }
-            )
-        })
-        .unwrap_or_else(|| "房间资料未建立".into());
-    let routing_status = app.bridge.routing_snapshot();
-    let routing = &routing_status["queue"];
-    format!(
-        "B站连接：{}\n主账号：{}\nOBS：{}\n配置：{}\n会话日志：{}\n\nAI状态：{} {}\n当前原因：{}\n上轮结果：{}\n场次上下文：{}\n原生会话：{}\n{}\n工作区：{}\n历史重建：{}\n\n消息分流：模型待处理 {} / 128 · 致谢组 {}\n已交模型 {} · 代码致谢 {} · 合并 {}\n去重 {} · 过期 {} · 容量淘汰 {} · 跳过 {}\n点赞 {} · 分享 {}；分流明细见本场日志",
-        app.connection,
-        account_label(&app.account_status),
-        app.obs_status
-            .as_ref()
-            .map(|s| format!(
-                "场景 {} · 推流 {:?} · 麦克风 {:?}",
-                s.current_scene, s.stream, s.microphone
-            ))
-            .unwrap_or_else(|| app.obs_error.clone().unwrap_or_else(|| "未连接".into())),
-        app.config.config_path.display(),
-        app.journal.root().display(),
-        app.runner.marker(),
-        app.runner.state(),
-        app.runner.note,
-        app.runner.last_round_summary,
-        app.runner.scene_id(),
-        app.runner.native_id(),
-        room,
-        app.runner
-            .workspace_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|e| e.to_string()),
-        app.runner.history_repair_result().unwrap_or("尚未运行"),
-        routing["pending_models"].as_u64().unwrap_or(0),
-        routing["pending_templates"].as_u64().unwrap_or(0),
-        routing["model_dispatched"].as_u64().unwrap_or(0),
-        routing["template_dispatched"].as_u64().unwrap_or(0),
-        routing["merged"].as_u64().unwrap_or(0),
-        routing["deduplicated"].as_u64().unwrap_or(0),
-        routing["expired"].as_u64().unwrap_or(0),
-        routing["overflow"].as_u64().unwrap_or(0),
-        routing["skipped"].as_u64().unwrap_or(0),
-        routing["likes"].as_u64().unwrap_or(0),
-        routing["shares"].as_u64().unwrap_or(0)
-    )
-}
-fn details(app: &TerminalApp, panel: &Panel) -> String {
+fn details(app: &RuntimeState, panel: &Panel) -> String {
     if let Some(e) = &panel.error {
         return format!("{e}\n\n{}", selected_details(app, panel));
     }
@@ -2222,14 +1846,12 @@ fn details(app: &TerminalApp, panel: &Panel) -> String {
         );
     }
     if let Some(c) = &panel.choices {
-        return if c.id.as_deref() == Some("__sending__") {
-            format!(
-                "发送账号：{} · 房间 {}。选择自动发送会公开发送并记住本房间与账号；选择逐条立即撤权。",
-                app.assistant_accounts.label(&app.account_status),
-                app.session.room_id
-            )
-        } else {
-            "选中后提交给 AI 工具；收到原生 ACK 前显示当前值。未知选项保持只读。".into()
+        return match c.kind {
+            ChoiceKind::Sending => format!("发送账号：{} · 房间 {}。自动发送会公开发送并记住本房间与账号；逐条立即撤权。", app.assistant_accounts.label(&app.account_status), app.session.room_id),
+            ChoiceKind::ApiProtocol => "更换协议设置官方基址并清空模型；重选当前项不重置。旧 Key 不删除、不跨作用域发送；不自动推理或授权发送。".into(),
+            ChoiceKind::ClearApiKey => "确认清除唯一私有 API Key 记录；不删除目录或 ChatGPT 账号。选择保留不会写入。".into(),
+            ChoiceKind::ChatgptAccount => "切换账号会清空旧账号模型并自动读取所选账号目录；成功后直接选择模型。已退出或缺订阅权限的账号不能推理。".into(),
+            ChoiceKind::ChatgptModel => "选择当前账号目录中的模型；仍可用的已选模型保留。保存不启动推理、不授予发送权。".into(),
         };
     }
     if panel.page == Page::About {
@@ -2245,7 +1867,7 @@ fn details(app: &TerminalApp, panel: &Panel) -> String {
         selected_details(app, panel)
     }
 }
-fn row_danger(row: Row, app: &TerminalApp) -> bool {
+fn row_danger(row: Row, app: &RuntimeState) -> bool {
     if let Row::Command(raw) = row {
         return COMMAND_SPECS
             .iter()
@@ -2256,7 +1878,8 @@ fn row_danger(row: Row, app: &TerminalApp) -> bool {
     matches!(
         row,
         Row::Visible
-            | Row::Context
+            | Row::ClearApiKey
+            | Row::ChatgptSignOut
             | Row::Stop
             | Row::RepairHistory
             | Row::Logout
@@ -2267,10 +1890,11 @@ fn row_danger(row: Row, app: &TerminalApp) -> bool {
     ) || matches!(row, Row::Permission) && app.bridge.sending_enabled()
 }
 
-pub(super) fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
+pub(crate) fn draw(frame: &mut ratatui::Frame, app: &mut RuntimeState) {
     let Some(mut panel) = app.assistant_panel.take() else {
         return;
     };
+    panel.menu_hit = None;
     if panel.page == Page::Candidates {
         app.assistant_panel = Some(panel);
         draw_candidates(frame, app);
@@ -2362,7 +1986,6 @@ pub(super) fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
             let rect = Rect::new(areas[0].x + column * 7, areas[0].y + row, 6, 1);
             frame.render_widget(
                 Paragraph::new(match page {
-                    Page::Reading => "外观",
                     Page::Account => "B站",
                     Page::Obs => "OBS",
                     Page::AiSettings => "AI",
@@ -2385,16 +2008,21 @@ pub(super) fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
                 .iter()
                 .enumerate()
                 .map(|(i, v)| {
-                    let current = if c.id.as_deref() == Some("__sending__") {
-                        i == usize::from(app.runner.settings.automatic)
-                    } else {
-                        choice_is_current(app, c.id.as_deref(), &v.value)
+                    let current = match c.kind {
+                        ChoiceKind::Sending => i == usize::from(app.runner.settings.automatic),
+                        ChoiceKind::ApiProtocol => {
+                            API_PROTOCOLS.get(i) == Some(&app.runner.settings.api.protocol)
+                        }
+                        ChoiceKind::ClearApiKey => i == 0,
+                        ChoiceKind::ChatgptAccount => panel.accounts.get(i).is_some_and(|a| {
+                            Some(&a.id) == app.runner.settings.api.chatgpt_account.as_ref()
+                        }),
+                        ChoiceKind::ChatgptModel => panel
+                            .models
+                            .get(i)
+                            .is_some_and(|m| m.slug == app.runner.settings.api.model),
                     };
-                    ListItem::new(format!(
-                        "{}{}",
-                        if current { "[当前] " } else { "" },
-                        v.name
-                    ))
+                    ListItem::new(format!("{}{}", if current { "[当前] " } else { "" }, v))
                 })
                 .collect(),
             c.selected,
@@ -2445,6 +2073,10 @@ pub(super) fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
     );
     panel.list_offset = state.offset();
     panel.menu_height = usize::from(areas[1].height);
+    if panel.editor.is_none() && panel.choices.is_none() && panel.pending_save.is_none() {
+        panel.menu_hit = Some((panel.page, areas[1], state.offset()));
+        panel.menu_rows = menu_rows;
+    }
     let detail = if panel.expanded {
         details(app, &panel)
     } else if let Some(error) = &panel.error {
@@ -2452,7 +2084,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
     } else if panel
         .choices
         .as_ref()
-        .is_some_and(|choices| choices.id.as_deref() == Some("__sending__"))
+        .is_some_and(|choices| matches!(choices.kind, ChoiceKind::Sending))
         || panel.page == Page::Home
     {
         "公开发送 · 同房间同账号记住".into()
@@ -2503,7 +2135,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
     app.assistant_panel = Some(panel)
 }
 
-fn draw_candidates(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
+fn draw_candidates(frame: &mut ratatui::Frame, app: &mut RuntimeState) {
     let screen = frame.area();
     let width = screen.width.min(92);
     let height = screen.height.min(28);
@@ -2587,7 +2219,7 @@ mod tests {
     use super::*;
     #[test]
     fn direct_sections_close_without_synthetic_parents() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         app.open_ai_section("model").unwrap();
         let p = app.assistant_panel.as_ref().unwrap();
@@ -2596,9 +2228,9 @@ mod tests {
     }
     #[tokio::test]
     async fn settings_categories_and_details_are_keyboard_reachable() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
-        app.open_settings_section("reading").unwrap();
+        app.open_settings_section("account").unwrap();
         let (tx, _) = mpsc::channel(1);
 
         assert!(
@@ -2606,7 +2238,7 @@ mod tests {
                 .await
         );
         let panel = app.assistant_panel.as_ref().unwrap();
-        assert_eq!(panel.page, Page::Account);
+        assert_eq!(panel.page, Page::Obs);
         assert!(panel.history.is_empty());
 
         assert!(
@@ -2626,7 +2258,7 @@ mod tests {
     }
     #[tokio::test]
     async fn topic_editor_f2_restores_the_live_title_source() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         app.runner.set_topic_override("临时主题".into()).unwrap();
         app.open_ai_topic().unwrap();
@@ -2644,35 +2276,13 @@ mod tests {
         );
     }
     #[test]
-    fn folds_stay_on_the_same_page_and_only_one_advanced_group_opens() {
-        let root = tempfile::tempdir().unwrap();
-        let mut app = replay::app(root.path(), DanmuSession::new("local"));
-        let mut p = Panel::new();
-        p.page = Page::Assistant;
-        app.apply_assistant_row(Row::ToggleThanks, &mut p).unwrap();
-        assert!(p.thanks_expanded);
-        assert!(p.rows(&app).iter().any(|r| matches!(r, Row::ThankGifts)));
-        assert!(p.rows(&app).iter().any(|r| matches!(r, Row::ThankShares)));
-        p.page = Page::Advanced;
-        app.apply_assistant_row(Row::AdvancedGroup(0), &mut p)
-            .unwrap();
-        app.apply_assistant_row(Row::AdvancedGroup(1), &mut p)
-            .unwrap();
-        assert_eq!(p.advanced_group, Some(1));
-        assert!(
-            !p.rows(&app)
-                .iter()
-                .any(|r| matches!(r, Row::Edit(Field::Profile)))
-        );
-    }
-    #[test]
     fn preset_applies_once_without_preview_and_preserves_identity_fields() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         let mut s = app.runner.settings.clone();
         s.name = "保留名字".into();
         s.automatic = true;
-        app.runner.save(s, &app.bridge, false).unwrap();
+        app.runner.save(s, &app.bridge).unwrap();
         let mut p = Panel::new();
         p.page = Page::Presets;
         p.history.push(HistoryEntry {
@@ -2681,8 +2291,6 @@ mod tests {
             scroll: 0,
             list_offset: 0,
             expanded: false,
-            thanks_expanded: false,
-            advanced_group: None,
         });
         app.apply_assistant_row(Row::Preset(ReplyPreset::TextQa), &mut p)
             .unwrap();
@@ -2692,28 +2300,27 @@ mod tests {
     }
     #[test]
     fn sending_mode_is_an_explicit_choice() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         let mut p = Panel::new();
         app.apply_assistant_row(Row::Permission, &mut p).unwrap();
         let c = p.choices.as_ref().unwrap();
         assert_eq!(c.values.len(), 2);
-        assert_eq!(c.values[0].name, "逐条发送");
-        assert_eq!(c.values[1].name, "自动发送");
+        assert!(matches!(c.kind, ChoiceKind::Sending));
+        assert!(!app.bridge.sending_enabled());
+        assert!(!app.runner.running);
     }
     #[tokio::test]
     async fn failed_editor_save_keeps_the_exact_input() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
-        app.open_settings_section("reading").unwrap();
+        app.open_ai_section("materials").unwrap();
         let mut panel = app.assistant_panel.take().unwrap();
-        app.apply_assistant_row(Row::Edit(Field::HistorySeconds), &mut panel)
+        app.apply_assistant_row(Row::Edit(Field::Name), &mut panel)
             .unwrap();
         panel.editor.as_mut().unwrap().1.clear();
         panel.editor.as_mut().unwrap().1.insert_text("137");
-        let blocked = root.path().join("blocked");
-        std::fs::create_dir(&blocked).unwrap();
-        app.config.config_path = blocked;
+        std::fs::create_dir(root.path().join("assistant.json")).unwrap();
         app.assistant_panel = Some(panel);
         let (tx, _) = mpsc::channel(1);
         assert!(
@@ -2726,45 +2333,484 @@ mod tests {
     }
     #[test]
     fn child_back_restores_parent_selection_and_direct_back_closes() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         app.open_settings().unwrap();
         let mut p = app.assistant_panel.take().unwrap();
-        p.row = 4;
+        p.row = 3;
+        app.apply_assistant_row(Row::Page(Page::AiSettings), &mut p)
+            .unwrap();
         app.apply_assistant_row(Row::Page(Page::Materials), &mut p)
             .unwrap();
         assert_eq!(p.page, Page::Materials);
         assert!(!p.back());
+        assert_eq!(p.page, Page::AiSettings);
+        assert!(!p.back());
         assert_eq!(p.page, Page::Settings);
-        assert_eq!(p.row, 4);
+        assert_eq!(p.row, 3);
         app.assistant_panel = Some(p);
         app.open_ai_section("materials").unwrap();
         assert!(app.assistant_panel.as_mut().unwrap().back());
     }
     #[test]
-    fn reselecting_current_agent_keeps_custom_binary_and_source() {
-        let root = tempfile::tempdir().unwrap();
+    fn reselecting_current_protocol_preserves_custom_connection() {
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
-        let mut s = app.runner.settings.clone();
-        let binary = root.path().join("custom/omp");
-        s.binary = binary.clone();
-        s.source = Source::OmpProfile("live".into());
-        app.runner.save(s, &app.bridge, false).unwrap();
-        let mut p = Panel::new();
-        p.discovered = Host::ALL.into_iter().map(Host::discovery).collect();
-        app.apply_assistant_row(Row::Host(Host::Omp), &mut p)
+        let mut settings = app.runner.settings.clone();
+        settings.api.base_url = "https://example.com/custom/v1".into();
+        settings.api.model = "custom-model".into();
+        app.runner.save(settings, &app.bridge).unwrap();
+        let before = app.runner.settings.api.clone();
+        let mut panel = Panel::new();
+        app.apply_assistant_row(Row::ApiProtocol, &mut panel)
             .unwrap();
-        assert_eq!(app.runner.settings.binary, binary);
-        assert!(matches!(&app.runner.settings.source,Source::OmpProfile(v) if v=="live"));
+        app.select_assistant_choice(&mut panel, 0).unwrap();
+        assert_eq!(app.runner.settings.api, before);
+        app.apply_assistant_row(Row::ApiProtocol, &mut panel)
+            .unwrap();
+        app.select_assistant_choice(&mut panel, 1).unwrap();
+        assert_eq!(
+            app.runner.settings.api.protocol,
+            ApiProtocol::AnthropicMessages
+        );
+        assert_eq!(
+            app.runner.settings.api.base_url,
+            ApiProtocol::AnthropicMessages.default_base_url()
+        );
+        assert!(app.runner.settings.api.model.is_empty());
+        assert!(!app.runner.running);
+        assert!(!app.bridge.sending_enabled());
+    }
+    #[test]
+    fn connection_rows_reject_running_permission_and_pending_resume_without_writes() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let mut app = replay::app(root.path(), DanmuSession::new("local"));
+        app.runner
+            .save(app.runner.settings.clone(), &app.bridge)
+            .unwrap();
+        let before = std::fs::read(root.path().join("assistant.json")).unwrap();
+        let rows = [
+            Row::ApiProtocol,
+            Row::ApiKey,
+            Row::ClearApiKey,
+            Row::WebSearch,
+            Row::Edit(Field::ApiBaseUrl),
+            Row::Edit(Field::ApiModel),
+            Row::ChatgptLogin,
+        ];
+        for state in 0..3 {
+            app.runner.running = state == 0;
+            app.resume_pending = state == 1;
+            app.bridge.permission(state == 2).unwrap();
+            for row in rows {
+                let mut panel = Panel::new();
+                assert!(app.apply_assistant_row(row, &mut panel).is_err());
+                assert!(panel.editor.is_none() && panel.choices.is_none());
+                assert!(app.secret_target.is_none());
+            }
+            assert_eq!(
+                std::fs::read(root.path().join("assistant.json")).unwrap(),
+                before
+            );
+            assert!(!app.runner.settings.web_search);
+        }
+        app.runner.running = false;
+        app.resume_pending = false;
+        app.bridge.permission(false).unwrap();
+        let mut panel = Panel::new();
+        app.apply_assistant_row(Row::WebSearch, &mut panel).unwrap();
+        assert!(app.runner.settings.web_search);
+    }
+    #[tokio::test]
+    async fn subscription_setup_automatically_reads_catalog_and_requires_model_choice() {
+        use crate::runner::{
+            responses, subscription,
+            test_support::{HttpServer, Response, Scenario},
+        };
+        use serde_json::json;
+        const TEST: &str = "terminal::assistant::tests::subscription_setup_automatically_reads_catalog_and_requires_model_choice";
+        const PHASE: &str = "DANMU_TEST_SUBSCRIPTION_SETUP";
+        match std::env::var(PHASE) {
+            Err(std::env::VarError::NotPresent) => {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(PHASE, "loopback")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+            Ok(phase) => assert_eq!(phase, "loopback"),
+            Err(error) => panic!("invalid fixture phase: {error}"),
+        }
+        const SCOPE: &str =
+            "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
+        fn catalog() -> Response {
+            Response::json(json!({"models":[
+                {"visibility":"list", "slug":"first", "display_name":"First"},
+                {"visibility":"list", "slug":"second", "display_name":"Second"}
+            ]}))
+        }
+        async fn finish_models(app: &mut RuntimeState, rx: &mut mpsc::Receiver<CoreEvent>) {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(event, CoreEvent::ChatgptModels { .. }));
+            app.handle_ui_event(event);
+        }
+        async fn login(app: &mut RuntimeState, oauth: &HttpServer, selected: Option<&str>) {
+            let login = app
+                .runner
+                .begin_chatgpt_login(&app.bridge, selected)
+                .unwrap();
+            let token = uuid::Uuid::new_v4();
+            app.chatgpt_operation = Some(ChatgptOperation {
+                token,
+                account_id: app.runner.settings.api.chatgpt_account.clone(),
+                scene_id: app.bridge.session_id(),
+                account_generation: app.assistant_accounts.generation(),
+                task: tokio::spawn(std::future::pending()),
+            });
+            let pending = subscription::fixture_finish_login(
+                login,
+                oauth,
+                "oaiapp_fixture",
+                "fixture-subject",
+                SCOPE,
+            )
+            .await;
+            app.handle_ui_event(CoreEvent::ChatgptLogin {
+                token,
+                result: Ok(pending),
+            });
+        }
+        let oauth = HttpServer::spawn(vec![]).await;
+        let api = HttpServer::spawn(vec![]).await;
+        subscription::install_test_oauth_origin(&oauth.url("/")).unwrap();
+        responses::install_test_api_origin(&api.url("/")).unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
+        let mut app = replay::app(root.path(), DanmuSession::new("local"));
+        let (tx, mut rx) = mpsc::channel(8);
+        app.ui_tx = Some(tx.clone());
+        app.open_ai_section("model").unwrap();
+        app.input = "人工甲🙂乙".into();
+        app.input.move_left();
+        let cursor = app.input.cursor();
+
+        // First authorization queues exactly one catalog request, never inference.
+        api.push(Scenario::new(catalog()));
+        login(&mut app, &oauth, None).await;
+        assert!(app.runner.connection_busy());
+        assert!(app.runner.settings.api.model.is_empty());
+        finish_models(&mut app, &mut rx).await;
+        let panel = app.assistant_panel.as_ref().unwrap();
+        assert_eq!(panel.page, Page::Models);
+        let choices = panel.choices.as_ref().unwrap();
+        assert!(matches!(choices.kind, ChoiceKind::ChatgptModel));
+        assert_eq!(choices.values, ["First · first", "Second · second"]);
+        assert_eq!(choices.selected, 0);
+        assert!(
+            app.runner.settings.api.model.is_empty(),
+            "highlight is not selection"
+        );
+        let mut panel = app.assistant_panel.take().unwrap();
+        app.select_assistant_choice(&mut panel, 1).unwrap();
+        app.assistant_panel = Some(panel);
+        let account = app.runner.settings.api.chatgpt_account.clone().unwrap();
+        assert_eq!(app.runner.settings.api.model, "second");
+        assert_eq!(api.requests().len(), 1);
+
+        // Reauthorizing the same registration preserves an available chosen model.
+        api.push(Scenario::new(catalog()));
+        login(&mut app, &oauth, Some(&account)).await;
+        assert_eq!(app.runner.settings.api.model, "second");
+        assert!(app.assistant_panel.as_ref().unwrap().models.is_empty());
+        assert!(app.assistant_panel.as_ref().unwrap().choices.is_none());
+        finish_models(&mut app, &mut rx).await;
+        assert_eq!(app.runner.settings.api.model, "second");
+        assert_eq!(
+            app.assistant_panel
+                .as_ref()
+                .unwrap()
+                .choices
+                .as_ref()
+                .unwrap()
+                .selected,
+            1
+        );
+        assert_eq!(api.requests().len(), 2);
+
+        // A no-longer-visible model clears only after successful catalog admission.
+        api.push(Scenario::new(Response::json(
+            json!({"models":[{"visibility":"list", "slug":"first", "display_name":"First"}]}),
+        )));
+        app.begin_chatgpt_models().unwrap();
+        finish_models(&mut app, &mut rx).await;
+        assert!(app.runner.settings.api.model.is_empty());
+        let mut panel = app.assistant_panel.take().unwrap();
+        app.select_assistant_choice(&mut panel, 0).unwrap();
+        app.assistant_panel = Some(panel);
+
+        // A directory failure retains login/selection and allows manual reread.
+        api.push(Scenario::new(
+            Response::json(json!({"error":{"code":"rate_limit_exceeded"}})).status(429),
+        ));
+        login(&mut app, &oauth, Some(&account)).await;
+        finish_models(&mut app, &mut rx).await;
+        assert_eq!(app.runner.settings.api.model, "first");
+        assert!(
+            app.runner
+                .chatgpt_accounts()
+                .unwrap()
+                .iter()
+                .any(|a| a.id == account && a.signed_in)
+        );
+        assert!(app.chatgpt_operation.is_none() && !app.runner.connection_busy());
+        assert_eq!(api.requests().len(), 4);
+        api.push(Scenario::new(catalog()));
+        app.begin_chatgpt_models().unwrap();
+        finish_models(&mut app, &mut rx).await;
+        assert_eq!(app.runner.settings.api.model, "first");
+
+        // Explicitly switching registrations automatically reads that account once.
+        let pending = subscription::fixture_pending_login(
+            &root.path().join("assistant.json"),
+            &oauth,
+            None,
+            "oaiapp_other",
+            "other-subject",
+            SCOPE,
+        )
+        .await;
+        let other =
+            subscription::complete_login(&root.path().join("assistant.json"), pending).unwrap();
+        let mut panel = app.assistant_panel.take().unwrap();
+        app.refresh_model_panel(&mut panel);
+        app.apply_assistant_row(Row::ChatgptAccount, &mut panel)
+            .unwrap();
+        let index = panel
+            .accounts
+            .iter()
+            .position(|a| a.id == other.id)
+            .unwrap();
+        api.push(Scenario::new(catalog()));
+        app.select_assistant_choice(&mut panel, index).unwrap();
+        app.assistant_panel = Some(panel);
+        assert!(app.runner.settings.api.model.is_empty());
+        finish_models(&mut app, &mut rx).await;
+        assert_eq!(api.requests().len(), 6);
+        assert_eq!(
+            app.runner.settings.api.chatgpt_account.as_deref(),
+            Some(other.id.as_str())
+        );
+        assert!(app.assistant_panel.as_ref().unwrap().choices.is_some());
+
+        // Cancelled, scene-changed and newly authorized requests cannot apply late catalogs.
+        for change in ["cancel", "scene", "permission", "resume", "account"] {
+            let (scenario, received, release) = Scenario::new(Response::json(json!({"models":[
+                {"visibility":"list", "slug":"late", "display_name":"Late"}
+            ]})))
+            .barrier();
+            api.push(scenario);
+            app.begin_chatgpt_models().unwrap();
+            let token = app.chatgpt_operation.as_ref().unwrap().token;
+            tokio::time::timeout(Duration::from_secs(5), received)
+                .await
+                .unwrap()
+                .unwrap();
+            match change {
+                "cancel" => app.cancel_chatgpt_operation(),
+                "scene" => app.bridge.new_session(),
+                "permission" => app.bridge.permission(true).unwrap(),
+                "resume" => app.resume_pending = true,
+                "account" => app.runner.settings.api.chatgpt_account = Some(account.clone()),
+                _ => unreachable!(),
+            }
+            release.send(()).unwrap();
+            if change == "cancel" {
+                app.handle_ui_event(CoreEvent::ChatgptModels {
+                    token,
+                    result: Ok(vec![ModelChoice {
+                        slug: "late".into(),
+                        display_name: "Late".into(),
+                    }]),
+                });
+            } else {
+                finish_models(&mut app, &mut rx).await;
+            }
+            assert!(app.runner.settings.api.model.is_empty());
+            assert!(
+                !app.assistant_panel
+                    .as_ref()
+                    .unwrap()
+                    .models
+                    .iter()
+                    .any(|m| m.slug == "late")
+            );
+            assert!(app.chatgpt_operation.is_none() && !app.runner.connection_busy());
+            app.bridge.permission(false).unwrap();
+            app.resume_pending = false;
+            app.runner.settings.api.chatgpt_account = Some(other.id.clone());
+        }
+        assert_eq!(api.requests().len(), 11);
+        assert!(api.requests().iter().all(|r| r.method == "GET"
+            && r.path == "/v1/models"
+            && r.header("authorization").is_some()));
+        assert!(!app.runner.running && !app.bridge.sending_enabled());
+        assert_eq!(app.bridge.candidate_count(), 0);
+        assert_eq!(app.input, "人工甲🙂乙");
+        assert_eq!(app.input.cursor(), cursor);
+        assert!(rx.try_recv().is_err());
+        app.runner.shutdown(&app.bridge).await;
+        api.shutdown().await;
+        oauth.shutdown().await;
+    }
+    #[tokio::test]
+    async fn model_key_menu_owns_hidden_input_and_cancel_restores_unicode_cursor() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let mut app = replay::app(root.path(), DanmuSession::new("local"));
+        app.input = "甲🙂乙".into();
+        app.input.set_cursor(1);
+        app.open_ai_section("model").unwrap();
+        let index = app
+            .assistant_panel
+            .as_ref()
+            .unwrap()
+            .rows(&app)
+            .iter()
+            .position(|row| matches!(row, Row::ApiKey))
+            .unwrap();
+        app.assistant_panel.as_mut().unwrap().row = index;
+        let (tx, _) = mpsc::channel(1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            app.secret_target,
+            Some(SecretTarget::AssistantApiKey)
+        ));
+        app.handle_paste("fake-secret-menu-only");
+        assert!(app.assistant_panel.as_ref().unwrap().editor.is_none());
+        assert!(
+            !details(&app, app.assistant_panel.as_ref().unwrap()).contains("fake-secret-menu-only")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx)
+            .await
+            .unwrap();
+        assert!(app.secret_target.is_none());
+        assert_eq!(app.input, "甲🙂乙");
+        assert_eq!(app.input.cursor(), 1);
+        assert!(!root.path().join("assistant-secrets/api-key.json").exists());
+        assert!(!app.runner.running && !app.bridge.sending_enabled());
+    }
+    #[test]
+    fn mouse_click_uses_rendered_list_and_does_not_activate_stale_or_hidden_rows() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let mut app = replay::app(root.path(), DanmuSession::new("local"));
+        app.open_settings_section("ai").unwrap();
+        let backend = ratatui::backend::TestBackend::new(90, 28);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let panel = app.assistant_panel.as_ref().unwrap();
+        let (_, area, offset) = panel.menu_hit.unwrap();
+        let index = panel
+            .rows(&app)
+            .iter()
+            .position(|row| matches!(row, Row::Page(Page::Models)))
+            .unwrap();
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: area.x,
+            row: area.y + u16::try_from(index - offset).unwrap(),
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.assistant_click(event));
+        assert_eq!(app.assistant_panel.as_ref().unwrap().row, index);
+        assert_eq!(app.assistant_panel.as_ref().unwrap().page, Page::AiSettings);
+        let mut panel = app.assistant_panel.take().unwrap();
+        app.apply_assistant_row(Row::Page(Page::Models), &mut panel)
+            .unwrap();
+        app.assistant_panel = Some(panel);
+        assert!(!app.assistant_click(event));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.secret_target = Some(SecretTarget::AssistantApiKey);
+        assert!(!app.assistant_click(event));
+        assert!(!app.runner.running && !app.bridge.sending_enabled());
+        assert!(!root.path().join("assistant.json").exists());
+    }
+    #[test]
+    fn mouse_choice_navigation_never_commits_connection() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let mut app = replay::app(root.path(), DanmuSession::new("local"));
+        app.open_ai_section("model").unwrap();
+        let mut panel = app.assistant_panel.take().unwrap();
+        app.apply_assistant_row(Row::ApiProtocol, &mut panel)
+            .unwrap();
+        let before = app.runner.settings.api.clone();
+        app.assistant_panel = Some(panel);
+        assert!(app.assistant_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(
+            app.assistant_panel
+                .as_ref()
+                .unwrap()
+                .choices
+                .as_ref()
+                .unwrap()
+                .selected,
+            1
+        );
+        assert_eq!(app.runner.settings.api, before);
+        assert!(!root.path().join("assistant.json").exists());
+    }
+    #[tokio::test]
+    async fn invalid_api_editor_preserves_unicode_draft_and_unsaved_value() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let mut app = replay::app(root.path(), DanmuSession::new("local"));
+        app.input = "甲🙂乙".into();
+        app.input.set_cursor(1);
+        app.open_ai_section("model").unwrap();
+        let mut panel = app.assistant_panel.take().unwrap();
+        app.apply_assistant_row(Row::Edit(Field::ApiBaseUrl), &mut panel)
+            .unwrap();
+        panel.editor.as_mut().unwrap().1 = "https://user:private@example.com/v1".into();
+        let before = app.runner.settings.api.clone();
+        app.assistant_panel = Some(panel);
+        let (tx, _) = mpsc::channel(1);
+        app.assistant_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx)
+            .await;
+        let panel = app.assistant_panel.as_ref().unwrap();
+        assert_eq!(
+            panel.editor.as_ref().unwrap().1.to_string(),
+            "https://user:private@example.com/v1"
+        );
+        assert!(panel.error.is_some());
+        assert_eq!(app.runner.settings.api, before);
+        assert_eq!(app.input, "甲🙂乙");
+        assert_eq!(app.input.cursor(), 1);
+        assert!(!app.runner.running && !app.bridge.sending_enabled());
     }
     #[test]
     fn preset_running_gate_changes_nothing_and_keeps_permission() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         let mut s = app.runner.settings.clone();
         s.name = "保留".into();
         s.automatic = true;
-        app.runner.save(s, &app.bridge, false).unwrap();
+        app.runner.save(s, &app.bridge).unwrap();
         app.bridge.permission(true).unwrap();
         let before = std::fs::read(root.path().join("assistant.json")).unwrap();
         app.runner.running = true;
@@ -2781,29 +2827,12 @@ mod tests {
         assert!(app.bridge.sending_enabled());
     }
     #[test]
-    fn unsupported_native_option_never_opens_choices() {
-        let root = tempfile::tempdir().unwrap();
-        let mut app = replay::app(root.path(), DanmuSession::new("local"));
-        app.runner.report.options.config = Some(vec![crate::runner::acp::ConfigOption {
-            id: "future".into(),
-            name: "未知".into(),
-            category: None,
-            current: false.into(),
-            choices: vec![],
-            unsupported: true,
-        }]);
-        let mut p = Panel::new();
-        assert!(app.apply_assistant_row(Row::Option(0), &mut p).is_err());
-        assert!(p.choices.is_none());
-        assert!(app.runner.pending.is_none());
-    }
-    #[test]
     fn choosing_per_item_clears_stale_automatic_preference_without_permission() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         let mut settings = app.runner.settings.clone();
         settings.automatic = true;
-        app.runner.save(settings, &app.bridge, false).unwrap();
+        app.runner.save(settings, &app.bridge).unwrap();
         app.bridge.permission(false).unwrap();
         let mut panel = Panel::new();
         app.apply_assistant_row(Row::Permission, &mut panel)
@@ -2818,7 +2847,7 @@ mod tests {
     }
     #[tokio::test]
     async fn external_save_keeps_failed_input_and_manual_draft_until_real_ack() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         app.input = "甲🙂乙".into();
         app.input.move_left();
@@ -2880,7 +2909,7 @@ mod tests {
 
     #[tokio::test]
     async fn late_settings_ack_does_not_close_another_editor() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         let (tx, mut rx) = mpsc::channel(4);
         app.command("/obs config host example.invalid", tx.clone())
@@ -2889,7 +2918,11 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx.clone())
             .await
             .unwrap();
-        app.edit_workspace(None, tx).unwrap();
+        app.open_ai_section("materials").unwrap();
+        let mut panel = app.assistant_panel.take().unwrap();
+        app.apply_assistant_row(Row::Edit(Field::Name), &mut panel)
+            .unwrap();
+        app.assistant_panel = Some(panel);
         let before = app
             .assistant_panel
             .as_ref()
@@ -2917,7 +2950,7 @@ mod tests {
 
     #[tokio::test]
     async fn obs_menu_password_and_stop_overlays_own_keyboard_focus() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         app.input = "人工草稿".into();
         let (tx, _rx) = mpsc::channel(4);
@@ -2939,7 +2972,7 @@ mod tests {
             .await
             .unwrap();
             if command.ends_with("password") {
-                assert!(app.secret_mode);
+                assert_eq!(app.secret_target, Some(SecretTarget::ObsPassword));
                 app.handle_paste("secret-not-saved");
             } else {
                 assert!(matches!(
@@ -2952,7 +2985,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx.clone())
                 .await
                 .unwrap();
-            assert!(!app.secret_mode && app.stop_flow.is_none());
+            assert!(app.secret_target.is_none() && app.stop_flow.is_none());
             assert_eq!(app.assistant_panel.as_ref().unwrap().page, Page::Obs);
             assert_eq!(app.input, "人工草稿");
         }
@@ -2960,7 +2993,7 @@ mod tests {
     }
     #[tokio::test]
     async fn settings_archive_search_requires_a_keyword_and_cancel_preserves_the_draft() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         app.input = EditorInput::from("甲🙂乙");
         app.input.set_cursor(1);
@@ -3003,7 +3036,7 @@ mod tests {
 
     #[tokio::test]
     async fn settings_quit_exits_the_application() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let mut app = replay::app(root.path(), DanmuSession::new("local"));
         let (tx, _) = mpsc::channel(2);
         app.open_settings().unwrap();

@@ -35,6 +35,18 @@ DANMU 把 B 站历史弹幕、实时互动、重点问题、发送状态和有�
 
 这是基础功能实录，**不代表已经展示 v0.5.0 的 AI 助手流程**。点击画面观看完整 MP4。
 
+## 未发布：轻量 HTTP 助手与设置精简
+
+以下说明当前源码的未发布行为，不属于已发布的 v0.5.0 / v0.5.1，也不承诺下一版版本号。下文历史发布说明保留当时事实，不能当作当前内置助手的安装指南。
+
+- **四类设置**：`/settings` 保留 B站账号与直播间、OBS、AI助手、系统与关于。外观不再占设置类别；用 Tab 切换布局，或用 `/display theme`、`/display names`、`/display time`、`/display layout` 调整。历史空闲返回秒数仍可通过 TOML 的 `history_idle_seconds` 配置。
+- **AI 路径收拢**：AI助手下分模型、发送策略、人设与资料、维护。`/ai replies` 只保留方案、联网搜索、屏蔽词；`/ai materials` 保留名字与人设；`/ai advanced` 保留处理可见弹幕、结束。本场 `/ai range`、`/ai topic` 不变；`/ai workspace`、`/ai reset` 与重建模型上下文入口已移除。
+- **方案一次保存**：少主动回复、侧重回答问题、感谢礼物、关注和分享，分别保存一组十项偏好，不改账号、模型或自动发送许可，也不启动助手。感谢默认关闭；感谢方案包括礼物与上舰、关注、分享，不含点赞。选方案会关闭联网搜索，需要时再显式开启。
+- **固定安全策略与资料引用**：开麦让位和有限内容修复固定开启；让位不等于停止回答文字问题，修复不处理未知送达，也不重发。已有公开简介与 `PROJECT.md` 默认引用，仍受原有资料与权限边界约束；资料文本合计 8KiB 上限不变，技能仍须显式选中文件，未选技能不加载、不执行。
+- **内置链路切换**：直接使用 OpenAI 兼容 Chat Completions、Anthropic Messages 或 ChatGPT 订阅官方 preview；不再启动 ACP / coding CLI，不需要安装 Pi、Node 或适配器，`danmu setup pi` 已退役。外部 Agent 的 CLI/MCP 与配置生成器仍保留。
+- **配置迁移**：`assistant.json` 改为 format=4，`api` 替代旧宿主、程序路径、原生来源及参数。无版本/format2/3 只在内存严格迁移，加载不写盘；首次显式保存先逐字备份到 `assistant.pre-api.json`，备份冲突或失败不覆盖设置。业务资料与归档保留，但旧自动发送、启动续用、联网搜索均关闭，必须重新配置、启动并授权。原生规则不扫描、不复制，必要文本由本人放入既有 SYSTEM、人设、PROJECT 或 `preferences`。
+- **文件级项**：`workspace`、`skills`、`preferences` 与 `api.max_output_tokens`、`api.openai_token_limit` 从同目录配置启动读取，外部修改后重启。旧资料引用、开麦让位、有限修复 false 仍只在内存归一化为开启；不因加载覆盖原文件，自有工作区准备权限不变。
+
 ## v0.5.1 修复
 
 - 修复 Windows 启动时的 `Initial console modes not set`，并避开 Windows 后端不支持的键盘增强命令。
@@ -79,7 +91,7 @@ curl -fsSL https://raw.githubusercontent.com/rockythink/shisui-danmu/main/script
 | Linux aarch64 | `shisui-danmu-linux-aarch64.tar.gz` |
 | Windows x86_64 | `shisui-danmu-windows-x86_64.zip` |
 
-每个压缩包都有同名 `.sha256`。以上是**基础 TUI** 的构建范围；内置 ACP Runner 要求 Unix，部分宿主还有更窄的平台限制，不宣传 Windows 内置 AI 可用。
+每个压缩包都有同名 `.sha256`。以上是**已发布基础 TUI** 的构建范围；v0.5.1 的旧内置 ACP 有 Unix/宿主限制。当前未发布 HTTP 链路不依赖该进程机制，但不据此声称 Windows/Linux 新模型页、浏览器授权或真实服务已经验收。
 
 ```bash
 danmu --version
@@ -119,23 +131,22 @@ OBS 从 `danmu --configure-obs` 或 `/settings obs` 配置。`/obs start` 会真
 
 ## AI 与平台边界
 
-**程序开源免费，不等于外部模型免费。** 原生宿主的安装、登录、订阅、模型费用和搜索额度由用户及对应服务管理。
+本节面向**当前未发布源码**；最新正式 v0.5.1 仍是上面的历史实现。**程序开源免费，不等于模型或搜索免费。**
 
-1. 在 `/settings` → AI助手 → 模型选择已安装、已认证的宿主；连接/同步只读取模型与思考档位，不开始值班。
-2. `/ai start` 开始处理新消息；先用 `/review` 阅读候选，完整看过后 Shift+Enter 批准。编辑中的 Enter 只保存，不发送。
-3. 自动发送必须由本人明确授权。保存过的自动偏好，仅在同房间、同发送 UID 且启动恢复检查通过时续用；暂停、身份或房间变化、身份失效会撤权。批量批准当前候选不授权未来候选。
+1. `/settings` → AI助手 → 模型（或 `/ai model`）选择连接方式。API Key 连接明确填写包含版本路径的基址、模型名，再用“设置/更换 Key”或 `/ai key` 打开隐藏输入；命令不接受明文参数。Enter 只保存，Esc 恢复原人工草稿，旧 Key 不回填界面。清除 Key 另需选择“清除”。
+2. ChatGPT 订阅连接用“Continue with ChatGPT”由本人在系统浏览器授权；完成后自动读取账号目录并打开模型选择，首次只需明确选择一次模型。同注册重登录保留仍可用的模型，选已保存账号也自动读取目录；“读取账号模型”保留作刷新或失败后重读。不会自动选新模型、启动助手或授发送权。采用官方 OSS/local Sign in with ChatGPT，不复用 Codex/Pi/ACP OAuth，不需要安装 coding CLI，不读取 ChatGPT 旧聊天历史。官方 preview 当前面向符合资格的 Plus/Pro 用户；资格及模型以官方授权/目录为准。额度与 ChatGPT 共享并受每应用限制，见 [Usage](https://chatgpt.com/settings/usage)；不承诺永久支持或无限额度。
+3. 保存普通配置不推理、不授权；登录完成或选择账号会自动联网读取目录，手动刷新也会联网。`/ai start` 只准备本机 worker，等待新消息不产生模型请求，“就绪”不代表远端鉴权已验证。先用 `/review` 阅读候选，完整看过后 Shift+Enter 批准；编辑中的 Enter 只保存、不发送。
+4. 更换连接、Key、订阅账号或联网设置前先 `/pause`，等待在途请求与账号操作结束并撤销发送权/待续用。自动发送仍需本人明确授权；同房间、同发送 UID 且恢复检查通过才可续用，旧后端迁移不继承授权。批量批准当前候选不授权未来候选。
 
-Unix 用户接入官方 Node 版 Pi 前，先自行安装并认证 Pi，再执行：
+API Key 只有一个当前记录，位于 `assistant.json` 同目录 `assistant-secrets/api-key.json`，按协议与规范化基址匹配，同服务换模型可复用，换服务不发送旧 Key。订阅 Token 独立保存到 `assistant-secrets/chatgpt.json`，可保留多个隔离注册；订阅只访问官方 API 地址。两者都是本机权限保护的**明文**，不是钥匙串或加密保险箱：Unix 私有根 0700、文件 0600，拒绝不安全路径，不自动改宽权限；Windows 不承诺等价 ACL。不要同步、提交或交给外部 Agent。手工修改 Key 文件不会改变运行中的快照，须暂停后重新启动；取消本机 future 不代表远端推理或收费已停止。退出订阅区分本地 Token 已清除和远端撤销是否确认，亦可在 ChatGPT 设置管理授权。
 
-```bash
-danmu setup pi
-```
+联网默认关闭。开启后最多一次 Exa 搜索、三条来源：程序只发送冻结的本批完整公开 Danmu/SC 正文（非空、无控制字符、最多240个 Unicode 字符），不让模型自由写 query，不携带 UID、昵称、私有资料或历史扩写。搜索失败/限流/无结果为不可用，只补全一次且候选强制待审，不重试或切付费搜索。公共入口可用性/永久免费未承诺。
 
-这只准备应用私有的 `pi-acp@0.0.33`，需要 Node.js 20+ 与 npm；重复执行复用已准备适配器，不加载用户全局扩展，不替换不可用模型或思考档位。完整流程见 [Pi 接入示例](https://danmu.elazer.wang/guide/#pi接入示例)。
+每轮从本地组装完整选定资料、本场上下文、相关观众/场次历史及实际送达结果，不依赖供应商会话。Journal/SQLite 与工作区保留；历史索引导入场次与观众事件，**不承诺所有旧助手回复已进入历史检索**，原回复仍在 Journal。仅存在于原生宿主、未归档的聊天不自动迁移。
 
-当前适配列表为 OMP、Gemini、Claude Code、Codex、OpenCode、Pi、Amp、GitHub Copilot CLI、DeepSeek Harness。**适配实现或隔离验证不等于九种宿主、所有真实模型均已验收。** 具体版本与限制见[开发接入向导](https://github.com/rockythink/shisui-danmu/blob/main/docs/agent-onboarding.md#九宿主接入与认证边界)。
+内容错误整批拒绝、不重试，保留原候选及有效许可并继续新消息；HTTP/外层协议/连接/凭据或额度等真实故障暂停并撤权，处理后显式启动。额度错误提供安全摘要与 Usage 指引，保留订阅 Token，**不自动转为 API 付费、不换模型、不重试旧批**。平台目前只接 B 站；模型不能授权发送、操作电脑或自报送达。麦克风状态不是语音识别，合批不保证固定省费比例或模型永不误判。真实模型、官方账号/额度与真实联网效果未由这些源码说明验收。
 
-平台目前只接入 B 站。模型不能授权发送、操作电脑或自报送达；联网默认关闭，开启也仅准入搜索。麦克风状态不是语音内容识别。连续空轮合批不承诺固定省费比例、永不漏答或永不报错。
+订阅推理逐事件解析SSE：单事件（含字段、注释与换行）≤256KiB，整个解压流≤8MiB、最多4096个数据事件；只在完整终态及HTTP正常结束后准入，中间推理文本不进入候选。两种非流式API和HTTP错误仍限256KiB。底部普通提示3秒、警告/错误15秒后消退，操作进度保留到完成；清除文字不会恢复已暂停助手或发送权，错误仍可从`/diag`及归档查看。
 
 ## 文档
 
@@ -200,7 +211,7 @@ Runner 持有时 `status.driver=runner`。外部读/查保留，同一内置调�
 python3 script/agent_config.py --host HOST --binary /绝对路径/danmu --instance /绝对私有实例目录
 ```
 
-生成器只打印配置，不安装、不写宿主设置、不启动宿主。`HOST` 可选 `omp`、`claude`、`codex`、`opencode`、`gemini`、`cursor`、`vscode`、`amp`、`pi`；这是外部接入格式列表，不等同于内置 Runner 宿主列表。Amp 使用 `amp.mcpServers`；Pi 只输出明确标记的 CLI 示例，不安装 MCP 扩展。用户负责合并配置、信任服务器与限制宿主自身的其他能力。
+生成器只打印配置，不安装、不写宿主设置、不启动宿主。`HOST` 可选 `omp`、`claude`、`codex`、`opencode`、`gemini`、`cursor`、`vscode`、`amp`、`pi`；这是**外部 coding Agent** 的接入格式列表，不是当前内置 Runner 的后端列表。Amp 使用 `amp.mcpServers`；Pi 只输出明确标记的 CLI 示例，不安装 MCP 扩展。用户负责合并配置、信任服务器与限制宿主自身的其他能力。
 
 ### 无房间隔离示例
 
@@ -213,7 +224,7 @@ danmu --instance "$INSTANCE" local --assistant
 
 在这个隔离 TUI 内可输入 `/event 观众甲 怎样理解增量游标？`，用 `/local confirmed|uncertain|rejected` 选择本地传输结果，用 `/session end|new` 演练场次切换。这些是本地 TUI 命令，不是外部 CLI/MCP 控制口；外部五操作不能启动 Runner、注入事件或批准发送。
 
-工具/本地入口不能混用房间、登录、OBS、回放或生产配置参数。`setup pi` 独立执行，不接受 `--instance` 等 TUI 参数。退出只移除该实例端点并释放锁，保留记录；本地自动许可不保存为真实房间授权。
+工具/本地入口不能混用房间、登录、OBS、回放或生产配置参数。当前内置助手没有 `setup` 子命令。退出只移除该实例端点并释放锁，保留记录；本地自动许可不保存为真实房间授权。
 
 </details>
 
@@ -222,11 +233,13 @@ danmu --instance "$INSTANCE" local --assistant
 需要 Rust 1.89+；网站构建使用 Node.js 24。
 
 ```bash
-git clone https://github.com/rockythink/shisui-danmu.git
-cd shisui-danmu
+git clone https://github.com/rockythink/shisui-danmu.git danmu
+cd danmu
 ./script/verify.sh
 ./script/install_cli.sh
 ```
+
+本地源码目录可命名为 `danmu`，不要求与远程仓库同名。目录改名不改变 Cargo 包名 `shisui-danmu`、命令 `danmu`、用户配置或历史数据目录；已有终端、编辑器及外部脚本中的绝对源码路径需同步更新。
 
 `verify.sh` 执行格式检查、严格 Clippy、全目标测试、Release 构建及 CLI 冒烟。CI 在 macOS、Linux、Windows 执行 Rust 门禁，并构建官网。平台协议留在 Adapter，领域模块不直接依赖 B 站协议字段。贡献前阅读 [CONTRIBUTING.md](https://github.com/rockythink/shisui-danmu/blob/main/CONTRIBUTING.md)。
 

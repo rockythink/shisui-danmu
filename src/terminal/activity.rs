@@ -126,14 +126,14 @@ struct ShownBatch {
 
 /// Only the visible batch and one bounded next-batch summary are retained.
 #[derive(Default)]
-pub(super) struct ActivityNotices {
+pub(crate) struct ActivityNotices {
     current: Option<ShownBatch>,
     next_enter: Batch,
     next_like: Batch,
 }
 
 impl ActivityNotices {
-    pub(super) fn push(&mut self, event: &DanmuEvent, now: Instant, wall_now: DateTime<Utc>) {
+    pub(crate) fn push(&mut self, event: &DanmuEvent, now: Instant, wall_now: DateTime<Utc>) {
         let Some(lifetime) = event.kind.activity_lifetime() else {
             return;
         };
@@ -159,7 +159,7 @@ impl ActivityNotices {
         self.advance(now);
     }
 
-    pub(super) fn advance(&mut self, now: Instant) {
+    pub(crate) fn advance(&mut self, now: Instant) {
         self.next_enter.expire(now);
         self.next_like.expire(now);
         if self
@@ -212,7 +212,7 @@ impl ActivityNotices {
         }
     }
 
-    pub(super) fn render(
+    pub(crate) fn render(
         &self,
         width: usize,
         show_name: bool,

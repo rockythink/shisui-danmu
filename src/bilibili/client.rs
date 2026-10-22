@@ -823,11 +823,14 @@ enum AccountStorage {
     Memory(Arc<Mutex<Option<Credential>>>),
 }
 
+#[cfg(any(test, feature = "test-support"))]
+static QA_ACCOUNT_ENDPOINT: std::sync::OnceLock<Url> = std::sync::OnceLock::new();
+
 #[derive(Clone)]
 pub struct AccountClient {
     http: reqwest::Client,
     storage: AccountStorage,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_endpoint: Option<Url>,
 }
 impl std::fmt::Debug for AccountClient {
@@ -838,15 +841,44 @@ impl std::fmt::Debug for AccountClient {
 
 impl AccountClient {
     pub fn new(session_path: PathBuf) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .user_agent(USER_AGENT_VALUE)
+            .redirect(reqwest::redirect::Policy::none());
+        #[cfg(any(test, feature = "test-support"))]
+        let http = if QA_ACCOUNT_ENDPOINT.get().is_some() {
+            http.no_proxy()
+        } else {
+            http
+        };
         Ok(Self {
-            http: reqwest::Client::builder()
-                .user_agent(USER_AGENT_VALUE)
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            http: http.build()?,
             storage: AccountStorage::File(session_path),
-            #[cfg(test)]
-            test_endpoint: None,
+            #[cfg(any(test, feature = "test-support"))]
+            test_endpoint: QA_ACCOUNT_ENDPOINT.get().cloned(),
         })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn install_qa_endpoint(origin: &str) -> Result<()> {
+        let endpoint = Url::parse(origin)?;
+        anyhow::ensure!(
+            endpoint.scheme() == "http"
+                && endpoint.host_str() == Some("127.0.0.1")
+                && endpoint.path() == "/"
+                && endpoint.username().is_empty()
+                && endpoint.password().is_none()
+                && endpoint.query().is_none()
+                && endpoint.fragment().is_none(),
+            "QA account endpoint must be a literal HTTP 127.0.0.1 origin"
+        );
+        QA_ACCOUNT_ENDPOINT
+            .set(endpoint)
+            .map_err(|_| anyhow!("QA account endpoint already installed"))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn qa_endpoint_installed() -> bool {
+        QA_ACCOUNT_ENDPOINT.get().is_some()
     }
 
     #[cfg(test)]
@@ -856,7 +888,7 @@ impl AccountClient {
     }
 
     fn endpoint(&self, endpoint: &'static str) -> std::borrow::Cow<'static, str> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(base) = &self.test_endpoint {
             let original = Url::parse(endpoint).expect("static account endpoint");
             return base
@@ -880,7 +912,7 @@ impl AccountClient {
         Self {
             http: self.http.clone(),
             storage: AccountStorage::Memory(Arc::default()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_endpoint: self.test_endpoint.clone(),
         }
     }
@@ -890,7 +922,7 @@ impl AccountClient {
         Ok(Self {
             http: self.http.clone(),
             storage: AccountStorage::Memory(Arc::new(Mutex::new(self.load_credential()?))),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_endpoint: self.test_endpoint.clone(),
         })
     }
@@ -900,7 +932,7 @@ impl AccountClient {
         let account = Self {
             http: self.http.clone(),
             storage: AccountStorage::File(path),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_endpoint: self.test_endpoint.clone(),
         };
         account.save_credential(&credential)?;

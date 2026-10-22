@@ -1,44 +1,52 @@
-struct MainLogin {
-    token: uuid::Uuid,
-    task: tokio::task::JoinHandle<()>,
-}
-impl Drop for MainLogin {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
+#[cfg(test)]
+use crate::runtime::{
+    ChatgptOperation, DELIVERY_NOTICE_LIFETIME, MainLogin, PendingDelivery,
+    reconcile_cross_origin_event,
+};
+use crate::runtime::{CoreEvent, DeliveryStatus, NoticeLevel, RuntimeState, StopFlow};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretTarget {
+    ObsPassword,
+    AssistantApiKey,
 }
 
-mod accounts;
-mod activity;
-mod agent;
-mod assistant;
-mod settings;
+pub(crate) mod activity;
+pub(crate) mod agent;
+pub(crate) mod assistant;
+use crate::runtime::settings;
 #[cfg(all(test, windows))]
 mod windows_tests;
 
 pub use agent::run_local as local;
-mod input;
+pub(crate) mod input;
 mod meter;
 mod qr;
 mod replay;
 pub use replay::run as replay;
-mod send;
-use send::TerminalTransport;
 
 pub use qr::qr_lines;
 
+pub(crate) fn login_qr_lines(url: &str) -> Result<Vec<String>> {
+    compact_qr_lines(url)
+}
+
+#[cfg(test)]
+use crate::{
+    bilibili::BilibiliClientEvent,
+    bridge::Bridge,
+    delivery::Outcome,
+    obs::{ObsController, ObsStatus},
+    persistence::SessionJournal,
+};
 use crate::{
     bilibili::{
-        AccountClient, AccountStatus, BilibiliClient, BilibiliClientEvent, LoginPoll,
-        RoomLiveStatus, RoomSnapshot, cross_origin_duplicate, kind_label, masked_name_matches,
-        normalized_message, segment_message, usable_author_id,
+        AccountClient, AccountStatus, LoginPoll, RoomLiveStatus, RoomSnapshot, kind_label,
+        segment_message, usable_author_id,
     },
-    bridge::{self, Bridge},
+    bridge,
     config::TerminalConfig,
-    delivery::{Outcome, SendQueue, Transport},
     domain::{DanmuEvent, DanmuEventKind, DanmuEventOrigin, DanmuSession, DanmuSessionEndReason},
-    obs::{MicrophoneLevel, MicrophoneState, ObsController, ObsStatus},
-    persistence::SessionJournal,
+    obs::{MicrophoneLevel, MicrophoneState},
     theme::Palette,
 };
 use anyhow::{Result, anyhow};
@@ -68,20 +76,20 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+#[cfg(test)]
+use std::path::PathBuf;
 use std::{
-    collections::VecDeque,
     io::{self, Stdout},
-    path::PathBuf,
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::mpsc;
+#[cfg(test)]
+use tokio::sync::oneshot;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-const DELIVERY_NOTICE_LIFETIME: Duration = Duration::from_secs(15);
-const DELIVERY_ECHO_WINDOW: chrono::Duration = chrono::Duration::seconds(90);
 // Register once and keep the receivers alive across all startup/main-loop draws.
-fn shutdown_signal() -> io::Result<impl std::future::Future<Output = ()>> {
+fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -105,7 +113,7 @@ fn shutdown_signal() -> io::Result<impl std::future::Future<Output = ()>> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StartupCheck {
+pub(crate) enum StartupCheck {
     Waiting,
     Running,
     Passed(&'static str),
@@ -114,16 +122,16 @@ enum StartupCheck {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct StartupView {
-    local: StartupCheck,
-    account: StartupCheck,
-    room: StartupCheck,
-    metrics: StartupCheck,
-    obs: StartupCheck,
+pub(crate) struct StartupView {
+    pub(crate) local: StartupCheck,
+    pub(crate) account: StartupCheck,
+    pub(crate) room: StartupCheck,
+    pub(crate) metrics: StartupCheck,
+    pub(crate) obs: StartupCheck,
 }
 
 impl StartupView {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             local: StartupCheck::Running,
             account: StartupCheck::Running,
@@ -133,15 +141,7 @@ impl StartupView {
         }
     }
 
-    fn apply(&mut self, update: StartupUpdate) {
-        match update {
-            StartupUpdate::Local(status) => self.local = status,
-            StartupUpdate::Account(status) => self.account = status,
-            StartupUpdate::Room(status) => self.room = status,
-        }
-    }
-
-    fn active_label(self) -> &'static str {
+    pub(crate) fn active_label(self) -> &'static str {
         if self.local == StartupCheck::Running {
             "恢复本地会话"
         } else if self.account == StartupCheck::Running {
@@ -156,28 +156,8 @@ impl StartupView {
     }
 }
 
-#[derive(Debug)]
-enum StartupUpdate {
-    Local(StartupCheck),
-    Account(StartupCheck),
-    Room(StartupCheck),
-}
-
-#[derive(Debug)]
-struct StartupData {
-    room: Option<RoomSnapshot>,
-    initial_room_error: Option<String>,
-    account_status: AccountStatus,
-}
-
-#[derive(Debug)]
-struct StartupSession {
-    session: DanmuSession,
-    initial_error: Option<String>,
-}
-
 #[derive(Debug, Default)]
-enum StartupGate {
+pub(crate) enum StartupGate {
     #[default]
     Checking,
     Ready,
@@ -187,332 +167,20 @@ enum StartupGate {
 }
 
 impl StartupGate {
-    fn can_finish(&self) -> bool {
+    pub(crate) fn can_finish(&self) -> bool {
         matches!(self, Self::Ready | Self::Skipped)
     }
 }
 
 impl StartupView {
-    fn has_warning(self) -> bool {
+    pub(crate) fn has_warning(self) -> bool {
         [self.local, self.room]
             .into_iter()
             .any(|status| matches!(status, StartupCheck::Warning(_)))
     }
 
-    fn obs_requires_password(self) -> bool {
-        matches!(self.obs, StartupCheck::Warning(message) if message.contains("/obs config password"))
-    }
-}
-
-async fn load_startup_clients(account_session: PathBuf) -> Result<(BilibiliClient, AccountClient)> {
-    tokio::task::spawn_blocking(move || {
-        let client = BilibiliClient::new(account_session.clone())?;
-        let account = AccountClient::new(account_session)?;
-        Ok::<_, anyhow::Error>((client, account))
-    })
-    .await
-    .map_err(|error| anyhow!("B 站客户端初始化任务失败：{error}"))?
-}
-
-async fn load_startup_session(
-    journal: SessionJournal,
-    room_id: String,
-    updates: mpsc::UnboundedSender<StartupUpdate>,
-) -> StartupSession {
-    let history_room_id = room_id.clone();
-    let recovery = tokio::task::spawn_blocking(move || {
-        journal
-            .recent_room_history(&history_room_id, 240)
-            .map(|history| {
-                let mut session = DanmuSession::new(&history_room_id);
-                session.preload_history(history);
-                session
-            })
-    })
-    .await;
-    let recovered = match recovery {
-        Ok(result) => result.map_err(|error| error.to_string()),
-        Err(error) => Err(format!("会话恢复任务失败：{error}")),
-    };
-    match recovered {
-        Ok(session) => {
-            let status = if session.recent_events.is_empty() {
-                "已读取"
-            } else {
-                "已恢复"
-            };
-            let _ = updates.send(StartupUpdate::Local(StartupCheck::Passed(status)));
-            StartupSession {
-                session,
-                initial_error: None,
-            }
-        }
-        Err(error) => {
-            let _ = updates.send(StartupUpdate::Local(StartupCheck::Warning(
-                "读取失败 · 可重试",
-            )));
-            StartupSession {
-                session: DanmuSession::new(&room_id),
-                initial_error: Some(error),
-            }
-        }
-    }
-}
-
-async fn check_startup_obs(obs: ObsController) -> StartupCheck {
-    match tokio::time::timeout(Duration::from_secs(3), obs.fetch_status()).await {
-        Ok(Ok(_)) => StartupCheck::Passed("已连接"),
-        Ok(Err(error)) if error.to_string().contains("/obs config password") => {
-            StartupCheck::Warning("需要密码 · /obs config password")
-        }
-        Ok(Err(_)) => StartupCheck::Warning("连接失败 · 进入后重试"),
-        Err(_) => StartupCheck::Warning("连接超时 · 进入后重试"),
-    }
-}
-
-async fn load_startup_data(
-    client: BilibiliClient,
-    account: AccountClient,
-    room_id: String,
-    updates: mpsc::UnboundedSender<StartupUpdate>,
-) -> StartupData {
-    let account_updates = updates.clone();
-    let account_request = async {
-        match account.status().await {
-            Ok(status @ AccountStatus::SignedIn { .. }) => {
-                let _ =
-                    account_updates.send(StartupUpdate::Account(StartupCheck::Passed("已登录")));
-                status
-            }
-            Ok(AccountStatus::SignedOut) => {
-                let _ = account_updates.send(StartupUpdate::Account(StartupCheck::Passed(
-                    "未登录 · 监看模式",
-                )));
-                AccountStatus::SignedOut
-            }
-            Err(_) => {
-                let _ = account_updates.send(StartupUpdate::Account(StartupCheck::Warning(
-                    "检查失败 · 可重试",
-                )));
-                AccountStatus::SignedOut
-            }
-        }
-    };
-
-    let _ = updates.send(StartupUpdate::Room(StartupCheck::Running));
-    let room_request = async {
-        match client.room_snapshot(&room_id).await {
-            Ok(room) => {
-                let _ = updates.send(StartupUpdate::Room(StartupCheck::Passed("房间可访问")));
-                (Some(room), None)
-            }
-            Err(error) => {
-                let _ = updates.send(StartupUpdate::Room(StartupCheck::Warning(
-                    "读取失败 · 可重试",
-                )));
-                (None, Some(error.to_string()))
-            }
-        }
-    };
-
-    let (account_status, (room, initial_room_error)) = tokio::join!(account_request, room_request);
-
-    StartupData {
-        room,
-        initial_room_error,
-        account_status,
-    }
-}
-
-#[derive(Debug)]
-enum UiEvent {
-    LocalEcho(String),
-    SettingSaved {
-        token: uuid::Uuid,
-        result: std::result::Result<settings::SavedSetting, String>,
-    },
-
-    DeliveryAccepted,
-    DeliveryNotice(String),
-    Notice {
-        message: String,
-        level: NoticeLevel,
-    },
-    LoginQr {
-        token: uuid::Uuid,
-        lines: Vec<String>,
-    },
-    LoginDone {
-        token: uuid::Uuid,
-        account: AccountClient,
-        status: AccountStatus,
-    },
-    LoginFailed {
-        token: uuid::Uuid,
-        message: String,
-    },
-    AssistantAccount(accounts::AccountEvent),
-    ObsStatus(std::result::Result<ObsStatus, String>),
-    ObsStopDone(std::result::Result<(), String>),
-    RoomSnapshot(RoomSnapshot),
-    BroadcasterProfile {
-        room_id: String,
-        user_id: String,
-        result: std::result::Result<Option<crate::bilibili::PublicProfile>, String>,
-    },
-    OnlineViewers(std::result::Result<Option<u64>, String>),
-    Likes(std::result::Result<Option<u64>, String>),
-    DeliveryStarted {
-        delivery: PendingDelivery,
-        confirmation: oneshot::Sender<()>,
-        registered: oneshot::Sender<()>,
-    },
-    DeliveryHistory {
-        events: Vec<DanmuEvent>,
-    },
-    DeliveryTimedOut {
-        delivery_ids: Vec<String>,
-    },
-    DeliveryEchoMissing {
-        delivery_ids: Vec<String>,
-    },
-    DeliveryExpired {
-        delivery_id: String,
-    },
-    DeliveryRejected {
-        content: String,
-        message: String,
-    },
-    AssistantDelivery {
-        session_id: String,
-        record: serde_json::Value,
-    },
-    DeliveryCompleted,
-}
-
-async fn send_room_metrics(
-    account: &AccountClient,
-    tx: &mpsc::Sender<UiEvent>,
-    room: &RoomSnapshot,
-) -> bool {
-    let (online, likes) = tokio::join!(
-        account.current_online_viewers(&room.room_id, &room.broadcaster_id),
-        account.current_likes(&room.room_id),
-    );
-    tx.send(UiEvent::OnlineViewers(
-        online.map_err(|error| error.to_string()),
-    ))
-    .await
-    .is_ok()
-        && tx
-            .send(UiEvent::Likes(likes.map_err(|error| error.to_string())))
-            .await
-            .is_ok()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeliveryStatus {
-    Idle,
-    Sending,
-    AwaitingEcho,
-    Verifying,
-    Delivered,
-    Uncertain,
-    Failed,
-}
-
-#[derive(Debug, Clone)]
-struct PendingDelivery {
-    id: String,
-    content: String,
-    broadcaster_name: String,
-    broadcaster_id: String,
-    submitted_at: DateTime<Utc>,
-}
-
-impl PendingDelivery {
-    fn new(
-        content: String,
-        broadcaster_name: String,
-        broadcaster_id: String,
-        submitted_at: DateTime<Utc>,
-    ) -> Self {
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            content: content.trim().to_owned(),
-            broadcaster_name: broadcaster_name.trim().to_owned(),
-            broadcaster_id: broadcaster_id.trim().to_owned(),
-            submitted_at,
-        }
-    }
-
-    fn matches(&self, event: &DanmuEvent) -> bool {
-        if event.kind != DanmuEventKind::Danmu
-            || normalized_message(&event.content) != normalized_message(&self.content)
-            || event.timestamp < self.submitted_at - chrono::Duration::seconds(3)
-            || event.timestamp > self.submitted_at + DELIVERY_ECHO_WINDOW
-        {
-            return false;
-        }
-        match usable_author_id(event.author_id.as_deref()) {
-            Some(author_id) => author_id == self.broadcaster_id,
-            None => event.username.as_deref().is_some_and(|username| {
-                username.eq_ignore_ascii_case(&self.broadcaster_name)
-                    || masked_name_matches(username, &self.broadcaster_name)
-            }),
-        }
-    }
-
-    fn canonicalize(&self, event: &mut DanmuEvent) {
-        event.username = Some(self.broadcaster_name.clone());
-        event.author_id = Some(self.broadcaster_id.clone());
-    }
-}
-
-#[derive(Debug)]
-struct ActiveDelivery {
-    delivery: PendingDelivery,
-    confirmation: Option<oneshot::Sender<()>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NoticeLevel {
-    Info,
-    Success,
-    Warning,
-    Error,
-    Progress,
-}
-
-impl NoticeLevel {
-    fn lifetime(self) -> Option<Duration> {
-        match self {
-            Self::Info | Self::Success => Some(Duration::from_secs(3)),
-            Self::Warning | Self::Error | Self::Progress => None,
-        }
-    }
-}
-
-impl UiEvent {
-    fn success(message: impl Into<String>) -> Self {
-        Self::Notice {
-            message: message.into(),
-            level: NoticeLevel::Success,
-        }
-    }
-
-    fn error(message: impl Into<String>) -> Self {
-        Self::Notice {
-            message: message.into(),
-            level: NoticeLevel::Error,
-        }
-    }
-}
-
-fn operation_notice(result: Result<String>) -> UiEvent {
-    match result {
-        Ok(message) => UiEvent::success(message),
-        Err(error) => UiEvent::error(error.to_string()),
+    pub(crate) fn obs_requires_password(self) -> bool {
+        matches!(self.obs, StartupCheck::Warning(message) if message.contains("OBS 已启用认证时"))
     }
 }
 
@@ -526,7 +194,7 @@ enum CommandCategory {
 }
 
 impl CommandCategory {
-    fn color(self, palette: Palette) -> Color {
+    pub(crate) fn color(self, palette: Palette) -> Color {
         match self {
             Self::Display => palette.host,
             Self::Account => palette.info,
@@ -539,11 +207,11 @@ impl CommandCategory {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CommandSpec {
-    completion: &'static str,
-    usage: &'static str,
-    description: &'static str,
-    category: CommandCategory,
-    danger: bool,
+    pub(crate) completion: &'static str,
+    pub(crate) usage: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) category: CommandCategory,
+    pub(crate) danger: bool,
 }
 
 enum SlashKeyAction {
@@ -591,7 +259,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         completion: "/settings",
         usage: "设置与操作",
-        description: "五类设置、本场与常用操作",
+        description: "四类设置、本场与常用操作",
         category: CommandCategory::System,
         danger: false,
     },
@@ -696,16 +364,16 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         completion: "/ai visible",
         usage: "处理可见弹幕",
-        description: "重建上下文，处理可见内容",
+        description: "处理尚未消费的可见内容",
         category: CommandCategory::Ai,
         danger: true,
     },
     CommandSpec {
-        completion: "/ai reset",
-        usage: "重建上下文",
-        description: "丢弃当前上下文",
+        completion: "/ai key",
+        usage: "隐藏输入 API Key",
+        description: "设置当前 API 连接的私有 Key，不接收明文参数",
         category: CommandCategory::Ai,
-        danger: true,
+        danger: false,
     },
     CommandSpec {
         completion: "/ai stop",
@@ -731,28 +399,21 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         completion: "/ai replies",
         usage: "发送策略",
-        description: "方案与默认范围",
+        description: "方案、联网搜索与屏蔽词",
         category: CommandCategory::Ai,
         danger: false,
     },
     CommandSpec {
         completion: "/ai materials",
         usage: "人设与资料",
-        description: "AI名字、人设与上下文",
+        description: "AI名字与人设",
         category: CommandCategory::Ai,
         danger: false,
     },
     CommandSpec {
         completion: "/ai advanced",
-        usage: "Agent配置",
-        description: "规则、运行策略与维护",
-        category: CommandCategory::Ai,
-        danger: false,
-    },
-    CommandSpec {
-        completion: "/ai workspace",
-        usage: "工作空间",
-        description: "编辑Agent工作目录",
+        usage: "维护",
+        description: "可见弹幕、重建上下文与结束",
         category: CommandCategory::Ai,
         danger: false,
     },
@@ -889,13 +550,6 @@ const OBS_COMMAND_SPECS: &[CommandSpec] = &[
 
 const SETTINGS_COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
-        completion: "/settings reading",
-        usage: "外观与显示",
-        description: "主题、布局与阅读",
-        category: CommandCategory::Display,
-        danger: false,
-    },
-    CommandSpec {
         completion: "/settings account",
         usage: "B站账号与直播间",
         description: "主账号、AI发送账号、标题与封面",
@@ -912,7 +566,7 @@ const SETTINGS_COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         completion: "/settings ai",
         usage: "AI助手设置",
-        description: "工作空间、Agent与发送策略",
+        description: "模型、发送策略与维护",
         category: CommandCategory::Ai,
         danger: false,
     },
@@ -998,10 +652,10 @@ fn command_suggestions(input: &str, include_ai: bool) -> Vec<&'static CommandSpe
 }
 
 #[derive(Default)]
-struct HelpState {
-    scroll: usize,
-    max_scroll: usize,
-    page_rows: usize,
+pub(crate) struct HelpState {
+    pub(crate) scroll: usize,
+    pub(crate) max_scroll: usize,
+    pub(crate) page_rows: usize,
 }
 
 const HELP_SECTIONS: &[(&str, &str)] = &[
@@ -1013,12 +667,12 @@ const HELP_SECTIONS: &[(&str, &str)] = &[
     (
         "设置与回复",
         "设置用方向键选择、Enter执行、Esc返回；“设置”“当前操作”为只读分组。直达页Esc一次关闭。Tab切换同级分类，F1或?展开说明。编辑Enter保存、Esc取消；归档搜索必须输入关键词，取消不搜索。
-/display theme选择主题；/display names或time on|off；/display layout chat|list保存布局。/settings ai集中AI配置；/ai model、/ai replies、/ai materials、/ai advanced直达子页，/ai workspace编辑工作空间。
+/display theme选择主题；/display names或time on|off；/display layout chat|list保存布局。/settings ai集中AI配置；/ai model选模型，/ai replies选方案、联网与屏蔽词，/ai materials改名字与人设，/ai advanced维护。工作区、来源、技能与补充要求在assistant.json配置；资料引用、开麦让位与有限修复固定启用。
 /review查看候选全文；Shift-Enter发送本条，e编辑，Delete丢弃，Tab下一条。长文须先下滑看完；编辑只保存，须重新看完才可发送。",
     ),
     (
         "AI运行",
-        "/ai start 启动；/pause 暂停并撤权、保留可继续状态；/ai stop 释放专用进程。/ai range 本场范围，/ai topic 本场主题。\n/ai auto on 允许公开自动发送，同房间同账号记住；/ai auto off 立即撤权。旧自动偏好不是许可。/ai visible 处理可见弹幕；/ai reset 重建上下文。/diag repair 先备份再重建历史。",
+        "/ai start 启动并等待新消息；/pause 暂停并撤权；/ai stop 释放本机 worker。/ai range 本场范围，/ai topic 本场主题。\n/ai auto on 允许公开自动发送，同房间同账号记住；/ai auto off 立即撤权。旧自动偏好不是许可。/ai visible 处理可见弹幕；/ai key 打开隐藏 Key 输入。/diag repair 先备份再重建历史。",
     ),
     (
         "指令与编辑",
@@ -1034,79 +688,92 @@ const HELP_SECTIONS: &[(&str, &str)] = &[
     ),
 ];
 
-#[derive(Debug, Clone, Copy)]
-enum StopFlow {
-    Confirm { stop_selected: bool },
-    Countdown { deadline: Instant },
-    Stopping,
+#[cfg(test)]
+static SUBSCRIPTION_TEST_BROWSER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+fn open_chatgpt_browser(url: &str) -> Result<()> {
+    #[cfg(test)]
+    if let Some(path) = SUBSCRIPTION_TEST_BROWSER.get() {
+        let mut authorize = url::Url::parse(url).map_err(|_| anyhow!("测试授权地址无效"))?;
+        anyhow::ensure!(
+            authorize.scheme() == "http" && authorize.host_str() == Some("127.0.0.1"),
+            "测试授权地址须为loopback"
+        );
+        let nonce = authorize
+            .query_pairs()
+            .find(|(key, _)| key == "nonce")
+            .map(|(_, value)| value.into_owned())
+            .ok_or_else(|| anyhow!("测试nonce缺失"))?;
+        let client = authorize
+            .query_pairs()
+            .find(|(key, _)| key == "client_id")
+            .map(|(_, value)| value.into_owned())
+            .ok_or_else(|| anyhow!("测试client缺失"))?;
+        let pairs: Vec<(String, String)> = authorize
+            .query_pairs()
+            .filter(|(key, _)| key != "id_token_hint")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        authorize.set_query(None);
+        authorize.query_pairs_mut().extend_pairs(pairs);
+        let issued = if client == "dynamic_agent_client" {
+            "oaiapp_fixture"
+        } else {
+            &client
+        };
+        let record = serde_json::json!({"authorize_url": authorize.as_str(),
+            "token_response": crate::runner::subscription::fixture_login_token_response(&nonce, issued, "fixture-subject", true)});
+        crate::storage::write_private_atomic(
+            path,
+            &serde_json::to_vec(&record).map_err(|_| anyhow!("测试授权记录编码失败"))?,
+        )
+        .map_err(|_| anyhow!("私有测试授权通道写入失败"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = std::process::Command::new("rundll32.exe");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    let status = command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|_| anyhow!("无法打开系统浏览器；未输出授权地址，请重试"))?;
+    anyhow::ensure!(
+        status.success(),
+        "系统浏览器打开失败；未输出授权地址，请重试"
+    );
+    Ok(())
 }
+impl RuntimeState {
+    pub(crate) fn begin_assistant_api_key(&mut self) -> Result<()> {
+        self.check_assistant_connection_change()?;
+        anyhow::ensure!(
+            self.runner.settings.api.protocol
+                != crate::runner::settings::ApiProtocol::ChatgptSubscription,
+            "ChatGPT订阅使用浏览器登录，不使用API Key"
+        );
+        anyhow::ensure!(self.secret_target.is_none(), "已有隐藏输入，请先保存或取消");
+        if self.command_search_draft.is_some() {
+            self.close_command_search();
+        }
+        self.secret_draft = Some(std::mem::take(&mut self.input));
+        self.secret_target = Some(SecretTarget::AssistantApiKey);
+        self.set_notice(
+            "输入当前连接的 API Key；Enter保存，Esc取消；更换将替换唯一Key记录，不公开发送",
+            NoticeLevel::Progress,
+        );
+        Ok(())
+    }
 
-pub struct TerminalApp {
-    config: TerminalConfig,
-    client: BilibiliClient,
-    account: AccountClient,
-    assistant_accounts: accounts::AssistantAccounts,
-    manual_send_queue: SendQueue,
-    independent_send_queue: SendQueue,
-    bridge: Bridge,
-    local_transport: Option<std::sync::Arc<agent::LocalTransport>>,
-    live_scope: Option<String>,
-    candidate_selected: Option<(String, String)>,
-    candidate_edit: Option<agent::CandidateEdit>,
-    review_frame: Option<agent::ReviewFrame>,
-    runner: crate::runner::Runner,
-    assistant_panel: Option<assistant::Panel>,
-    settings_operation: Option<uuid::Uuid>,
-    profile: agent::ProfileState,
-    obs: ObsController,
-    journal: SessionJournal,
-    session: DanmuSession,
-    room: Option<RoomSnapshot>,
-    room_updated_at: Option<DateTime<Local>>,
-    connection: String,
-    watched: Option<u64>,
-    likes: Option<u64>,
-    online_viewers: Option<u64>,
-    input: EditorInput,
-    slash_selection: usize,
-    command_search_draft: Option<EditorInput>,
-    secret_draft: Option<EditorInput>,
-    help: Option<HelpState>,
-    selected: usize,
-    scroll_offset: usize,
-    last_user_activity: Instant,
-    activity: activity::ActivityNotices,
-    notice: String,
-    notice_deadline: Option<Instant>,
-    notice_is_delivery: bool,
-    notice_level: NoticeLevel,
-    delivery_status: DeliveryStatus,
-    delivery_status_deadline: Option<Instant>,
-    layout_chat: bool,
-    show_name: bool,
-    show_time: bool,
-    account_status: AccountStatus,
-    stop_flow: Option<StopFlow>,
-    login_qr: Option<Vec<String>>,
-    main_login: Option<MainLogin>,
-    secret_mode: bool,
-    selection_active: bool,
-    quit_requested: bool,
-    unread_live_count: u64,
-    obs_status: Option<ObsStatus>,
-    microphone_level: Option<MicrophoneLevel>,
-    obs_error: Option<String>,
-    obs_checked_at: Option<DateTime<Local>>,
-    pending_deliveries: VecDeque<ActiveDelivery>,
-    confirmed_deliveries: VecDeque<PendingDelivery>,
-    last_realtime_at: Option<DateTime<Local>>,
-    last_live_danmu_at: Option<DateTime<Local>>,
-    animation_tick: u64,
-    resume_pending: bool,
-}
-
-impl TerminalApp {
-    fn record_reading_config(&mut self) {
+    pub(crate) fn record_reading_config(&mut self) {
         self.runner
             .record_reading_config(crate::workspace_config::Reading {
                 single_line: self.config.single_line,
@@ -1120,7 +787,7 @@ impl TerminalApp {
             self.set_notice(warning, NoticeLevel::Error);
         }
     }
-    fn persist_ui(&mut self, key: &str, value: toml_edit::Value) -> bool {
+    pub(crate) fn persist_ui(&mut self, key: &str, value: toml_edit::Value) -> bool {
         match self.config.save_value(key, value) {
             Ok(()) => true,
             Err(error) => {
@@ -1129,1021 +796,16 @@ impl TerminalApp {
             }
         }
     }
-    pub async fn run(
-        config: TerminalConfig,
-        account_session: PathBuf,
-        obs: ObsController,
-        journal: SessionJournal,
-    ) -> Result<()> {
-        let shutdown = shutdown_signal()?;
-        tokio::pin!(shutdown);
-        let room_id = config.room_id.clone();
-        let palette = config.palette;
-        let mut terminal = TerminalGuard::enter()?;
-        let mut events = EventStream::new();
-        let mut startup_tick = tokio::time::interval(Duration::from_millis(90));
-        startup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut startup_frame = 0_u64;
-        let startup_started_at = Instant::now();
-        let mut startup_view = StartupView::new();
-        terminal.terminal.draw(|frame| {
-            draw_startup(
-                frame,
-                palette,
-                startup_frame,
-                &startup_view,
-                &StartupGate::Checking,
-                startup_started_at.elapsed(),
-                false,
-            )
-        })?;
 
-        let (startup_update_tx, mut startup_update_rx) = mpsc::unbounded_channel();
-        let mut startup_clients = Box::pin(load_startup_clients(account_session));
-        let mut clients = None;
-        let mut startup_session = Box::pin(load_startup_session(
-            journal.clone(),
-            room_id.clone(),
-            startup_update_tx.clone(),
-        ));
-        let mut startup_data = None;
-        let mut startup_obs_check = Box::pin(check_startup_obs(obs.clone()));
-        let mut startup_result: Option<StartupData> = None;
-        let mut startup_session_result = None;
-        let mut startup_obs_done = false;
-        let mut startup_gate = StartupGate::default();
-        let mut runner = crate::runner::Runner::load(&config.config_path);
-        let mut startup_accounts: Option<accounts::AssistantAccounts> = None;
-        let mut automatic_restore = false;
-        let mut automatic_restore_warning = None;
-        let mut resume_decision = (!runner.settings.resume_on_start).then_some(false);
-        let (
-            StartupData {
-                room,
-                initial_room_error,
-                account_status,
-            },
-            StartupSession {
-                session,
-                initial_error: initial_session_error,
-            },
-        ) = loop {
-            let checks_ready = startup_result.is_some() && startup_session_result.is_some();
-            if checks_ready && matches!(startup_gate, StartupGate::Checking) {
-                startup_gate = if startup_view.has_warning() {
-                    StartupGate::Blocked
-                } else {
-                    StartupGate::Ready
-                };
-            }
-            if checks_ready && startup_gate.can_finish() {
-                if resume_decision.is_none() {
-                    let accounts = startup_accounts
-                        .as_ref()
-                        .expect("startup accounts are loaded");
-                    let status = &startup_result
-                        .as_ref()
-                        .expect("startup data is ready")
-                        .account_status;
-                    if runner.settings.automatic && accounts.automatic_matches(&room_id, status) {
-                        automatic_restore = true;
-                        resume_decision = Some(true);
-                        continue;
-                    }
-                    resume_decision = Some(false);
-                    continue;
-                } else {
-                    break (
-                        startup_result.take().expect("startup result checked above"),
-                        startup_session_result
-                            .take()
-                            .expect("startup session checked above"),
-                    );
-                }
-            }
-            tokio::select! {
-                result = &mut startup_clients, if clients.is_none() => {
-                    let (client, account) = result?;
-                    startup_accounts = Some(accounts::AssistantAccounts::load(&account, &config.config_path)?);
-                    startup_data = Some(Box::pin(load_startup_data(
-                        client.clone(),
-                        account.clone(),
-                        room_id.clone(),
-                        startup_update_tx.clone(),
-                    )));
-                    clients = Some((client, account));
-                }
-                result = &mut startup_session, if startup_session_result.is_none() => {
-                    startup_session_result = Some(result);
-                }
-                result = async {
-                    startup_data
-                        .as_mut()
-                        .expect("startup data is guarded above")
-                        .await
-                }, if startup_data.is_some() && startup_result.is_none() => {
-                    let accounts = startup_accounts.as_mut().expect("startup accounts are loaded");
-                    if accounts.has_automatic_grant() && !accounts.automatic_matches(&room_id, &result.account_status)
-                        && let Err(error) = accounts.forget_automatic() {
-                        automatic_restore_warning = Some(format!("房间或账号不匹配，未恢复自动发送；清除旧授权失败：{error}"));
-                    }
-                    startup_result = Some(result);
-                }
-                status = &mut startup_obs_check, if !startup_obs_done => {
-                    startup_obs_done = true;
-                    startup_view.obs = status;
-                }
-                Some(update) = startup_update_rx.recv() => {
-                    startup_view.apply(update);
-                }
-                _ = &mut shutdown => return Ok(()),
-                _ = startup_tick.tick() => {
-                    startup_frame = startup_frame.wrapping_add(1);
-                    terminal.terminal.draw(|frame| {
-                        draw_startup(
-                            frame,
-                            palette,
-                            startup_frame,
-                            &startup_view,
-                            &startup_gate,
-                            startup_started_at.elapsed(),
-                            checks_ready,
-                        )
-                    })?;
-                }
-                event = events.next() => {
-                    let Some(event) = event else { return Ok(()); };
-                    let event = event?;
-                    match event {
-                        Event::Key(key) => {
-                            if key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)
-                            {
-                                return Ok(());
-                            }
-
-                            let mut retry_all = false;
-                            let mut password_to_save = None;
-                            match &mut startup_gate {
-                                StartupGate::Blocked => match key.code {
-                                    KeyCode::Char('s' | 'S') => {
-                                        startup_gate = StartupGate::Skipped;
-                                    }
-                                    KeyCode::Enter if startup_view.obs_requires_password() => {
-                                        startup_gate = StartupGate::EnteringObsPassword(
-                                            EditorInput::default(),
-                                        );
-                                    }
-                                    KeyCode::Enter => retry_all = true,
-                                    _ => {}
-                                },
-                                StartupGate::EnteringObsPassword(input) => match key.code {
-                                    KeyCode::Esc => startup_gate = StartupGate::Blocked,
-                                    KeyCode::Enter if !input.is_empty() => {
-                                        password_to_save = Some(input.take());
-                                    }
-                                    KeyCode::Backspace => input.delete_before_cursor(),
-                                    KeyCode::Char('u')
-                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        input.clear();
-                                    }
-                                    KeyCode::Char(character)
-                                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        input.insert_text(&character.to_string());
-                                    }
-                                    _ => {}
-                                },
-                                _ => {}
-                            }
-
-                            if retry_all {
-                                startup_view = StartupView::new();
-                                startup_result = None;
-                                startup_session_result = None;
-                                startup_obs_done = false;
-                                let (client, account) =
-                                    clients.as_ref().expect("startup clients initialized");
-                                startup_data = Some(Box::pin(load_startup_data(
-                                    client.clone(),
-                                    account.clone(),
-                                    room_id.clone(),
-                                    startup_update_tx.clone(),
-                                )));
-                                startup_session = Box::pin(load_startup_session(
-                                    journal.clone(),
-                                    room_id.clone(),
-                                    startup_update_tx.clone(),
-                                ));
-                                startup_obs_check =
-                                    Box::pin(check_startup_obs(obs.clone()));
-                                startup_gate = StartupGate::Checking;
-                            }
-                            if let Some(password) = password_to_save {
-                                match obs.set_password(&password).await {
-                                    Ok(()) => {
-                                        startup_view.obs = StartupCheck::Running;
-                                        startup_obs_done = false;
-                                        startup_obs_check =
-                                            Box::pin(check_startup_obs(obs.clone()));
-                                        startup_gate = StartupGate::Checking;
-                                    }
-                                    Err(_) => {
-                                        startup_view.obs = StartupCheck::Warning(
-                                            "密码保存失败 · 检查文件权限",
-                                        );
-                                        startup_gate = StartupGate::Blocked;
-                                    }
-                                }
-                            }
-                        }
-                        Event::Paste(text) => {
-                            if let StartupGate::EnteringObsPassword(input) = &mut startup_gate
-                                && text.len() <= 4096
-                            {
-                                input.insert_paste(&text, false);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        };
-        let (client, account) = clients.expect("startup clients checked above");
-        journal.start(&session)?;
-        let history_error = runner
-            .begin_history_import(&session.room_id, &journal)
-            .err();
-        let room_updated_at = room.as_ref().map(|_| Local::now());
-        let mut app = Self {
-            bridge: Bridge::new(false),
-            local_transport: None,
-            live_scope: None,
-            candidate_selected: None,
-            candidate_edit: None,
-
-            review_frame: None,
-            runner,
-            assistant_panel: None,
-            settings_operation: None,
-            profile: agent::ProfileState::default(),
-            layout_chat: config.chat_layout,
-            show_name: config.show_name,
-            show_time: config.show_time,
-            assistant_accounts: startup_accounts.expect("startup accounts are loaded"),
-            config,
-            client: client.clone(),
-            account,
-            manual_send_queue: SendQueue::default(),
-            independent_send_queue: SendQueue::default(),
-            obs,
-            journal,
-            session,
-            room,
-            connection: "连接中".into(),
-            watched: None,
-            likes: None,
-            online_viewers: None,
-            input: EditorInput::default(),
-            room_updated_at,
-            slash_selection: 0,
-            command_search_draft: None,
-            secret_draft: None,
-            help: None,
-            selected: 0,
-            scroll_offset: 0,
-            last_user_activity: Instant::now(),
-            activity: activity::ActivityNotices::default(),
-            notice: "/ · Commands     Tab · Layout".into(),
-            notice_deadline: Some(Instant::now() + Duration::from_secs(6)),
-            notice_is_delivery: false,
-            notice_level: NoticeLevel::Info,
-            delivery_status: DeliveryStatus::Idle,
-            delivery_status_deadline: None,
-            account_status,
-            stop_flow: None,
-            login_qr: None,
-            main_login: None,
-            secret_mode: false,
-            selection_active: false,
-            quit_requested: false,
-            unread_live_count: 0,
-            obs_status: None,
-            microphone_level: None,
-            pending_deliveries: VecDeque::new(),
-            confirmed_deliveries: VecDeque::new(),
-            last_realtime_at: None,
-            obs_error: None,
-            obs_checked_at: None,
-            last_live_danmu_at: None,
-            animation_tick: 0,
-            resume_pending: false,
-        };
-        if let Some(error) = history_error {
-            app.runner.history_warning = Some(format!("后台历史加载未启动：{error:#}"));
-            app.set_notice("历史后台加载未启动；输入 /diag 查看", NoticeLevel::Error);
-        } else if let Some(error) = initial_session_error {
-            app.set_notice(format!("本地会话恢复失败：{error}"), NoticeLevel::Error);
-        } else if let Some(error) = initial_room_error {
-            app.set_notice(format!("房间数据读取失败：{error}"), NoticeLevel::Error);
-        }
-        if let Some(warning) = automatic_restore_warning {
-            app.set_notice(warning, NoticeLevel::Error);
-        }
-        app.record_reading_config();
-        let (client_tx, mut client_rx) = mpsc::channel(512);
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let stream_room_id = room_id.clone();
-        let stream_stop = stop_rx.clone();
-        tokio::spawn(async move {
-            client.run(stream_room_id, client_tx, stream_stop).await;
-        });
-        let (ui_tx, mut ui_rx) = mpsc::channel(32);
-        let (meter_tx, mut meter_rx) = watch::channel(None);
-        let meter_obs = app.obs.clone();
-        let meter_stop = stop_rx.clone();
-        tokio::spawn(async move {
-            meter_obs
-                .monitor_microphone_levels(meter_tx, meter_stop)
-                .await;
-        });
-        let obs_client = app.obs.clone();
-        let obs_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                let status = obs_client
-                    .fetch_status()
-                    .await
-                    .map_err(|error| error.to_string());
-                if obs_tx.send(UiEvent::ObsStatus(status)).await.is_err() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        });
-        let room_client = app.client.clone();
-        let room_account = app.account.clone();
-        let room_tx = ui_tx.clone();
-        let refresh_room_id = room_id.clone();
-        let mut last_room = app.room.clone();
-        tokio::spawn(async move {
-            if let Some(room) = last_room.as_ref()
-                && !send_room_metrics(&room_account, &room_tx, room).await
-            {
-                return;
-            }
-
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                match room_client
-                    .room_snapshot_preserving(&refresh_room_id, last_room.as_ref())
-                    .await
-                {
-                    Ok(snapshot) => {
-                        last_room = Some(snapshot.clone());
-                        if room_tx.send(UiEvent::RoomSnapshot(snapshot)).await.is_err()
-                            || !send_room_metrics(
-                                &room_account,
-                                &room_tx,
-                                last_room
-                                    .as_ref()
-                                    .expect("successful room refresh is stored"),
-                            )
-                            .await
-                        {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        if room_tx
-                            .send(UiEvent::Notice {
-                                message: format!("房间数据刷新失败，继续显示上次成功值：{error}"),
-                                level: NoticeLevel::Error,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-        let mut tick = tokio::time::interval(Duration::from_millis(250));
-        let _bridge_server = if let Some(root) = &app.config.instance {
-            Some(bridge::wire::serve(root, app.bridge.clone()).await?)
-        } else {
-            None
-        };
-        let mut should_quit = false;
-        app.resume_pending = resume_decision == Some(true);
-        if !app.resume_pending && app.runner.settings.resume_on_start {
-            app.set_notice("AI已暂停 · /ai start 继续", NoticeLevel::Info);
-        }
-        let restore_scope = (app.bridge.session_id(), app.assistant_accounts.generation());
-        let mut restore_verified = !automatic_restore;
-        let mut restore_check = if automatic_restore {
-            let identity = app.assistant_accounts.send_identity(&app.account_status);
-            Some(tokio::spawn(async move {
-                tokio::time::timeout(Duration::from_secs(10), identity.status())
-                    .await
-                    .map_err(|_| "发送身份验证超时；本次未恢复自动发送".to_string())?
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            }))
-        } else {
-            None
-        };
-        if app.resume_pending {
-            app.set_notice(
-                "已记住自动发送；后台核对发送身份，Esc 可取消本次恢复",
-                NoticeLevel::Info,
-            );
-        }
-
-        let loop_result: Result<()> = async {
-        while !should_quit {
-            if !app.resume_pending && let Some(check) = restore_check.take() { check.abort(); }
-            app.advance_bridge(ui_tx.clone());
-            if app.resume_pending
-                && restore_verified
-                && !app.runner.history_loading()
-                && app.bridge.status()["available"] == true
-            {
-                app.resume_pending = false;
-                let result = app
-                    .restore_automatic(&restore_scope.0, restore_scope.1)
-                    .and_then(|()| app.runner.start(&app.bridge, false, false));
-                if let Err(error) = result {
-                    app.runner.pause(&app.bridge);
-                    app.set_notice(
-                        format!("助手未启用：{error}；请从 /ai 检查后重试"),
-                        NoticeLevel::Error,
-                    );
-                } else {
-                    app.set_notice(
-                        "身份核验通过，AI正在启动；/pause 暂停",
-                        NoticeLevel::Info,
-                    );
-                }
-            }
-            terminal.draw_app(&mut app)?;
-            tokio::select! {
-                result = async { restore_check.as_mut().expect("restore check is guarded").await }, if restore_check.is_some() => {
-                    restore_check = None;
-                    match result {
-                        Ok(Ok(())) => restore_verified = true,
-                        error => {
-                            app.resume_pending = false;
-                            app.set_notice(format!("自动发送未恢复：{}；请从 /ai 检查身份", match error {
-                                Ok(Err(message)) => message,
-                                Err(error) => error.to_string(),
-                                Ok(Ok(())) => unreachable!(),
-                            }), NoticeLevel::Error);
-                        }
-                    }
-                },
-                _ = &mut shutdown => { should_quit = true; },
-                _ = tick.tick() => {
-                    app.animation_tick = app.animation_tick.wrapping_add(1);
-                    app.expire_notice_at(Instant::now());
-                    app.advance_stop_at(Instant::now(), &ui_tx);
-                    app.advance_history_at(Instant::now());
-                },
-                event = events.next() => {
-                    let Some(event) = event else { break; };
-                    let event = event?;
-                    match event {
-                        Event::Key(key) => {
-                            if app.resume_pending && key.kind == crossterm::event::KeyEventKind::Press
-                                && (!automatic_restore || key.code == KeyCode::Esc || (key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL))) {
-                                app.resume_pending = false;
-                                if let Some(check) = restore_check.take() { check.abort(); }
-                                app.set_notice("已取消本次待启用；助手保持关闭", NoticeLevel::Info);
-                            }
-                            should_quit = app.handle_key(key, ui_tx.clone()).await?;
-                        }
-                        Event::Paste(text) => app.handle_paste(&text),
-                        Event::Mouse(mouse) => app.handle_mouse(mouse),
-                        _ => {}
-                    }
-                },
-                message = client_rx.recv() => if let Some(message) = message { app.handle_client_event(message); },
-                event = ui_rx.recv() => if let Some(event) = event { app.handle_ui_event(event); },
-                changed = meter_rx.changed() => if changed.is_ok() {
-                    app.microphone_level = *meter_rx.borrow_and_update();
-                },
-            }
-        }
-        Ok(())
-        }.await;
-        if let Some(check) = restore_check {
-            check.abort();
-        }
-        let routing_log = app
-            .runner
-            .record_routing(&app.bridge, &app.journal, &app.session, true);
-        app.runner.shutdown(&app.bridge).await;
-        app.bridge.end();
-        let _ = stop_tx.send(true);
-        loop_result?;
-        routing_log?;
-        app.session
-            .end(Utc::now(), DanmuSessionEndReason::Completed);
-        app.journal.end(&app.session)?;
-        Ok(())
-    }
-
-    fn handle_client_event(&mut self, event: BilibiliClientEvent) {
-        match event {
-            BilibiliClientEvent::Connected { room_id } => {
-                self.connection = format!("已连接 {room_id}");
-                self.last_realtime_at = Some(Local::now());
-            }
-            BilibiliClientEvent::Disconnected { reason } => {
-                self.connection = format!("实时连接中断 · {reason}");
-            }
-            BilibiliClientEvent::Heartbeat => {
-                self.last_realtime_at = Some(Local::now());
-            }
-            BilibiliClientEvent::Watched(value) => {
-                self.watched = Some(value);
-                self.last_realtime_at = Some(Local::now());
-            }
-            BilibiliClientEvent::Likes(value) => {
-                self.likes = Some(self.likes.map_or(value, |current| current.max(value)));
-                self.last_realtime_at = Some(Local::now());
-            }
-            BilibiliClientEvent::UnhandledCommand { command } => {
-                self.last_realtime_at = Some(Local::now());
-                if let Err(error) = self.journal.unhandled_command(&self.session, &command) {
-                    self.set_notice(
-                        format!("记录未处理的 B 站命令失败：{error}"),
-                        NoticeLevel::Error,
-                    );
-                }
-            }
-            BilibiliClientEvent::Error(error) => self.set_notice(error, NoticeLevel::Error),
-            BilibiliClientEvent::Danmu(event) => {
-                self.last_realtime_at = Some(Local::now());
-                if event.origin == DanmuEventOrigin::Live && event.kind == DanmuEventKind::Danmu {
-                    self.last_live_danmu_at = Some(Local::now());
-                }
-                self.ingest_event(event);
-            }
-        }
-    }
-
-    fn handle_ui_event(&mut self, event: UiEvent) {
-        match event {
-            UiEvent::SettingSaved { token, result } => self.finish_setting_save(token, result),
-            UiEvent::LocalEcho(text) => {
-                let mut event = DanmuEvent::new(DanmuEventKind::Danmu, text);
-                event.username = Some("本机发送".into());
-                event.author_id = Some("local-host".into());
-                self.ingest_event(event);
-            }
-
-            UiEvent::DeliveryAccepted => self.set_delivery_status(DeliveryStatus::AwaitingEcho),
-            UiEvent::DeliveryNotice(message) => self.set_delivery_notice(message),
-            UiEvent::ObsStopDone(result) => {
-                self.stop_flow = None;
-                self.handle_ui_event(operation_notice(
-                    result
-                        .map(|()| "OBS 已停止推流".to_owned())
-                        .map_err(anyhow::Error::msg),
-                ));
-            }
-            UiEvent::AssistantAccount(event) => {
-                let ready = matches!(&event, accounts::AccountEvent::Ready { .. });
-                let unavailable = matches!(&event, accounts::AccountEvent::Unavailable { .. });
-                if let Some(mut message) = self.assistant_accounts.apply_event(event) {
-                    if unavailable {
-                        self.resume_pending = false;
-                        self.bridge.identity_changed();
-                        self.runner.pause(&self.bridge);
-                        self.review_frame = None;
-                        if let Err(error) = self.assistant_accounts.forget_automatic() {
-                            message.push_str(&format!("；清除记住的授权失败：{error}"));
-                        }
-                    } else {
-                        self.login_qr = self.assistant_accounts.qr_lines().map(<[String]>::to_vec);
-                    }
-                    self.set_notice(
-                        message,
-                        if unavailable {
-                            NoticeLevel::Error
-                        } else {
-                            NoticeLevel::Info
-                        },
-                    );
-                    if ready {
-                        let result = self
-                            .assistant_accounts
-                            .complete_independent_ready(&self.account_status);
-                        match result {
-                            Ok(message) => {
-                                self.bridge.identity_changed();
-                                self.runner.pause(&self.bridge);
-                                self.review_frame = None;
-                                self.set_notice(message, NoticeLevel::Success);
-                            }
-                            Err(error) => self.set_notice(error.to_string(), NoticeLevel::Error),
-                        }
-                        // Keep the visited account page and its return stack.
-                    }
-                }
-            }
-            UiEvent::Notice { message, level } => {
-                self.set_notice(message, level);
-            }
-            UiEvent::LoginQr { token, lines } => {
-                if self
-                    .main_login
-                    .as_ref()
-                    .is_some_and(|login| login.token == token)
-                {
-                    self.login_qr = Some(lines);
-                    self.set_notice("请使用主账号扫码登录", NoticeLevel::Progress);
-                }
-            }
-            UiEvent::LoginDone {
-                token,
-                account,
-                status,
-            } => {
-                if self
-                    .main_login
-                    .as_ref()
-                    .is_some_and(|login| login.token == token)
-                {
-                    self.cancel_main_login();
-                    let saved = self
-                        .account
-                        .session_path()
-                        .ok_or_else(|| anyhow!("主账号凭据目录不可用"))
-                        .and_then(|path| account.persist_to(path.to_path_buf()));
-                    match saved {
-                        Ok(_) => {
-                            self.account_status = status;
-                            let forgotten = self.assistant_accounts.main_changed();
-                            self.bridge.identity_changed();
-                            self.runner.pause(&self.bridge);
-                            self.review_frame = None;
-                            match forgotten {
-                                Ok(()) => self.set_notice(
-                                    "主账号登录成功；助手仍暂停，未授权发送",
-                                    NoticeLevel::Success,
-                                ),
-                                Err(error) => self.set_notice(
-                                    format!("主账号已登录，助手已停发；清除旧授权失败：{error}"),
-                                    NoticeLevel::Error,
-                                ),
-                            }
-                        }
-                        Err(error) => self.set_notice(
-                            format!("登录态保存失败，原账号保留：{error}"),
-                            NoticeLevel::Error,
-                        ),
-                    }
-                }
-            }
-            UiEvent::LoginFailed { token, message } => {
-                if self
-                    .main_login
-                    .as_ref()
-                    .is_some_and(|login| login.token == token)
-                {
-                    self.cancel_main_login();
-                    self.set_notice(message, NoticeLevel::Error);
-                }
-            }
-            UiEvent::ObsStatus(result) => {
-                self.obs_checked_at = Some(Local::now());
-                match result {
-                    Ok(status) => {
-                        self.runner.observe_microphone(status.microphone);
-                        self.obs_status = Some(status);
-                        self.obs_error = None;
-                    }
-                    Err(error) => {
-                        self.runner.observe_microphone(MicrophoneState::Unknown);
-                        self.obs_status = None;
-                        self.obs_error = Some(error);
-                    }
-                }
-            }
-            UiEvent::RoomSnapshot(snapshot) => {
-                self.room = Some(snapshot);
-                self.room_updated_at = Some(Local::now());
-                self.sync_assistant_room();
-            }
-            UiEvent::BroadcasterProfile {
-                room_id,
-                user_id,
-                result,
-            } => {
-                if self
-                    .room
-                    .as_ref()
-                    .is_some_and(|room| room.room_id == room_id && room.broadcaster_id == user_id)
-                {
-                    self.profile.pending = false;
-                    self.profile.checked_at = Some(Instant::now());
-                    match result {
-                        Ok(value) => {
-                            self.profile.value = value;
-                            self.profile.error = None;
-                        }
-                        Err(error) => {
-                            self.profile.value = None;
-                            self.profile.error = Some(error);
-                        }
-                    }
-                    self.sync_assistant_room();
-                }
-            }
-            UiEvent::OnlineViewers(result) => match result {
-                Ok(viewers) => self.online_viewers = viewers,
-                Err(error) => {
-                    self.set_notice(
-                        format!("在线人数刷新失败，继续显示上次成功值：{error}"),
-                        NoticeLevel::Error,
-                    );
-                }
-            },
-            UiEvent::Likes(result) => match result {
-                Ok(Some(value)) => {
-                    self.likes = Some(self.likes.map_or(value, |current| current.max(value)));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    self.set_notice(
-                        format!("点赞数刷新失败，继续显示上次成功值：{error}"),
-                        NoticeLevel::Error,
-                    );
-                }
-            },
-            UiEvent::DeliveryStarted {
-                delivery,
-                confirmation,
-                registered,
-            } => {
-                while self.pending_deliveries.len() >= 32 {
-                    self.pending_deliveries.pop_front();
-                }
-                self.pending_deliveries.push_back(ActiveDelivery {
-                    delivery,
-                    confirmation: Some(confirmation),
-                });
-                let _ = registered.send(());
-                self.set_delivery_status(DeliveryStatus::Sending);
-            }
-            UiEvent::AssistantDelivery { session_id, record } => {
-                if let Err(error) = self.journal.reply_record(&session_id, &record) {
-                    self.runner.pause(&self.bridge);
-                    self.set_notice(
-                        format!("发送结果归档失败，助手已暂停；真实发送结果不变且不重发：{error}"),
-                        NoticeLevel::Error,
-                    );
-                }
-            }
-            UiEvent::DeliveryHistory { events } => {
-                for event in events {
-                    self.ingest_event(event);
-                }
-                if !self.pending_deliveries.is_empty() {
-                    self.set_delivery_status(DeliveryStatus::Verifying);
-                }
-            }
-            UiEvent::DeliveryEchoMissing { delivery_ids } => {
-                if self
-                    .pending_deliveries
-                    .iter()
-                    .any(|active| delivery_ids.contains(&active.delivery.id))
-                {
-                    self.set_delivery_status(DeliveryStatus::Uncertain);
-                    self.set_delivery_notice("未确认送达；不自动重发，详情见助手");
-                }
-            }
-            UiEvent::DeliveryExpired { delivery_id } => {
-                self.clear_delivery(&delivery_id);
-            }
-            UiEvent::DeliveryTimedOut { delivery_ids } => {
-                let contents = delivery_ids
-                    .iter()
-                    .filter_map(|delivery_id| {
-                        self.pending_deliveries
-                            .iter()
-                            .find(|active| active.delivery.id == *delivery_id)
-                            .map(|active| active.delivery.content.clone())
-                    })
-                    .collect::<Vec<_>>();
-                for delivery_id in delivery_ids {
-                    self.clear_delivery(&delivery_id);
-                }
-                self.set_delivery_status(DeliveryStatus::Uncertain);
-                self.set_delivery_notice(format!(
-                    "平台接受或回流未确认；本次剩余部分取消，可继续输入新消息，不自动重发。{}",
-                    contents
-                        .iter()
-                        .map(|content| format!("「{content}」"))
-                        .collect::<Vec<_>>()
-                        .join(" ｜ ")
-                ));
-            }
-            UiEvent::DeliveryRejected { content, message } => {
-                self.set_delivery_status(DeliveryStatus::Failed);
-                self.set_delivery_notice(format!("{message}；内容：「{content}」"));
-            }
-            UiEvent::DeliveryCompleted => {
-                if self.notice_is_delivery {
-                    self.notice.clear();
-                    self.notice_deadline = None;
-                    self.notice_is_delivery = false;
-                }
-                if self.pending_deliveries.is_empty() {
-                    self.set_delivery_status(DeliveryStatus::Delivered);
-                } else {
-                    self.set_delivery_status(DeliveryStatus::AwaitingEcho);
-                }
-            }
-        }
-    }
-
-    fn ingest_event(&mut self, mut event: DanmuEvent) {
-        if event.kind == DanmuEventKind::RoomStatus
-            && event.origin == DanmuEventOrigin::Live
-            && let Some(room) = self.room.as_mut()
-        {
-            room.live_status = RoomLiveStatus::Offline;
-            self.bridge.end();
-        }
-        let live_arrival =
-            event.origin == DanmuEventOrigin::Live && event.kind == DanmuEventKind::Danmu;
-        let confirmed = self
-            .pending_deliveries
-            .iter()
-            .position(|active| active.delivery.matches(&event));
-        self.confirmed_deliveries
-            .retain(|delivery| event.timestamp <= delivery.submitted_at + DELIVERY_ECHO_WINDOW);
-        if confirmed.is_none()
-            && self
-                .confirmed_deliveries
-                .iter()
-                .any(|delivery| delivery.matches(&event))
-        {
-            return;
-        }
-        if let Some(index) = confirmed {
-            let mut active = self
-                .pending_deliveries
-                .remove(index)
-                .expect("已检查待确认弹幕");
-            active.delivery.canonicalize(&mut event);
-            self.confirmed_deliveries.push_back(active.delivery.clone());
-            while self.confirmed_deliveries.len() > 32 {
-                self.confirmed_deliveries.pop_front();
-            }
-            if let Some(confirmation) = active.confirmation.take() {
-                let _ = confirmation.send(());
-            }
-            // Echo alone is insufficient: the sending service still checks HTTP acceptance.
-            self.set_delivery_status(DeliveryStatus::Verifying);
-        }
-
-        if reconcile_cross_origin_event(&mut self.session.recent_events, &event) {
-            return;
-        }
-        let is_new_logical_event = !self
-            .session
-            .recent_events
-            .iter()
-            .any(|existing| existing.id == event.id);
-        let selected_anchor = self
-            .selection_active
-            .then(|| self.session.recent_events.get(self.selected))
-            .flatten()
-            .map(|event| event.id.clone());
-        let scroll_anchor = (self.scroll_offset > 0)
-            .then(|| self.session.recent_events.get(self.scroll_offset))
-            .flatten()
-            .map(|event| event.id.clone());
-        if self.session.ingest(event.clone()) {
-            if is_new_logical_event {
-                self.bridge.ingest(event.clone());
-                if let Err(error) = self.runner.record_history(&self.session.room_id, &event) {
-                    self.set_notice(
-                        format!("历史索引未更新；原件仍单独保存：{error}"),
-                        NoticeLevel::Error,
-                    );
-                }
-            }
-            if let Err(error) = self.journal.event(&self.session, &event) {
-                self.set_notice(
-                    format!("直播原始归档或工作区副本未完整保存：{error}"),
-                    NoticeLevel::Error,
-                );
-            }
-            self.activity.push(&event, Instant::now(), Utc::now());
-            self.selected = selected_anchor
-                .as_deref()
-                .and_then(|id| {
-                    self.session
-                        .recent_events
-                        .iter()
-                        .position(|event| event.id == id)
-                })
-                .unwrap_or(0);
-            self.scroll_offset = scroll_anchor
-                .as_deref()
-                .and_then(|id| {
-                    self.session
-                        .recent_events
-                        .iter()
-                        .position(|event| event.id == id)
-                })
-                .unwrap_or(0);
-            if is_new_logical_event
-                && live_arrival
-                && (self.selection_active || self.scroll_offset > 0)
-            {
-                self.unread_live_count = self.unread_live_count.saturating_add(1);
-            } else if !self.selection_active && self.scroll_offset == 0 {
-                self.unread_live_count = 0;
-            }
-        }
-    }
-
-    fn clear_delivery(&mut self, delivery_id: &str) -> bool {
-        let Some(index) = self
-            .pending_deliveries
-            .iter()
-            .position(|active| active.delivery.id == delivery_id)
-        else {
-            return false;
-        };
-        self.pending_deliveries.remove(index);
-        true
-    }
-
-    fn set_notice(&mut self, message: impl Into<String>, level: NoticeLevel) {
-        self.set_notice_at(message, level, Instant::now());
-    }
-
-    fn set_delivery_notice(&mut self, message: impl Into<String>) {
-        self.notice = message.into();
-        self.notice_deadline = Some(Instant::now() + DELIVERY_NOTICE_LIFETIME);
-        self.notice_is_delivery = true;
-        self.notice_level = NoticeLevel::Warning;
-    }
-
-    fn set_notice_at(&mut self, message: impl Into<String>, level: NoticeLevel, now: Instant) {
-        self.notice = message.into();
-        self.notice_deadline = level.lifetime().map(|lifetime| now + lifetime);
-        self.notice_is_delivery = false;
-        self.notice_level = level;
-    }
-    fn set_delivery_status(&mut self, status: DeliveryStatus) {
-        self.set_delivery_status_at(status, Instant::now());
-    }
-
-    fn set_delivery_status_at(&mut self, status: DeliveryStatus, now: Instant) {
-        self.delivery_status = status;
-        self.delivery_status_deadline = match status {
-            DeliveryStatus::Delivered => Some(now + Duration::from_secs(3)),
-            DeliveryStatus::Uncertain | DeliveryStatus::Failed => {
-                Some(now + DELIVERY_NOTICE_LIFETIME)
-            }
-            _ => None,
-        };
-    }
-
-    fn expire_notice_at(&mut self, now: Instant) {
-        self.activity.advance(now);
-        if self.notice_deadline.is_some_and(|deadline| now >= deadline) {
-            self.notice.clear();
-            self.notice_deadline = None;
-        }
-        if self
-            .delivery_status_deadline
-            .is_some_and(|deadline| now >= deadline)
-        {
-            self.delivery_status = DeliveryStatus::Idle;
-            self.delivery_status_deadline = None;
-        }
-    }
-
-    fn is_browsing_history(&self) -> bool {
+    pub(crate) fn is_browsing_history(&self) -> bool {
         self.selection_active || self.scroll_offset > 0
     }
 
-    fn advance_history_at(&mut self, now: Instant) {
+    pub(crate) fn advance_history_at(&mut self, now: Instant) {
         // Modal operations must not silently discard a reply target underneath them.
         if self.stop_flow.is_some()
             || self.login_qr.is_some()
-            || self.secret_mode
+            || self.secret_target.is_some()
             || self.candidate_edit.is_some()
             || self.assistant_panel.is_some()
             || self.help.is_some()
@@ -2161,28 +823,40 @@ impl TerminalApp {
         }
     }
 
-    fn return_to_live(&mut self) {
+    pub(crate) fn return_to_live(&mut self) {
         self.selection_active = false;
         self.selected = 0;
         self.scroll_offset = 0;
         self.unread_live_count = 0;
     }
 
-    fn handle_mouse(&mut self, event: MouseEvent) {
+    pub(crate) fn handle_mouse(&mut self, event: MouseEvent) -> bool {
+        if self.stop_flow.is_some()
+            || self.login_qr.is_some()
+            || self.secret_target.is_some()
+            || self.candidate_edit.is_some()
+            || self.main_login.is_some()
+            || self.assistant_accounts.login_pending()
+        {
+            return false;
+        }
+        if matches!(
+            event.kind,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        ) {
+            if self.help.is_some() || self.command_search_draft.is_some() {
+                return false;
+            }
+            self.last_user_activity = Instant::now();
+            return self.assistant_click(event);
+        }
         if !matches!(
             event.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         ) {
-            return;
+            return false;
         }
         self.last_user_activity = Instant::now();
-        if self.stop_flow.is_some()
-            || self.login_qr.is_some()
-            || self.secret_mode
-            || self.candidate_edit.is_some()
-        {
-            return;
-        }
         if let Some(help) = self.help.as_mut() {
             match event.kind {
                 MouseEventKind::ScrollUp => help.scroll = help.scroll.saturating_sub(3),
@@ -2205,9 +879,10 @@ impl TerminalApp {
         } else {
             self.scroll_history(event.kind == MouseEventKind::ScrollUp);
         }
+        false
     }
 
-    fn open_commands(&mut self) {
+    pub(crate) fn open_commands(&mut self) {
         if self.command_search_draft.is_none() {
             self.command_search_draft = Some(std::mem::take(&mut self.input));
         }
@@ -2215,7 +890,7 @@ impl TerminalApp {
         self.clear_review_surface();
     }
 
-    fn scroll_history(&mut self, older: bool) {
+    pub(crate) fn scroll_history(&mut self, older: bool) {
         let mut candidates = self
             .session
             .recent_events
@@ -2252,7 +927,7 @@ impl TerminalApp {
 
     fn handle_slash_key(&mut self, key: &KeyEvent) -> SlashKeyAction {
         let searching = self.command_search_draft.is_some();
-        if self.secret_mode || (!searching && !self.input.starts_with('/')) {
+        if self.secret_target.is_some() || (!searching && !self.input.starts_with('/')) {
             return SlashKeyAction::Ignored;
         }
 
@@ -2333,7 +1008,6 @@ impl TerminalApp {
     fn command_suggestions(&self) -> Vec<&'static CommandSpec> {
         let include_ai = self.runner.has_saved_settings()
             || self.runner.running
-            || self.runner.report.connected
             || self.bridge.candidate_count() != 0;
         if self.command_search_draft.is_some() || self.input.starts_with('/') {
             command_suggestions(&self.input, include_ai)
@@ -2342,12 +1016,12 @@ impl TerminalApp {
         }
     }
 
-    fn close_command_search(&mut self) {
+    pub(crate) fn close_command_search(&mut self) {
         self.input = self.command_search_draft.take().unwrap_or_default();
         self.slash_selection = 0;
     }
 
-    fn handle_stop_key(&mut self, key: KeyCode, now: Instant) {
+    pub(crate) fn handle_stop_key(&mut self, key: KeyCode, now: Instant) {
         match self.stop_flow {
             Some(StopFlow::Confirm { stop_selected }) => match key {
                 KeyCode::Up | KeyCode::Left => {
@@ -2361,9 +1035,12 @@ impl TerminalApp {
                     });
                 }
                 KeyCode::Enter if stop_selected => {
-                    self.stop_flow = Some(StopFlow::Countdown {
-                        deadline: now + Duration::from_secs(3),
-                    });
+                    if let Some(token) = self.stop_confirmation_token() {
+                        let operation_id = self.operation_token();
+                        if let Err(error) = self.confirm_stop_request(token, now, operation_id) {
+                            self.set_notice(error.to_string(), NoticeLevel::Error);
+                        }
+                    }
                 }
                 KeyCode::Enter | KeyCode::Esc => self.cancel_stop(),
                 _ => {}
@@ -2373,26 +1050,28 @@ impl TerminalApp {
         }
     }
 
-    fn cancel_stop(&mut self) {
-        self.stop_flow = None;
+    pub(crate) fn cancel_stop(&mut self) {
+        self.cancel_stop_request();
         self.set_notice("已取消停止推流", NoticeLevel::Info);
     }
 
-    fn advance_stop_at(&mut self, now: Instant, tx: &mpsc::Sender<UiEvent>) {
-        if !matches!(self.stop_flow, Some(StopFlow::Countdown { deadline }) if now >= deadline) {
-            return;
+    pub(crate) async fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        tx: mpsc::Sender<CoreEvent>,
+    ) -> Result<bool> {
+        self.ui_tx = Some(tx.clone());
+        if key.kind == crossterm::event::KeyEventKind::Press
+            && key.code == KeyCode::Esc
+            && self.chatgpt_operation.is_some()
+        {
+            self.cancel_chatgpt_operation();
+            self.set_notice(
+                "已取消本机 ChatGPT 操作；不声称远端请求已取消",
+                NoticeLevel::Info,
+            );
+            return Ok(false);
         }
-        // Leave Countdown before spawning: later ticks must never send a second stop.
-        self.stop_flow = Some(StopFlow::Stopping);
-        let obs = self.obs.clone();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let result = obs.stop_stream().await.map_err(|error| error.to_string());
-            let _ = tx.send(UiEvent::ObsStopDone(result)).await;
-        });
-    }
-
-    async fn handle_key(&mut self, key: KeyEvent, tx: mpsc::Sender<UiEvent>) -> Result<bool> {
         if key.kind == crossterm::event::KeyEventKind::Press
             && self.stop_flow.is_some()
             && !(key.modifiers.contains(KeyModifiers::CONTROL)
@@ -2402,6 +1081,18 @@ impl TerminalApp {
             return Ok(false);
         }
         if key.kind == crossterm::event::KeyEventKind::Press {
+            if self.secret_target.is_some()
+                && matches!(
+                    key.code,
+                    KeyCode::Tab
+                        | KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                )
+            {
+                return Ok(false);
+            }
             if key.code == KeyCode::Esc && self.main_login.is_some() {
                 self.cancel_main_login();
                 self.set_notice("已取消主账号扫码，原账号未更改", NoticeLevel::Info);
@@ -2431,7 +1122,7 @@ impl TerminalApp {
             }
             if self.command_search_draft.is_none()
                 && self.candidate_edit.is_none()
-                && !self.secret_mode
+                && self.secret_target.is_none()
                 && self.assistant_key(key, tx.clone()).await
             {
                 return Ok(self.quit_requested);
@@ -2439,6 +1130,7 @@ impl TerminalApp {
             if key.code == KeyCode::Char('g')
                 && key.modifiers == KeyModifiers::CONTROL
                 && self.command_search_draft.is_none()
+                && self.secret_target.is_none()
             {
                 if let Err(error) = self.open_assistant() {
                     self.set_notice(error.to_string(), NoticeLevel::Error);
@@ -2457,7 +1149,7 @@ impl TerminalApp {
             return Ok(true);
         }
         if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT {
-            if self.secret_mode
+            if self.secret_target.is_some()
                 || self.stop_flow.is_some()
                 || self.login_qr.is_some()
                 || self.command_search_draft.is_some()
@@ -2472,7 +1164,7 @@ impl TerminalApp {
             return Ok(false);
         }
         if key.code == KeyCode::Char('o') && key.modifiers == KeyModifiers::CONTROL {
-            if self.candidate_edit.is_none() && !self.secret_mode {
+            if self.candidate_edit.is_none() && self.secret_target.is_none() {
                 if self.command_search_draft.is_some() {
                     self.close_command_search();
                 } else {
@@ -2514,7 +1206,7 @@ impl TerminalApp {
             || key.modifiers.contains(KeyModifiers::SHIFT))
             && matches!(key.code, KeyCode::Up | KeyCode::Down);
         if self.candidate_edit.is_none()
-            && !self.secret_mode
+            && self.secret_target.is_none()
             && self.command_search_draft.is_none()
             && self.selection_active
             && !(self.input.starts_with('/')
@@ -2561,8 +1253,8 @@ impl TerminalApp {
                 if self.login_qr.take().is_some() {
                     return Ok(false);
                 }
-                if self.secret_mode {
-                    self.secret_mode = false;
+                if self.secret_target.is_some() {
+                    self.secret_target = None;
                     self.input = self.secret_draft.take().unwrap_or_default();
                     return Ok(false);
                 }
@@ -2594,13 +1286,16 @@ impl TerminalApp {
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.move_selection(false)
             }
-            KeyCode::Up | KeyCode::Down if key.modifiers.is_empty() && !self.secret_mode => {
+            KeyCode::Up | KeyCode::Down
+                if key.modifiers.is_empty() && self.secret_target.is_none() =>
+            {
                 self.scroll_history(key.code == KeyCode::Up);
             }
             KeyCode::Home => self.input.move_to_start(),
             KeyCode::End
                 if self.candidate_edit.is_none()
                     && self.command_search_draft.is_none()
+                    && self.secret_target.is_none()
                     && (self.selection_active || self.scroll_offset > 0) =>
             {
                 self.return_to_live()
@@ -2623,7 +1318,10 @@ impl TerminalApp {
                 self.slash_selection = 0;
             }
             KeyCode::Enter => {
-                if !self.secret_mode && self.selection_active && !self.input.starts_with('/') {
+                if self.secret_target.is_none()
+                    && self.selection_active
+                    && !self.input.starts_with('/')
+                {
                     let username = self
                         .session
                         .recent_events
@@ -2645,9 +1343,14 @@ impl TerminalApp {
                         );
                     }
                 } else {
-                    let command = sanitize_input(self.input.take());
-                    if !command.is_empty() {
-                        self.submit(command, tx).await?;
+                    if self.secret_target.is_some() {
+                        let secret = self.input.to_string();
+                        self.submit(secret, tx).await?;
+                    } else {
+                        let command = sanitize_input(self.input.take());
+                        if !command.is_empty() {
+                            self.submit(command, tx).await?;
+                        }
                     }
                 }
             }
@@ -2663,15 +1366,28 @@ impl TerminalApp {
         Ok(self.quit_requested)
     }
 
-    async fn submit(&mut self, input: String, tx: mpsc::Sender<UiEvent>) -> Result<()> {
-        if self.secret_mode {
-            if let Err(error) = self.obs.set_password(&input).await {
-                self.input.replace(input);
-                self.set_notice(format!("保存失败：{error}（内容保留）"), NoticeLevel::Error);
-            } else {
-                self.secret_mode = false;
-                self.input = self.secret_draft.take().unwrap_or_default();
-                self.set_notice("已保存", NoticeLevel::Success);
+    pub(crate) async fn submit(
+        &mut self,
+        input: String,
+        tx: mpsc::Sender<CoreEvent>,
+    ) -> Result<()> {
+        if let Some(target) = self.secret_target {
+            let result = match target {
+                SecretTarget::ObsPassword => self.obs.set_password(&input).await,
+                SecretTarget::AssistantApiKey => self
+                    .check_assistant_connection_change()
+                    .and_then(|()| self.runner.save_api_key(&input, &self.bridge)),
+            };
+            match result {
+                Err(error) => {
+                    self.input.replace(input);
+                    self.set_notice(format!("保存失败：{error}（内容保留）"), NoticeLevel::Error);
+                }
+                Ok(()) => {
+                    self.secret_target = None;
+                    self.input = self.secret_draft.take().unwrap_or_default();
+                    self.set_notice("已保存", NoticeLevel::Success);
+                }
             }
             return Ok(());
         }
@@ -2686,7 +1402,9 @@ impl TerminalApp {
         Ok(())
     }
 
-    async fn command(&mut self, raw: &str, tx: mpsc::Sender<UiEvent>) -> Result<()> {
+    pub(crate) async fn command(&mut self, raw: &str, tx: mpsc::Sender<CoreEvent>) -> Result<()> {
+        self.ui_tx = Some(tx.clone());
+        anyhow::ensure!(self.secret_target.is_none(), "隐藏输入中不能执行公开命令");
         let action: Result<()> = async {
             let parts = raw.split_whitespace().collect::<Vec<_>>();
             if self.local_transport.is_some()
@@ -2704,9 +1422,6 @@ impl TerminalApp {
                     "/ai",
                     section @ ("model" | "replies" | "materials" | "advanced"),
                 ] => self.open_ai_section(section)?,
-                ["/ai", "workspace", ..] => {
-                    self.edit_workspace(command_value(raw, 2), tx)?;
-                }
                 ["/settings", "obs"] => self.open_obs_settings().await?,
                 ["/room", setting @ ("title" | "cover"), ..] => {
                     let field = if *setting == "title" {
@@ -2737,7 +1452,7 @@ impl TerminalApp {
                 ["/commands"] => self.open_commands(),
                 ["/more"] => self.open_more()?,
                 ["/ai", "start"] => {
-                    self.start_assistant(false, false)?;
+                    self.start_assistant(false)?;
                 }
                 ["/ai", "auto", "on"] => {
                     self.set_automatic_permission(true)?;
@@ -2747,8 +1462,9 @@ impl TerminalApp {
                 }
                 ["/ai", "range"] => self.open_ai_range()?,
                 ["/ai", "topic"] => self.open_ai_topic()?,
-                ["/ai", "visible"] => self.start_assistant(true, true)?,
-                ["/ai", "reset"] => self.start_assistant(false, true)?,
+                ["/ai", "visible"] => self.start_assistant(true)?,
+                ["/ai", "key"] => self.begin_assistant_api_key()?,
+                ["/ai", "key", ..] => anyhow::bail!("/ai key 不接收参数；请在隐藏输入中填写"),
                 ["/ai", "stop"] => self.stop_assistant(),
                 ["/diag", "repair"] => {
                     self.runner.repair_history(&self.journal)?;
@@ -2789,22 +1505,10 @@ impl TerminalApp {
                 ["/find", rest @ ..] => self.search_archive(&rest.join(" ")),
                 ["/obs"] | ["/obs", "status"] | ["/obs", "connect"] => {
                     self.set_notice("正在检查 OBS 连接…", NoticeLevel::Progress);
-                    let obs = self.obs.clone();
-                    tokio::spawn(async move {
-                        let result = obs.fetch_status().await.map(|status| {
-                            format!(
-                                "OBS 场景：{}；推流：{:?}；麦克风：{:?}{}",
-                                status.current_scene,
-                                status.stream,
-                                status.microphone,
-                                status
-                                    .compatibility_warning
-                                    .map(|value| format!("；{value}"))
-                                    .unwrap_or_default()
-                            )
-                        });
-                        let _ = tx.send(operation_notice(result)).await;
-                    });
+                    self.execute_command(crate::runtime::RuntimeCommand::Obs(
+                        crate::runtime::ObsCommand::Connect,
+                    ))
+                    .await?;
                 }
                 ["/mute"] | ["/unmute"] => {
                     self.set_notice(
@@ -2816,21 +1520,13 @@ impl TerminalApp {
                         NoticeLevel::Progress,
                     );
                     let muted = parts[0] == "/mute";
-                    let obs = self.obs.clone();
-                    tokio::spawn(async move {
-                        let result = obs.set_microphone_muted(muted).await.map(|_| {
-                            if muted {
-                                "麦克风已静音"
-                            } else {
-                                "麦克风已取消静音"
-                            }
-                            .to_string()
-                        });
-                        let _ = tx.send(operation_notice(result)).await;
-                    });
+                    self.execute_command(crate::runtime::RuntimeCommand::Obs(
+                        crate::runtime::ObsCommand::SetMuted { muted },
+                    ))
+                    .await?;
                 }
                 ["/obs", "config", "password"] => {
-                    self.secret_mode = true;
+                    self.secret_target = Some(SecretTarget::ObsPassword);
                     self.secret_draft = Some(std::mem::take(&mut self.input));
                     self.set_notice(
                         "请输入 OBS WebSocket 密码并按 Enter；输入不会显示或进入历史",
@@ -2839,20 +1535,17 @@ impl TerminalApp {
                 }
                 ["/obs", "start"] => {
                     self.set_notice("正在启动 OBS 推流…", NoticeLevel::Progress);
-                    let obs = self.obs.clone();
-                    tokio::spawn(async move {
-                        let result = obs
-                            .start_stream()
-                            .await
-                            .map(|_| "OBS 已开始推流".to_string());
-                        let _ = tx.send(operation_notice(result)).await;
-                    });
+                    self.execute_command(crate::runtime::RuntimeCommand::Obs(
+                        crate::runtime::ObsCommand::StartStream,
+                    ))
+                    .await?;
                 }
                 ["/obs", "stop"] => {
                     if self.stop_flow.is_none() {
-                        self.stop_flow = Some(StopFlow::Confirm {
-                            stop_selected: false,
-                        });
+                        self.execute_command(crate::runtime::RuntimeCommand::Obs(
+                            crate::runtime::ObsCommand::RequestStop,
+                        ))
+                        .await?;
                     }
                 }
                 _ => self.set_notice(
@@ -2872,65 +1565,11 @@ impl TerminalApp {
         Ok(())
     }
 
-    fn cancel_main_login(&mut self) {
-        if self.main_login.take().is_some() {
-            self.login_qr = None;
-        }
-    }
-
-    fn start_login(&mut self, tx: mpsc::Sender<UiEvent>) {
-        self.cancel_main_login();
-        self.assistant_accounts.cancel_login();
-        self.bridge.identity_changed();
-        self.runner.pause(&self.bridge);
-        self.review_frame = None;
-        self.login_qr = None;
-        let token = uuid::Uuid::new_v4();
-        let account = self.account.staged();
-        let task = tokio::spawn(async move {
-            let result: Result<AccountStatus> = async {
-                let challenge =
-                    tokio::time::timeout(Duration::from_secs(10), account.login_challenge())
-                        .await??;
-                let lines = compact_qr_lines(challenge.url.as_str())?;
-                tx.send(UiEvent::LoginQr { token, lines }).await?;
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-                loop {
-                    anyhow::ensure!(
-                        tokio::time::Instant::now() < deadline,
-                        "登录二维码已过期，请重新扫码"
-                    );
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    match tokio::time::timeout(
-                        Duration::from_secs(10),
-                        account.poll_login(&challenge.key),
-                    )
-                    .await??
-                    {
-                        LoginPoll::Waiting | LoginPoll::Scanned => {}
-                        LoginPoll::Expired => return Err(anyhow!("登录二维码已过期，请重新扫码")),
-                        LoginPoll::SignedIn(status) => return Ok(status),
-                    }
-                }
-            }
-            .await;
-            let event = match result {
-                Ok(status) => UiEvent::LoginDone {
-                    token,
-                    account,
-                    status,
-                },
-                Err(error) => UiEvent::LoginFailed {
-                    token,
-                    message: format!("主账号登录失败，原账号未更改：{error}"),
-                },
-            };
-            let _ = tx.send(event).await;
-        });
-        self.main_login = Some(MainLogin { token, task });
-    }
-
-    fn with_selected(&mut self, operation: impl FnOnce(&mut DanmuSession, &str), notice: &str) {
+    pub(crate) fn with_selected(
+        &mut self,
+        operation: impl FnOnce(&mut DanmuSession, &str),
+        notice: &str,
+    ) {
         if let Some(id) = self
             .session
             .recent_events
@@ -2944,7 +1583,7 @@ impl TerminalApp {
         }
     }
 
-    fn move_selection(&mut self, older: bool) {
+    pub(crate) fn move_selection(&mut self, older: bool) {
         let candidates = self
             .session
             .recent_events
@@ -2982,7 +1621,7 @@ impl TerminalApp {
         self.selected = candidates[next];
     }
 
-    fn search_archive(&mut self, query: &str) {
+    pub(crate) fn search_archive(&mut self, query: &str) {
         match self.journal.search(query) {
             Ok(results) => {
                 let message = if results.is_empty() {
@@ -3009,12 +1648,12 @@ impl TerminalApp {
         }
     }
 
-    fn insert(&mut self, character: char) {
+    pub(crate) fn insert(&mut self, character: char) {
         let mut buffer = [0; 4];
         self.insert_text(character.encode_utf8(&mut buffer));
     }
 
-    fn handle_help_key(&mut self, key: KeyCode) -> bool {
+    pub(crate) fn handle_help_key(&mut self, key: KeyCode) -> bool {
         let Some(help) = self.help.as_mut() else {
             return false;
         };
@@ -3036,7 +1675,17 @@ impl TerminalApp {
         true
     }
 
-    fn handle_paste(&mut self, text: &str) {
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        if self.secret_target.is_some() {
+            if text.len() > 4096 || self.input.len().saturating_add(text.len()) > 4096 {
+                self.set_notice("隐藏输入超过4096字节，未插入", NoticeLevel::Error);
+                return;
+            }
+            self.last_user_activity = Instant::now();
+            self.input.insert_paste(text, false);
+            self.slash_selection = 0;
+            return;
+        }
         if self.help.is_some()
             || self.stop_flow.is_some()
             || self.login_qr.is_some()
@@ -3046,13 +1695,14 @@ impl TerminalApp {
             return;
         }
         if self.assistant_panel.is_some()
+            && self.secret_target.is_none()
             && self.candidate_edit.is_none()
             && self.command_search_draft.is_none()
         {
             self.paste_assistant(text);
             return;
         }
-        if !self.secret_mode
+        if self.secret_target.is_none()
             && self.candidate_edit.is_none()
             && self.command_search_draft.is_none()
             && self.selection_active
@@ -3069,18 +1719,22 @@ impl TerminalApp {
         self.slash_selection = 0;
     }
 
-    fn insert_text(&mut self, text: &str) {
+    pub(crate) fn insert_text(&mut self, text: &str) {
+        if self.secret_target.is_some() && self.input.len().saturating_add(text.len()) > 4096 {
+            self.set_notice("隐藏输入超过4096字节，未插入", NoticeLevel::Error);
+            return;
+        }
         self.input.insert_text(text);
         self.slash_selection = 0;
     }
 }
 
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-    mouse_capture: bool,
+    pub(crate) terminal: Terminal<CrosstermBackend<Stdout>>,
+    pub(crate) mouse_capture: bool,
 }
 impl TerminalGuard {
-    fn enter() -> Result<Self> {
+    pub(crate) fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
@@ -3104,7 +1758,7 @@ impl TerminalGuard {
         })
     }
 
-    fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
+    pub(crate) fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
         if self.mouse_capture == enabled {
             return Ok(());
         }
@@ -3114,23 +1768,6 @@ impl TerminalGuard {
             execute!(self.terminal.backend_mut(), DisableMouseCapture)?;
         }
         self.mouse_capture = enabled;
-        Ok(())
-    }
-
-    pub(super) fn draw_app(&mut self, app: &mut TerminalApp) -> Result<()> {
-        // Main-screen dragging belongs to the terminal. Alternate-screen wheels
-        // arrive as arrow keys; overlays retain their existing mouse handling.
-        self.set_mouse_capture(
-            app.stop_flow.is_some()
-                || app.login_qr.is_some()
-                || app.secret_mode
-                || app.candidate_edit.is_some()
-                || app.help.is_some()
-                || app.assistant_panel.is_some()
-                || app.command_search_draft.is_some()
-                || app.input.starts_with('/'),
-        )?;
-        self.terminal.draw(|frame| draw(frame, app))?;
         Ok(())
     }
 }
@@ -3146,25 +1783,6 @@ impl Drop for TerminalGuard {
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
     }
-}
-fn reconcile_cross_origin_event(events: &mut [DanmuEvent], incoming: &DanmuEvent) -> bool {
-    let Some(existing) = events
-        .iter_mut()
-        .find(|event| cross_origin_duplicate(event, incoming))
-    else {
-        return false;
-    };
-    if incoming.origin == DanmuEventOrigin::History {
-        existing.username = incoming.username.clone();
-        existing.author_id = incoming.author_id.clone();
-        existing.platform_event_id = incoming.platform_event_id.clone();
-    } else if existing.emotes.is_empty() && !incoming.emotes.is_empty() {
-        existing.emotes = incoming.emotes.clone();
-    }
-    if incoming.reply_to.is_some() {
-        existing.reply_to.clone_from(&incoming.reply_to);
-    }
-    true
 }
 
 fn display_events(events: &[DanmuEvent]) -> impl Iterator<Item = &DanmuEvent> {
@@ -3364,7 +1982,7 @@ fn draw_startup(
     );
 }
 
-fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
+fn draw(frame: &mut ratatui::Frame, app: &mut RuntimeState) {
     app.clear_review_surface();
     let palette = app.config.palette;
     let area = frame.area();
@@ -3413,12 +2031,12 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TerminalApp) {
     draw_overlays(frame, area, app, palette);
 }
 
-fn draw_overlays(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, palette: Palette) {
+fn draw_overlays(frame: &mut ratatui::Frame, area: Rect, app: &mut RuntimeState, palette: Palette) {
     if app.stop_flow.is_some() {
         draw_stop_flow(frame, area, app, palette);
     } else if let Some(lines) = &app.login_qr {
         draw_qr(frame, area, lines, palette);
-    } else if app.secret_mode || app.candidate_edit.is_some() {
+    } else if app.secret_target.is_some() || app.candidate_edit.is_some() {
         // The focused input already carries Enter/Esc instructions.
     } else if app
         .assistant_panel
@@ -3435,7 +2053,12 @@ fn draw_overlays(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, 
     }
 }
 
-fn draw_stop_flow(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, palette: Palette) {
+fn draw_stop_flow(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &mut RuntimeState,
+    palette: Palette,
+) {
     let Some(flow) = app.stop_flow else {
         return;
     };
@@ -3502,7 +2125,7 @@ fn draw_stop_flow(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp,
     }
 }
 
-fn draw_help(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, palette: Palette) {
+fn draw_help(frame: &mut ratatui::Frame, area: Rect, app: &mut RuntimeState, palette: Palette) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
@@ -3573,10 +2196,10 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, pale
 fn draw_command_palette(
     frame: &mut ratatui::Frame,
     area: Rect,
-    app: &mut TerminalApp,
+    app: &mut RuntimeState,
     palette: Palette,
 ) {
-    if app.candidate_edit.is_some() || app.secret_mode {
+    if app.candidate_edit.is_some() || app.secret_target.is_some() {
         return;
     }
     let area = Rect {
@@ -3667,7 +2290,7 @@ fn draw_command_palette(
 fn draw_compact(
     frame: &mut ratatui::Frame,
     mut area: Rect,
-    app: &mut TerminalApp,
+    app: &mut RuntimeState,
     palette: Palette,
 ) {
     if app.runner.running || app.resume_pending {
@@ -3730,7 +2353,7 @@ fn draw_compact(
     draw_input(frame, rows[1], app, palette);
 }
 
-fn draw_body(frame: &mut ratatui::Frame, area: Rect, app: &mut TerminalApp, palette: Palette) {
+fn draw_body(frame: &mut ratatui::Frame, area: Rect, app: &mut RuntimeState, palette: Palette) {
     let title = app
         .session
         .featured_event
@@ -3824,7 +2447,7 @@ fn live_elapsed(room: &RoomSnapshot, now: DateTime<Utc>) -> String {
 
 fn primary_status_line(
     room: &RoomSnapshot,
-    app: &TerminalApp,
+    app: &RuntimeState,
     palette: Palette,
     width: u16,
 ) -> Line<'static> {
@@ -3878,7 +2501,7 @@ fn primary_status_line(
 
 fn secondary_status_line(
     room: &RoomSnapshot,
-    app: &TerminalApp,
+    app: &RuntimeState,
     palette: Palette,
     width: u16,
 ) -> Line<'static> {
@@ -3938,7 +2561,7 @@ fn secondary_status_line(
     Line::from(spans)
 }
 
-fn technical_status_lines(app: &TerminalApp, palette: Palette, width: u16) -> Vec<Line<'static>> {
+fn technical_status_lines(app: &RuntimeState, palette: Palette, width: u16) -> Vec<Line<'static>> {
     let Some(room) = app.room.as_ref() else {
         return vec![Line::from(vec![
             assistant::compact(app, width.saturating_sub(8)),
@@ -3950,7 +2573,11 @@ fn technical_status_lines(app: &TerminalApp, palette: Palette, width: u16) -> Ve
         secondary_status_line(room, app, palette, width),
     ]
 }
-fn application_notice_lines(app: &TerminalApp, palette: Palette, width: u16) -> Vec<Line<'static>> {
+fn application_notice_lines(
+    app: &RuntimeState,
+    palette: Palette,
+    width: u16,
+) -> Vec<Line<'static>> {
     if app.notice.is_empty() {
         return Vec::new();
     }
@@ -3976,7 +2603,7 @@ fn application_notice_lines(app: &TerminalApp, palette: Palette, width: u16) -> 
 fn draw_history_status(
     frame: &mut ratatui::Frame,
     area: Rect,
-    app: &TerminalApp,
+    app: &RuntimeState,
     palette: Palette,
 ) {
     let first = if area.width >= 44 {
@@ -3988,7 +2615,7 @@ fn draw_history_status(
     };
     let mut second = format!(" +{} NEW", app.unread_live_count);
     if app.config.history_idle_seconds > 0 {
-        if app.stop_flow.is_some() || app.login_qr.is_some() || app.secret_mode {
+        if app.stop_flow.is_some() || app.login_qr.is_some() || app.secret_target.is_some() {
             second.push_str(" · TIMER PAUSED");
         } else {
             let remaining = u64::from(app.config.history_idle_seconds)
@@ -4012,7 +2639,7 @@ fn draw_history_status(
 fn draw_events(
     frame: &mut ratatui::Frame,
     area: Rect,
-    app: &mut TerminalApp,
+    app: &mut RuntimeState,
     palette: Palette,
     title: &str,
 ) {
@@ -4115,7 +2742,7 @@ fn event_marker(kind: DanmuEventKind) -> &'static str {
     }
 }
 
-fn is_assistant_message(event: &DanmuEvent, app: &TerminalApp) -> bool {
+fn is_assistant_message(event: &DanmuEvent, app: &RuntimeState) -> bool {
     event.kind == DanmuEventKind::Danmu
         && app
             .assistant_accounts
@@ -4125,7 +2752,7 @@ fn is_assistant_message(event: &DanmuEvent, app: &TerminalApp) -> bool {
 
 fn event_lines(
     event: &DanmuEvent,
-    app: &TerminalApp,
+    app: &RuntimeState,
     palette: Palette,
     width: u16,
 ) -> Text<'static> {
@@ -4317,15 +2944,15 @@ fn visible_event_content(event: &DanmuEvent) -> String {
     content
 }
 
-fn visible_input(app: &TerminalApp) -> String {
-    if app.secret_mode {
+fn visible_input(app: &RuntimeState) -> String {
+    if app.secret_target.is_some() {
         "•".repeat(app.input.to_string().graphemes(true).count())
     } else {
         app.input.to_string()
     }
 }
 
-fn connection_badge(app: &TerminalApp) -> String {
+fn connection_badge(app: &RuntimeState) -> String {
     if app.connection.starts_with("已连接") {
         app.last_realtime_at
             .as_ref()
@@ -4378,7 +3005,7 @@ fn powerline_title(segments: Vec<(String, Color)>) -> Line<'static> {
     )
 }
 
-fn delivery_status_title(app: &TerminalApp, palette: Palette) -> Line<'static> {
+fn delivery_status_title(app: &RuntimeState, palette: Palette) -> Line<'static> {
     const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let (label, color) = match app.delivery_status {
         DeliveryStatus::Idle => ("↑", palette.success),
@@ -4396,7 +3023,7 @@ fn delivery_status_title(app: &TerminalApp, palette: Palette) -> Line<'static> {
     ))
 }
 
-fn input_business_title(app: &TerminalApp, palette: Palette, width: u16) -> Line<'static> {
+fn input_business_title(app: &RuntimeState, palette: Palette, width: u16) -> Line<'static> {
     let watched = app
         .watched
         .map_or_else(|| "--".into(), |value| value.to_string());
@@ -4462,7 +3089,7 @@ fn input_top_line(
     Line::from(spans)
 }
 
-fn input_prompt_line(app: &TerminalApp, width: u16, palette: Palette) -> Line<'static> {
+fn input_prompt_line(app: &RuntimeState, width: u16, palette: Palette) -> Line<'static> {
     let border_style = Style::default().fg(palette.info);
     let input = visible_input(app);
     let input_width = UnicodeWidthStr::width(input.as_str());
@@ -4524,7 +3151,7 @@ fn wrapped_cursor_position(value: &str, cursor: usize, width: usize) -> (usize, 
     (row, column)
 }
 
-fn input_area_height(app: &TerminalApp, width: u16) -> u16 {
+fn input_area_height(app: &RuntimeState, width: u16) -> u16 {
     let lines = wrapped_input_lines(&visible_input(app), input_content_width(width)).len();
     u16::try_from(lines.min(MAX_INPUT_CONTENT_LINES)).unwrap_or(1) + 1
 }
@@ -4553,7 +3180,7 @@ fn input_final_line(content: &str, width: u16, palette: Palette) -> Line<'static
     ])
 }
 
-fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette: Palette) {
+fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &RuntimeState, palette: Palette) {
     let (left, right) = if app.candidate_edit.is_some() {
         (
             powerline_title(vec![(
@@ -4567,10 +3194,15 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette
             Line::from(" 命令搜索 · 输入中文 · Esc恢复草稿 "),
             Line::default(),
         )
-    } else if app.secret_mode {
+    } else if app.secret_target.is_some() {
         (
             powerline_title(vec![(
-                "OBS 密码 · Enter保存 · Esc取消".into(),
+                match app.secret_target {
+                    Some(SecretTarget::AssistantApiKey) => {
+                        "API Key · Enter保存 · Esc取消 · 不发送".into()
+                    }
+                    _ => "OBS 密码 · Enter保存 · Esc取消".into(),
+                },
                 palette.warning,
             )]),
             Line::default(),
@@ -4588,13 +3220,14 @@ fn draw_input(frame: &mut ratatui::Frame, area: Rect, app: &TerminalApp, palette
         (status, input_business_title(app, palette, available))
     };
 
-    let meter_context = if !app.secret_mode && !app.stop_flow.is_some() && app.obs_error.is_none() {
-        app.obs_status
-            .as_ref()
-            .map(|status| (status.microphone, app.microphone_level))
-    } else {
-        None
-    };
+    let meter_context =
+        if app.secret_target.is_none() && !app.stop_flow.is_some() && app.obs_error.is_none() {
+            app.obs_status
+                .as_ref()
+                .map(|status| (status.microphone, app.microphone_level))
+        } else {
+            None
+        };
 
     let visible = visible_input(app);
     if area.width < 6 {
@@ -4786,7 +3419,12 @@ pub async fn configure_obs(path: &std::path::Path) -> Result<()> {
     }
     let password = rpassword::prompt_password("OBS WebSocket 密码（留空保持当前值）：")?;
     if !password.is_empty() {
-        crate::obs::save_obs_password(path, &password)?;
+        use crate::obs::ObsPasswordStore;
+        crate::obs::FileObsPasswordStore::new(path.to_path_buf(), true).write(
+            &configuration.host,
+            configuration.port,
+            &password,
+        )?;
     }
     configuration.save(path)?;
     println!("OBS 配置已保存：{}", path.display());
@@ -4794,56 +3432,388 @@ pub async fn configure_obs(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn presentation_config(paths: &crate::storage::StoragePaths) -> Result<TerminalConfig> {
+    let themes = crate::theme::ThemeCatalog::load(paths.themes_file.clone())?;
+    let theme_name = themes.selected().to_owned();
+    let (_, palette) = themes.resolve(&theme_name)?;
+    Ok(TerminalConfig {
+        config_path: paths.config_file.clone(),
+        instance: None,
+        history_idle_seconds: 0,
+        room_id: String::new(),
+        single_line: true,
+        chat_layout: false,
+        show_time: true,
+        show_name: true,
+        palette,
+        theme_name,
+        themes,
+    })
+}
+
+pub async fn run(
+    mut config: TerminalConfig,
+    mut paths: crate::storage::StoragePaths,
+) -> Result<()> {
+    paths.config_file = std::path::absolute(&config.config_path)?;
+    config.config_path.clone_from(&paths.config_file);
+    let room_id = config.room_id.clone();
+    let external_instance = config.instance.clone();
+    let handle = crate::runtime::open(crate::runtime::RuntimeOptions {
+        obs_passwords: std::sync::Arc::new(crate::obs::FileObsPasswordStore::new(
+            paths.obs_configuration.clone(),
+            true,
+        )),
+        storage: paths,
+        workspace_default: crate::workspace::default_path()?,
+        mode: crate::runtime::RuntimeMode::Live,
+        external_instance,
+    })
+    .await?;
+    handle
+        .presentation(move |state| {
+            Box::pin(async move {
+                state.layout_chat = config.chat_layout;
+                state.show_name = config.show_name;
+                state.show_time = config.show_time;
+                state.config = config;
+                state.record_reading_config();
+                state.startup_gate = Some(StartupGate::Checking);
+                state.startup_started = Instant::now();
+            })
+        })
+        .await?;
+    let result = async {
+        handle
+            .execute(crate::runtime::RuntimeCommand::Connect { room_id })
+            .await?;
+        handle
+            .execute(crate::runtime::RuntimeCommand::Obs(
+                crate::runtime::ObsCommand::Connect,
+            ))
+            .await?;
+        drive(handle.clone(), false).await
+    }
+    .await;
+    result.and(handle.shutdown().await)
+}
+
+async fn drive(handle: crate::runtime::RuntimeHandle, local: bool) -> Result<()> {
+    let shutdown = shutdown_signal()?;
+    tokio::pin!(shutdown);
+    let mut terminal = TerminalGuard::enter()?;
+    let mut projection = Some(Terminal::new(ratatui::backend::TestBackend::new(1, 1))?);
+    let mut events = EventStream::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(90));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = tick.tick() => {
+                let size = terminal.terminal.size()?;
+                let mut buffered = projection.take().expect("presentation buffer belongs to current draw");
+                if buffered.backend().buffer().area.width != size.width || buffered.backend().buffer().area.height != size.height {
+                    buffered.backend_mut().resize(size.width, size.height);
+                }
+                let (buffered, mouse_capture, result) = handle.presentation(move |state| Box::pin(async move {
+                    state.animation_tick = state.animation_tick.wrapping_add(1);
+                    state.advance_history_at(Instant::now());
+                    state.advance_startup_projection();
+                    let result = buffered.draw(|frame| {
+                        if let Some(gate) = &state.startup_gate {
+                            draw_startup(frame, state.config.palette, state.animation_tick, &state.startup_view, gate, state.startup_started.elapsed(), state.room.is_some());
+                        } else { draw(frame, state); }
+                    }).map(|_| ());
+                    let mouse_capture = state.stop_flow.is_some() || state.login_qr.is_some() || state.secret_target.is_some()
+                        || state.candidate_edit.is_some() || state.help.is_some() || state.assistant_panel.is_some()
+                        || state.command_search_draft.is_some() || state.input.starts_with('/');
+                    (buffered, mouse_capture, result)
+                })).await?;
+                result?;
+                // Only this host touches stdout. A paused terminal consumer cannot hold
+                // the runtime's matcher, collection, or archival event loop hostage.
+                terminal.set_mouse_capture(mouse_capture)?;
+                terminal.terminal.draw(|frame| {
+                    let area = frame.area();
+                    let source = buffered.backend().buffer();
+                    for y in 0..area.height.min(source.area.height) {
+                        for x in 0..area.width.min(source.area.width) {
+                            frame.buffer_mut()[(x, y)].clone_from(&source[(x, y)]);
+                        }
+                    }
+                    let cursor = buffered.backend().cursor_position();
+                    if buffered.backend().cursor_visible() && cursor.x < area.width && cursor.y < area.height {
+                        frame.set_cursor_position(cursor);
+                    }
+                })?;
+                projection = Some(buffered);
+            }
+            event = events.next() => {
+                let Some(event) = event else { break; };
+                let event = event?;
+                let (quit, effects) = handle.presentation(move |state| Box::pin(async move {
+                    let tx = state.ui_tx.as_ref().expect("core event channel").clone();
+                    let result = match event {
+                        Event::Key(key) if local && state.handle_local_key(key)? => Ok(state.quit_requested),
+                        Event::Key(key) if state.startup_gate.is_some() => state.handle_startup_key(key).await,
+                        Event::Key(key) => state.handle_key(key, tx).await,
+                        Event::Paste(text) => { state.handle_paste(&text); Ok(false) }
+                        Event::Mouse(mouse) if state.handle_mouse(mouse) => state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx).await,
+                        _ => Ok(false),
+                    };
+                    let quit = match result {
+                        Ok(quit) => quit,
+                        Err(error) => { state.set_notice(error.to_string(), NoticeLevel::Error); false }
+                    };
+                    Ok::<_, anyhow::Error>((quit, std::mem::take(&mut state.effects)))
+                })).await??;
+                for effect in effects {
+                    match effect {
+                        crate::runtime::HostEffect::OpenBrowser { operation_id, url } => {
+                            if let Err(error) = open_chatgpt_browser(&url) {
+                                let _ = handle.execute(crate::runtime::RuntimeCommand::CancelOperation { operation_id }).await;
+                                handle.presentation(move |state| Box::pin(async move { state.set_notice(error.to_string(), NoticeLevel::Error); })).await?;
+                            }
+                        }
+                    }
+                }
+                if quit { break; }
+            }
+        }
+    }
+    Ok(())
+}
+
+impl RuntimeState {
+    pub(crate) fn presentation_anchors(&self) -> (Option<String>, Option<String>) {
+        (
+            self.selection_active
+                .then(|| self.session.recent_events.get(self.selected))
+                .flatten()
+                .map(|event| event.id.clone()),
+            (self.scroll_offset > 0)
+                .then(|| self.session.recent_events.get(self.scroll_offset))
+                .flatten()
+                .map(|event| event.id.clone()),
+        )
+    }
+    pub(crate) fn restore_presentation_anchors(
+        &mut self,
+        anchors: (Option<String>, Option<String>),
+        event: &DanmuEvent,
+        live: bool,
+    ) {
+        self.activity.push(event, Instant::now(), Utc::now());
+        self.selected = anchors
+            .0
+            .as_deref()
+            .and_then(|id| {
+                self.session
+                    .recent_events
+                    .iter()
+                    .position(|event| event.id == id)
+            })
+            .unwrap_or(0);
+        self.scroll_offset = anchors
+            .1
+            .as_deref()
+            .and_then(|id| {
+                self.session
+                    .recent_events
+                    .iter()
+                    .position(|event| event.id == id)
+            })
+            .unwrap_or(0);
+        if live && (self.selection_active || self.scroll_offset > 0) {
+            self.unread_live_count = self.unread_live_count.saturating_add(1);
+        } else if !self.selection_active && self.scroll_offset == 0 {
+            self.unread_live_count = 0;
+        }
+    }
+    fn handle_local_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.kind != crossterm::event::KeyEventKind::Press
+            || key.code != KeyCode::Enter
+            || !key.modifiers.is_empty()
+            || self.selection_active
+            || self.command_search_draft.is_some()
+            || self.candidate_edit.is_some()
+            || self.assistant_panel.is_some()
+            || self.help.is_some()
+            || self.stop_flow.is_some()
+            || self.secret_target.is_some()
+            || self.login_qr.is_some()
+        {
+            return Ok(false);
+        }
+        if let Some(rest) = self.input.strip_prefix("/event ") {
+            if let Some((name, text)) = rest.split_once(' ') {
+                let mut event =
+                    DanmuEvent::new(DanmuEventKind::Danmu, sanitize_input(text.to_owned()));
+                event.username = Some(sanitize_input(name.to_owned()));
+                event.author_id = Some(name.to_owned());
+                self.ingest_event(event);
+            } else {
+                self.set_notice("/event 姓名 正文", NoticeLevel::Warning);
+            }
+        } else if let Some(mode) = self.input.strip_prefix("/local ") {
+            let outcome = match mode {
+                "confirmed" => 0,
+                "uncertain" => 1,
+                "rejected" => 2,
+                _ => {
+                    self.set_notice("/local confirmed|uncertain|rejected", NoticeLevel::Warning);
+                    return Ok(true);
+                }
+            };
+            if let Some(transport) = &self.local_transport {
+                transport
+                    .outcome
+                    .store(outcome, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else if self.input == "/session new" {
+            if self.session.ended_at.is_none() {
+                self.session
+                    .end(Utc::now(), DanmuSessionEndReason::Completed);
+                self.journal.end(&self.session)?;
+            }
+            self.bridge.new_session();
+            self.session = DanmuSession::new("local");
+            self.journal.start(&self.session)?;
+            self.new_message_count = 0;
+            self.events_dirty = true;
+        } else if self.input == "/session end" {
+            self.bridge.end();
+            if self.session.ended_at.is_none() {
+                self.session
+                    .end(Utc::now(), DanmuSessionEndReason::Completed);
+                self.journal.end(&self.session)?;
+            }
+        } else {
+            return Ok(false);
+        }
+        self.input.take();
+        Ok(true)
+    }
+}
+
+impl RuntimeState {
+    fn advance_startup_projection(&mut self) {
+        if self.startup_gate.is_none() {
+            return;
+        }
+        if self
+            .startup_gate
+            .as_ref()
+            .is_some_and(StartupGate::can_finish)
+        {
+            self.startup_gate = None;
+            return;
+        }
+        self.startup_view.local = StartupCheck::Passed("已读取");
+        self.startup_view.account = if self.room.is_some() {
+            StartupCheck::Passed(
+                if matches!(self.account_status, AccountStatus::SignedIn { .. }) {
+                    "已登录"
+                } else {
+                    "未登录 · 监看模式"
+                },
+            )
+        } else {
+            StartupCheck::Running
+        };
+        self.startup_view.room = if self.room.is_some() {
+            StartupCheck::Passed("房间可访问")
+        } else if self.connection.starts_with("连接失败") {
+            StartupCheck::Warning("读取失败 · 可重试")
+        } else {
+            StartupCheck::Running
+        };
+        self.startup_view.obs = if self.obs_checked_at.is_some() {
+            match &self.obs_error {
+                None => StartupCheck::Passed("已连接"),
+                Some(error) if error.contains("/obs config password") => {
+                    StartupCheck::Warning("需要密码 · /obs config password")
+                }
+                Some(_) => StartupCheck::Warning("连接失败 · 进入后重试"),
+            }
+        } else {
+            StartupCheck::Running
+        };
+        if matches!(self.startup_gate, Some(StartupGate::Checking)) {
+            if self.room.is_some() {
+                self.startup_gate = Some(StartupGate::Ready);
+            } else if self.startup_view.has_warning() {
+                self.startup_gate = Some(StartupGate::Blocked);
+            }
+        }
+    }
+    async fn handle_startup_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return Ok(false);
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(true);
+        }
+        if let Some(StartupGate::EnteringObsPassword(editor)) = self.startup_gate.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.startup_gate = Some(StartupGate::Blocked),
+                KeyCode::Char(character) if !character.is_control() => {
+                    editor.insert_text(character.encode_utf8(&mut [0; 4]))
+                }
+                KeyCode::Backspace => editor.delete_before_cursor(),
+                KeyCode::Enter => {
+                    let value = editor.to_string();
+                    match self.obs.set_password(&value).await {
+                        Ok(()) => {
+                            self.execute_command(crate::runtime::RuntimeCommand::Obs(
+                                crate::runtime::ObsCommand::Refresh,
+                            ))
+                            .await?;
+                            self.execute_command(crate::runtime::RuntimeCommand::Connect {
+                                room_id: self.config.room_id.clone(),
+                            })
+                            .await?;
+                            self.startup_gate = Some(StartupGate::Checking);
+                        }
+                        Err(error) => {
+                            self.set_notice(format!("OBS密码未保存：{error}"), NoticeLevel::Error)
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if matches!(self.startup_gate, Some(StartupGate::Blocked)) {
+            match key.code {
+                KeyCode::Char('s' | 'S') => self.startup_gate = Some(StartupGate::Skipped),
+                KeyCode::Enter if self.startup_view.obs_requires_password() => {
+                    self.startup_gate =
+                        Some(StartupGate::EnteringObsPassword(EditorInput::default()))
+                }
+                KeyCode::Enter => {
+                    self.execute_command(crate::runtime::RuntimeCommand::Connect {
+                        room_id: self.config.room_id.clone(),
+                    })
+                    .await?;
+                    self.startup_gate = Some(StartupGate::Checking);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::obs::ObsConfiguration;
     use ratatui::backend::TestBackend;
-    fn test_app(temp: &tempfile::TempDir, session: DanmuSession) -> TerminalApp {
+    pub(crate) fn test_app(temp: &tempfile::TempDir, session: DanmuSession) -> RuntimeState {
         replay::app(temp.path(), session)
-    }
-    #[tokio::test]
-    async fn startup_history_creates_a_fresh_session_without_live_metrics() {
-        let temp = tempfile::tempdir().unwrap();
-        let journal = SessionJournal::new(temp.path().join("sessions"));
-        let mut archived = DanmuSession::new("42");
-        let event = DanmuEvent::new(DanmuEventKind::Danmu, "上次直播的弹幕");
-        archived.ingest(event.clone());
-        journal.start(&archived).unwrap();
-        archived.end(Utc::now(), DanmuSessionEndReason::Completed);
-        journal.end(&archived).unwrap();
-        let source = temp
-            .path()
-            .join("sessions")
-            .join(&archived.id)
-            .join("journal.jsonl");
-        let original = std::fs::read(&source).unwrap();
-        let (updates, _) = mpsc::unbounded_channel();
-
-        let loaded = load_startup_session(journal.clone(), "42".into(), updates).await;
-
-        assert_ne!(loaded.session.id, archived.id);
-        assert_eq!(
-            loaded.session.status,
-            crate::domain::DanmuSessionStatus::Active
-        );
-        assert_eq!(
-            loaded.session.metrics,
-            crate::domain::SessionMetrics::default()
-        );
-        assert_eq!(loaded.session.recent_events.len(), 1);
-        assert_eq!(loaded.session.recent_events[0].id, event.id);
-        assert_eq!(
-            loaded.session.recent_events[0].origin,
-            DanmuEventOrigin::Archived
-        );
-        journal.start(&loaded.session).unwrap();
-        assert_eq!(std::fs::read(source).unwrap(), original);
     }
 
     #[test]
-    fn independent_assistant_message_color_requires_uid_not_name_or_prefix() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn independent_assistant_message_color_requires_uid_not_name_or_prefix() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let id = uuid::Uuid::new_v4();
         crate::storage::write_private_atomic(
             &temp.path().join("assistant-account.json"),
@@ -4863,7 +3833,7 @@ mod tests {
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let mut event = DanmuEvent::new(DanmuEventKind::Danmu, "✦ 同名同前缀回复");
         event.username = Some("助手".into());
-        let emphasized = |event: &DanmuEvent, app: &TerminalApp| {
+        let emphasized = |event: &DanmuEvent, app: &RuntimeState| {
             event_lines(event, app, app.config.palette, 80)
                 .lines
                 .into_iter()
@@ -4904,12 +3874,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_flow_requires_selection_and_supports_cancelling_countdown() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn stop_flow_requires_selection_and_supports_cancelling_countdown() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
         let now = Instant::now();
         app.command("/obs stop", tx.clone()).await.unwrap();
+        app.set_notice_at("停止推流有中断直播风险", NoticeLevel::Warning, now);
+        app.expire_notice_at(now + DELIVERY_NOTICE_LIFETIME);
+        app.advance_stop_at(now + DELIVERY_NOTICE_LIFETIME, &tx);
+        assert!(app.notice.is_empty());
+        assert!(matches!(
+            app.stop_flow,
+            Some(StopFlow::Confirm {
+                stop_selected: false
+            })
+        ));
+        assert!(rx.try_recv().is_err(), "提醒消退不能批准OBS停止");
         assert!(
             !app.handle_key(
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -4970,14 +3951,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_flow_sends_one_request_only_after_three_seconds() {
+    pub(crate) async fn stop_flow_sends_one_request_only_after_three_seconds() {
         use futures_util::SinkExt;
         use serde_json::{Value, json};
         use tokio::net::TcpListener;
         use tokio_tungstenite::{accept_async, tungstenite::Message};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         app.obs = ObsController::new(
             ObsConfiguration {
@@ -4986,6 +3967,10 @@ mod tests {
                 ..ObsConfiguration::default()
             },
             temp.path().join("obs.json"),
+            std::sync::Arc::new(crate::obs::FileObsPasswordStore::new(
+                temp.path().join("obs.json"),
+                false,
+            )),
         );
         let (tx, mut rx) = mpsc::channel(8);
         app.command("/obs stop", tx.clone()).await.unwrap();
@@ -5091,7 +4076,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(result, UiEvent::ObsStopDone(Ok(()))), "{result:?}");
+        assert!(matches!(result, CoreEvent::ObsStopDone(Ok(()))));
         app.handle_ui_event(result);
         assert!(app.stop_flow.is_none());
         assert!(!app.quit_requested);
@@ -5099,7 +4084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn microphone_shortcuts_are_idempotent_and_require_remote_confirmation() {
+    pub(crate) async fn microphone_shortcuts_are_idempotent_and_require_remote_confirmation() {
         use futures_util::SinkExt;
         use serde_json::{Value, json};
         use std::sync::{
@@ -5107,7 +4092,7 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         };
         use tokio_tungstenite::{accept_async, tungstenite::Message};
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         app.obs = ObsController::new(
@@ -5117,6 +4102,10 @@ mod tests {
                 ..Default::default()
             },
             temp.path().join("obs.json"),
+            std::sync::Arc::new(crate::obs::FileObsPasswordStore::new(
+                temp.path().join("obs.json"),
+                false,
+            )),
         );
         let muted = Arc::new(AtomicBool::new(false));
         let ignore_change = Arc::new(AtomicBool::new(false));
@@ -5215,8 +4204,8 @@ mod tests {
     }
 
     #[test]
-    fn gift_combo_renders_one_row_without_moving_past_newer_chat() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn gift_combo_renders_one_row_without_moving_past_newer_chat() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         for index in 0..2 {
             let gift = crate::domain::GiftDetails {
@@ -5254,7 +4243,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_startup_checks_do_not_block_and_password_stays_private() {
+    pub(crate) fn optional_startup_checks_do_not_block_and_password_stays_private() {
         let palette = Palette::default();
         let mut startup = StartupView::new();
         startup.account = StartupCheck::Passed("未登录 · 监看模式");
@@ -5300,7 +4289,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_animation_degrades_to_the_active_compact_check() {
+    pub(crate) fn startup_animation_degrades_to_the_active_compact_check() {
         let startup = StartupView::new();
         let mut terminal = Terminal::new(TestBackend::new(30, 3)).unwrap();
         terminal
@@ -5334,8 +4323,8 @@ mod tests {
         );
     }
     #[test]
-    fn input_header_renders_live_meter_and_hides_it_when_obs_disconnects() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn input_header_renders_live_meter_and_hides_it_when_obs_disconnects() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         app.obs_status = Some(ObsStatus {
             current_scene: "直播".into(),
@@ -5366,17 +4355,17 @@ mod tests {
     }
 
     #[test]
-    fn sanitizes_ime_format_characters() {
+    pub(crate) fn sanitizes_ime_format_characters() {
         assert_eq!(sanitize_input("你\u{200d}好\u{feff}".into()), "你好");
     }
 
     #[test]
-    fn maps_known_emotes_and_preserves_unknown_codes() {
+    pub(crate) fn maps_known_emotes_and_preserves_unknown_codes() {
         assert_eq!(map_bili_emotes("[dog] [未知]"), "🐶 [未知]");
     }
 
     #[test]
-    fn renders_scannable_qr_rows() {
+    pub(crate) fn renders_scannable_qr_rows() {
         let rows = qr_lines("https://example.com/login").unwrap();
         assert!(rows.len() > 10);
         assert!(
@@ -5385,7 +4374,7 @@ mod tests {
         );
     }
     #[test]
-    fn tui_login_uses_a_smaller_qr_encoding_than_standalone_login() {
+    pub(crate) fn tui_login_uses_a_smaller_qr_encoding_than_standalone_login() {
         let payload = "x".repeat(131);
         let compact = compact_qr_lines(&payload).unwrap();
         let standard = qr_lines(&payload).unwrap();
@@ -5407,8 +4396,8 @@ mod tests {
     }
 
     #[test]
-    fn qr_overlay_degrades_instead_of_clipping_on_small_terminals() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn qr_overlay_degrades_instead_of_clipping_on_small_terminals() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let app = test_app(&temp, DanmuSession::new("1"));
         let rows = qr_lines(&"x".repeat(131)).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(44, 20)).unwrap();
@@ -5430,7 +4419,7 @@ mod tests {
         assert!(!rendered.contains('█'), "{rendered}");
     }
     #[test]
-    fn displays_oldest_event_at_top_and_newest_at_bottom() {
+    pub(crate) fn displays_oldest_event_at_top_and_newest_at_bottom() {
         let mut older = DanmuEvent::new(DanmuEventKind::Danmu, "旧消息");
         older.id = "older".into();
         let mut newer = DanmuEvent::new(DanmuEventKind::Danmu, "新消息");
@@ -5443,8 +4432,8 @@ mod tests {
     }
 
     #[test]
-    fn application_notices_render_below_the_danmu_frame() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn application_notices_render_below_the_danmu_frame() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut session = DanmuSession::new("1");
         session.ingest(DanmuEvent::new(DanmuEventKind::Danmu, "真实弹幕"));
         let mut app = test_app(&temp, session);
@@ -5477,10 +4466,10 @@ mod tests {
     }
 
     #[test]
-    fn activity_bursts_and_expiry_leave_chat_rows_unchanged() {
+    pub(crate) fn activity_bursts_and_expiry_leave_chat_rows_unchanged() {
         for chat_layout in [false, true] {
             for (browsing, selecting) in [(false, false), (true, false), (false, true)] {
-                let temp = tempfile::tempdir().unwrap();
+                let temp = crate::test_support::private_tempdir().unwrap();
                 let now = Utc::now();
                 let mut session = DanmuSession::with_options("1", 12, now);
                 for index in 0..12 {
@@ -5547,8 +4536,8 @@ mod tests {
     }
 
     #[test]
-    fn history_scrolling_skips_activity_even_after_it_expires() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn history_scrolling_skips_activity_even_after_it_expires() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let now = Utc::now();
         for index in 0..10 {
@@ -5577,17 +4566,17 @@ mod tests {
     }
 
     #[test]
-    fn polled_likes_cannot_overwrite_a_newer_realtime_total() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn polled_likes_cannot_overwrite_a_newer_realtime_total() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         app.handle_client_event(BilibiliClientEvent::Likes(300));
-        app.handle_ui_event(UiEvent::Likes(Ok(Some(221))));
+        app.handle_ui_event(CoreEvent::Likes(Ok(Some(221))));
 
         assert_eq!(app.likes, Some(300));
     }
 
     #[test]
-    fn viewer_reply_target_survives_history_reconciliation() {
+    pub(crate) fn viewer_reply_target_survives_history_reconciliation() {
         use serde_json::json;
         for target in ["另一位观众", "拾穗数据"] {
             let mut metadata = vec![serde_json::Value::Null; 16];
@@ -5615,7 +4604,7 @@ mod tests {
     }
 
     #[test]
-    fn reply_metadata_does_not_drop_body_or_duplicate_text_mentions() {
+    pub(crate) fn reply_metadata_does_not_drop_body_or_duplicate_text_mentions() {
         use serde_json::json;
         let cases = [
             (serde_json::Value::Null, "普通弹幕", "普通弹幕"),
@@ -5653,8 +4642,8 @@ mod tests {
     }
 
     #[test]
-    fn event_badges_use_type_colors_and_strip_bilibili_markup() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn event_badges_use_type_colors_and_strip_bilibili_markup() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let event = DanmuEvent::new(DanmuEventKind::Enter, "<%战区超人%> 来了");
         let app = test_app(&temp, DanmuSession::new("1"));
         let palette = app.config.palette;
@@ -5688,8 +4677,8 @@ mod tests {
     }
 
     #[test]
-    fn broadcaster_name_has_identity_mark_and_pink_color() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn broadcaster_name_has_identity_mark_and_pink_color() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         app.room = Some(RoomSnapshot {
             room_id: "1".into(),
@@ -5719,8 +4708,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pin_command_keeps_the_selected_message_when_live_messages_arrive() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn pin_command_keeps_the_selected_message_when_live_messages_arrive() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut session = DanmuSession::new("1");
         let mut question = DanmuEvent::new(DanmuEventKind::Danmu, "需要重点回答的问题");
         question.username = Some("观众".into());
@@ -5753,8 +4742,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_qr_consumes_keys_before_the_underlying_settings_panel() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn login_qr_consumes_keys_before_the_underlying_settings_panel() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let (tx, _rx) = mpsc::channel(1);
         app.input = "人工草稿".into();
@@ -5764,9 +4753,9 @@ mod tests {
             token,
             task: tokio::spawn(std::future::pending()),
         });
-        app.handle_ui_event(UiEvent::LoginQr {
+        app.handle_ui_event(CoreEvent::LoginQr {
             token,
-            lines: vec!["QR".into()],
+            url: "https://example.com/login".into(),
         });
         for code in [KeyCode::Enter, KeyCode::Char('x')] {
             app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), tx.clone())
@@ -5779,11 +4768,11 @@ mod tests {
         assert!(app.login_qr.is_none());
         assert!(app.assistant_panel.is_some());
         let notice = app.notice.clone();
-        app.handle_ui_event(UiEvent::LoginQr {
+        app.handle_ui_event(CoreEvent::LoginQr {
             token,
-            lines: vec!["迟到二维码".into()],
+            url: "https://example.com/expired-login".into(),
         });
-        app.handle_ui_event(UiEvent::LoginDone {
+        app.handle_ui_event(CoreEvent::LoginDone {
             token,
             account: app.account.staged(),
             status: AccountStatus::SignedIn {
@@ -5802,8 +4791,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn escape_and_selection_behavior_remain_intact() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn escape_and_selection_behavior_remain_intact() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut session = DanmuSession::new("1");
         let mut event = DanmuEvent::new(DanmuEventKind::Danmu, "问题");
         event.username = Some("观众".into());
@@ -5846,374 +4835,26 @@ mod tests {
         );
     }
     #[test]
-    fn successful_delivery_clears_only_transient_delivery_notices() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn successful_delivery_clears_only_transient_delivery_notices() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
-        app.handle_ui_event(UiEvent::DeliveryNotice("未确认送达".into()));
+        app.handle_ui_event(CoreEvent::DeliveryNotice("未确认送达".into()));
         assert!(app.notice_deadline.is_some());
-        app.handle_ui_event(UiEvent::DeliveryCompleted);
+        app.handle_ui_event(CoreEvent::DeliveryCompleted);
         assert!(app.notice.is_empty());
-        app.handle_ui_event(UiEvent::DeliveryNotice("再次未确认".into()));
+        app.handle_ui_event(CoreEvent::DeliveryNotice("再次未确认".into()));
         app.expire_notice_at(Instant::now() + DELIVERY_NOTICE_LIFETIME);
         assert!(app.notice.is_empty());
-        app.handle_ui_event(UiEvent::error("登录态需处理"));
-        app.handle_ui_event(UiEvent::DeliveryCompleted);
+        app.handle_ui_event(CoreEvent::error("登录态需处理"));
+        app.handle_ui_event(CoreEvent::DeliveryCompleted);
         assert_eq!(app.notice, "登录态需处理");
     }
-    #[tokio::test]
-    async fn post_waits_for_echo_matcher_and_fast_echo_confirms_once() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        fn response(body: &str) -> String {
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-        }
-
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let endpoint =
-            url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
-        let (post_seen_tx, mut post_seen_rx) = oneshot::channel();
-        let (respond_tx, respond_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            let mut post_seen_tx = Some(post_seen_tx);
-            let mut respond_rx = Some(respond_rx);
-            for body in [
-                r#"{"code":0,"data":{"isLogin":true,"uname":"用户42","mid":42}}"#,
-                r#"{"code":0,"data":{"mode_info":{"extra":{"content":"极速回声","send_from_me":true}}}}"#,
-            ] {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut chunk = [0_u8; 1024];
-                    let count = socket.read(&mut chunk).await.unwrap();
-                    assert!(count > 0);
-                    request.extend_from_slice(&chunk[..count]);
-                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
-                    else {
-                        continue;
-                    };
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().unwrap())
-                        })
-                        .unwrap_or(0);
-                    if request.len() >= header_end + 4 + content_length {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&request).into_owned();
-                if request.starts_with("POST ") {
-                    post_seen_tx.take().unwrap().send(()).unwrap();
-                    respond_rx.take().unwrap().await.unwrap();
-                }
-                requests.push(request);
-                socket.write_all(response(body).as_bytes()).await.unwrap();
-            }
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                    .await
-                    .is_err()
-            );
-            requests
-        });
-
-        let temp = tempfile::tempdir().unwrap();
-        let account_path = temp.path().join("account.json");
-        crate::storage::write_private_atomic(
-            &account_path,
-            &serde_json::to_vec(&serde_json::json!({
-                "cookieHeader":"SESSDATA=fake; bili_jct=fake; DedeUserID=42",
-                "csrf":"fake",
-                "identity":{"SignedIn":{"display_name":"用户42", "user_id":"42"}}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let account = AccountClient::new(account_path)
-            .unwrap()
-            .with_test_endpoint(endpoint);
-        let (tx, mut ui_rx) = mpsc::channel(8);
-        let transport = TerminalTransport {
-            account: accounts::SendIdentity::manual(account),
-            client: BilibiliClient::new(temp.path().join("live-session.json")).unwrap(),
-            room: "1".into(),
-            tx,
-            job: None,
-            bridge: bridge::Bridge::new(true),
-            queue: SendQueue::default(),
-        };
-        let send = tokio::spawn(async move { transport.send_confirm("极速回声", None).await });
-        let started = tokio::time::timeout(Duration::from_secs(1), ui_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut post_seen_rx)
-                .await
-                .is_err(),
-            "UI尚未注册回声匹配器时不得开始POST"
-        );
-
-        let mut app = test_app(&temp, DanmuSession::new("1"));
-        app.handle_ui_event(started);
-        post_seen_rx.await.unwrap();
-        let mut echo = DanmuEvent::new(DanmuEventKind::Danmu, "极速回声");
-        echo.timestamp = Utc::now();
-        echo.username = Some("用户42".into());
-        echo.author_id = Some("42".into());
-        app.ingest_event(echo);
-        respond_tx.send(()).unwrap();
-
-        let delivery = send.await.unwrap();
-        assert_eq!(delivery.outcome, Outcome::Confirmed);
-        assert_eq!(
-            delivery.diagnosis.cause,
-            crate::delivery::Cause::EchoConfirmed
-        );
-        let requests = server.await.unwrap();
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request.starts_with("POST "))
-                .count(),
-            1
-        );
-    }
-
     #[test]
-    fn late_echo_keeps_its_identity_and_expires_at_the_delivery_window() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut app = test_app(&temp, DanmuSession::new("1"));
-        let submitted = Utc::now();
-        let delivery =
-            PendingDelivery::new("late reply".into(), "host".into(), "42".into(), submitted);
-        let mut boundary = DanmuEvent::new(DanmuEventKind::Danmu, "late reply");
-        boundary.author_id = Some("42".into());
-        boundary.timestamp = submitted + chrono::Duration::seconds(90);
-        assert!(delivery.matches(&boundary));
-        boundary.timestamp += chrono::Duration::milliseconds(1);
-        assert!(!delivery.matches(&boundary));
-        let id = delivery.id.clone();
-        let (tx, mut rx) = oneshot::channel();
-        let (registered_tx, _registered_rx) = oneshot::channel();
-        app.handle_ui_event(UiEvent::DeliveryStarted {
-            delivery,
-            confirmation: tx,
-            registered: registered_tx,
-        });
-        app.handle_ui_event(UiEvent::DeliveryEchoMissing {
-            delivery_ids: vec![id.clone()],
-        });
-        assert_eq!(app.delivery_status, DeliveryStatus::Uncertain);
-        let mut impostor = DanmuEvent::new(DanmuEventKind::Danmu, "late reply");
-        impostor.author_id = Some("43".into());
-        impostor.username = Some("host".into());
-        impostor.timestamp = submitted + chrono::Duration::seconds(30);
-        app.ingest_event(impostor);
-        assert!(rx.try_recv().is_err());
-        let mut echo = DanmuEvent::new(DanmuEventKind::Danmu, "late reply");
-        echo.author_id = Some("42".into());
-        echo.timestamp = submitted + chrono::Duration::seconds(30);
-        app.ingest_event(echo);
-        assert!(rx.try_recv().is_ok());
-        app.handle_ui_event(UiEvent::DeliveryCompleted);
-        assert_eq!(app.delivery_status, DeliveryStatus::Delivered);
-        app.handle_ui_event(UiEvent::DeliveryEchoMissing {
-            delivery_ids: vec![id],
-        });
-        assert_eq!(app.delivery_status, DeliveryStatus::Delivered);
-    }
-    #[test]
-    fn sent_message_accepts_masked_live_echo_and_restores_broadcaster_identity() {
-        let submitted_at = Utc::now();
-        let pending = PendingDelivery::new(
-            "我发的消息".into(),
-            "拾穗数据".into(),
-            "42".into(),
-            submitted_at,
-        );
-        let mut event = DanmuEvent::new(DanmuEventKind::Danmu, "我发的消息");
-        event.timestamp = submitted_at + chrono::Duration::seconds(1);
-        event.username = Some("拾***据".into());
-        event.author_id = Some("0".into());
-
-        assert!(pending.matches(&event));
-        pending.canonicalize(&mut event);
-        assert_eq!(event.username.as_deref(), Some("拾穗数据"));
-        assert_eq!(event.author_id.as_deref(), Some("42"));
-    }
-
-    #[test]
-    fn canonical_history_reconciles_masked_live_event_without_a_duplicate() {
-        let timestamp = Utc::now();
-        let mut live = DanmuEvent::new(DanmuEventKind::Danmu, "同一条弹幕");
-        live.timestamp = timestamp;
-        live.username = Some("拾***据".into());
-        live.author_id = Some("0".into());
-        let mut events = vec![live];
-
-        let mut history = DanmuEvent::new(DanmuEventKind::Danmu, "同一条弹幕");
-        history.timestamp = timestamp + chrono::Duration::seconds(1);
-        history.username = Some("拾穗数据".into());
-        history.author_id = Some("42".into());
-        history.origin = crate::domain::DanmuEventOrigin::History;
-
-        assert!(reconcile_cross_origin_event(&mut events, &history));
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].username.as_deref(), Some("拾穗数据"));
-        assert_eq!(events[0].author_id.as_deref(), Some("42"));
-    }
-    #[test]
-    fn masked_live_echo_after_history_confirmation_is_not_inserted_twice() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut app = test_app(&temp, DanmuSession::new("1"));
-        let submitted_at = Utc::now();
-        let delivery = PendingDelivery::new(
-            "古天乐，神殿侠侣，应该看过吧".into(),
-            "停车拾穗".into(),
-            "42".into(),
-            submitted_at,
-        );
-        let (confirmation_tx, mut confirmation_rx) = oneshot::channel();
-        app.handle_ui_event(UiEvent::DeliveryStarted {
-            delivery,
-            confirmation: confirmation_tx,
-            registered: oneshot::channel().0,
-        });
-
-        let mut history = DanmuEvent::new(DanmuEventKind::Danmu, "古天乐，神殿侠侣，应该看过吧");
-        history.timestamp = submitted_at + chrono::Duration::seconds(1);
-        history.username = Some("停车拾穗".into());
-        history.author_id = Some("42".into());
-        history.origin = DanmuEventOrigin::History;
-        app.ingest_event(history);
-
-        let mut live = DanmuEvent::new(DanmuEventKind::Danmu, "古天乐，神殿侠侣，应该看过吧");
-        live.timestamp = submitted_at + chrono::Duration::seconds(8);
-        live.username = Some("停***".into());
-        live.author_id = Some("0".into());
-        app.ingest_event(live);
-
-        assert_eq!(confirmation_rx.try_recv(), Ok(()));
-        assert_eq!(app.confirmed_deliveries.len(), 1);
-        assert_eq!(app.session.recent_events.len(), 1);
-        assert_eq!(
-            app.session.recent_events[0].username.as_deref(),
-            Some("停车拾穗")
-        );
-    }
-    #[test]
-    fn app_shows_its_own_live_echo_immediately() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut app = test_app(&temp, DanmuSession::new("1"));
-        let submitted_at = Utc::now();
-        let delivery = PendingDelivery::new(
-            "主播消息".into(),
-            "拾穗数据".into(),
-            "42".into(),
-            submitted_at,
-        );
-        let (confirmation_tx, mut confirmation_rx) = oneshot::channel();
-        app.handle_ui_event(UiEvent::DeliveryStarted {
-            delivery,
-            confirmation: confirmation_tx,
-            registered: oneshot::channel().0,
-        });
-        assert_eq!(app.delivery_status, DeliveryStatus::Sending);
-        app.handle_ui_event(UiEvent::DeliveryAccepted);
-        assert_eq!(app.delivery_status, DeliveryStatus::AwaitingEcho);
-        app.animation_tick = 1;
-
-        let mut event = DanmuEvent::new(DanmuEventKind::Danmu, "主播消息");
-        event.timestamp = submitted_at + chrono::Duration::seconds(1);
-        event.username = Some("拾***据".into());
-        event.author_id = Some("0".into());
-        app.handle_client_event(BilibiliClientEvent::Danmu(event));
-
-        assert_eq!(confirmation_rx.try_recv(), Ok(()));
-        assert_eq!(app.session.recent_events.len(), 1);
-        assert_eq!(
-            app.session.recent_events[0].username.as_deref(),
-            Some("拾穗数据")
-        );
-        assert!(app.last_live_danmu_at.is_some());
-        assert_eq!(app.delivery_status, DeliveryStatus::Verifying);
-        app.handle_ui_event(UiEvent::DeliveryCompleted);
-        assert_eq!(app.delivery_status, DeliveryStatus::Delivered);
-        assert!(app.notice.is_empty());
-    }
-
-    #[test]
-    fn segmented_send_tracks_multiple_unconfirmed_echoes_without_overwriting() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut app = test_app(&temp, DanmuSession::new("1"));
-        let submitted_at = Utc::now();
-        let first = PendingDelivery::new(
-            "第一段".into(),
-            "拾穗数据".into(),
-            "42".into(),
-            submitted_at,
-        );
-        let second = PendingDelivery::new(
-            "第二段".into(),
-            "拾穗数据".into(),
-            "42".into(),
-            submitted_at + chrono::Duration::seconds(2),
-        );
-        let (first_tx, mut first_rx) = oneshot::channel();
-        let (second_tx, mut second_rx) = oneshot::channel();
-        app.handle_ui_event(UiEvent::DeliveryStarted {
-            delivery: first,
-            confirmation: first_tx,
-            registered: oneshot::channel().0,
-        });
-        app.handle_ui_event(UiEvent::DeliveryStarted {
-            delivery: second,
-            confirmation: second_tx,
-            registered: oneshot::channel().0,
-        });
-
-        assert_eq!(app.pending_deliveries.len(), 2);
-        let mut second_echo = DanmuEvent::new(DanmuEventKind::Danmu, "第二段");
-        second_echo.timestamp = submitted_at + chrono::Duration::seconds(3);
-        second_echo.username = Some("拾***据".into());
-        second_echo.author_id = Some("0".into());
-        app.ingest_event(second_echo);
-
-        assert_eq!(second_rx.try_recv(), Ok(()));
-        assert!(matches!(
-            first_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        assert_eq!(app.pending_deliveries.len(), 1);
-        assert_eq!(app.delivery_status, DeliveryStatus::Verifying);
-
-        let mut first_echo = DanmuEvent::new(DanmuEventKind::Danmu, "第一段");
-        first_echo.timestamp = submitted_at + chrono::Duration::seconds(4);
-        first_echo.username = Some("拾***据".into());
-        first_echo.author_id = Some("0".into());
-        app.ingest_event(first_echo);
-
-        assert_eq!(first_rx.try_recv(), Ok(()));
-        assert!(app.pending_deliveries.is_empty());
-        app.handle_ui_event(UiEvent::DeliveryCompleted);
-        assert_eq!(app.delivery_status, DeliveryStatus::Delivered);
-    }
-    #[test]
-    fn delivery_reminders_include_content_and_expire_once() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn delivery_reminders_include_content_and_expire_once() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
 
-        app.handle_ui_event(UiEvent::DeliveryRejected {
+        app.handle_ui_event(CoreEvent::DeliveryRejected {
             content: "请手动重发这条消息".into(),
             message: "发送失败：还没有 B 站登录态".into(),
         });
@@ -6233,14 +4874,17 @@ mod tests {
         );
         let delivery_id = delivery.id.clone();
         let (confirmation, _receiver) = oneshot::channel();
-        app.handle_ui_event(UiEvent::DeliveryStarted {
+        app.handle_ui_event(CoreEvent::DeliveryStarted {
             delivery,
             confirmation,
             registered: oneshot::channel().0,
         });
-        app.handle_ui_event(UiEvent::DeliveryHistory { events: Vec::new() });
+        app.handle_ui_event(CoreEvent::DeliveryHistory {
+            events: Vec::new(),
+            room_id: app.session.room_id.clone(),
+        });
         assert_eq!(app.delivery_status, DeliveryStatus::Verifying);
-        app.handle_ui_event(UiEvent::DeliveryTimedOut {
+        app.handle_ui_event(CoreEvent::DeliveryTimedOut {
             delivery_ids: vec![delivery_id],
         });
         assert_eq!(app.delivery_status, DeliveryStatus::Uncertain);
@@ -6253,30 +4897,62 @@ mod tests {
     }
 
     #[test]
-    fn success_notice_expires_but_warning_remains() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn success_and_info_notices_and_confirmed_delivery_expire_after_three_seconds() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
-        let now = std::time::Instant::now();
-
-        app.set_notice_at("已切换主题：chatroom", NoticeLevel::Success, now);
-        app.expire_notice_at(now + Duration::from_millis(2_999));
-        assert_eq!(app.notice, "已切换主题：chatroom");
-        app.expire_notice_at(now + Duration::from_secs(3));
-        assert!(app.notice.is_empty());
+        let now = Instant::now();
+        for level in [NoticeLevel::Info, NoticeLevel::Success] {
+            app.set_notice_at("已切换主题：chatroom", level, now);
+            app.expire_notice_at(now + Duration::from_millis(2_999));
+            assert_eq!(app.notice, "已切换主题：chatroom");
+            app.expire_notice_at(now + Duration::from_secs(3));
+            assert!(app.notice.is_empty());
+        }
         app.set_delivery_status_at(DeliveryStatus::Delivered, now);
         app.expire_notice_at(now + Duration::from_millis(2_999));
         assert_eq!(app.delivery_status, DeliveryStatus::Delivered);
         app.expire_notice_at(now + Duration::from_secs(3));
         assert_eq!(app.delivery_status, DeliveryStatus::Idle);
-
-        app.set_notice_at("停止推流有中断直播风险", NoticeLevel::Warning, now);
-        app.expire_notice_at(now + Duration::from_secs(60));
-        assert_eq!(app.notice, "停止推流有中断直播风险");
     }
 
     #[test]
-    fn overflowing_live_feed_keeps_newest_event_visible() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn warning_and_error_notices_expire_at_the_delivery_notice_boundary() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        let now = Instant::now();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+        for level in [NoticeLevel::Warning, NoticeLevel::Error] {
+            app.set_notice_at("限时异常提醒", level, now);
+            app.expire_notice_at(now + DELIVERY_NOTICE_LIFETIME - Duration::from_nanos(1));
+            assert_eq!(app.notice, "限时异常提醒");
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert!(format!("{:?}", terminal.backend().buffer()).contains("限时异常提醒"));
+            app.expire_notice_at(now + DELIVERY_NOTICE_LIFETIME);
+            assert!(app.notice.is_empty());
+            assert!(app.notice_deadline.is_none());
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert!(!format!("{:?}", terminal.backend().buffer()).contains("限时异常提醒"));
+        }
+    }
+
+    #[test]
+    pub(crate) fn progress_notice_waits_for_completion_instead_of_expiring() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let mut app = test_app(&temp, DanmuSession::new("1"));
+        let now = Instant::now();
+        app.set_notice_at("模型目录读取中", NoticeLevel::Progress, now);
+        app.expire_notice_at(now + Duration::from_secs(600));
+        assert_eq!(app.notice, "模型目录读取中");
+        assert!(app.notice_deadline.is_none());
+        app.set_notice_at("模型目录已读取", NoticeLevel::Success, now);
+        app.expire_notice_at(now + Duration::from_secs(3));
+        assert!(app.notice.is_empty());
+    }
+
+    #[test]
+    pub(crate) fn overflowing_live_feed_keeps_newest_event_visible() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut session = DanmuSession::new("1");
         for index in 0..30 {
             let mut event = DanmuEvent::new(DanmuEventKind::Danmu, format!("历史消息-{index:02}"));
@@ -6310,8 +4986,8 @@ mod tests {
     }
 
     #[test]
-    fn periodic_history_recovery_restores_a_message_missed_by_websocket() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn periodic_history_recovery_restores_a_message_missed_by_websocket() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let now = Utc::now();
         let mut session = DanmuSession::new("1");
         let mut previous = DanmuEvent::new(DanmuEventKind::Danmu, "上一条消息");
@@ -6334,8 +5010,8 @@ mod tests {
     }
 
     #[test]
-    fn incoming_live_event_preserves_the_message_being_browsed() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn incoming_live_event_preserves_the_message_being_browsed() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut session = DanmuSession::new("1");
         for index in 0..10 {
             let mut event = DanmuEvent::new(DanmuEventKind::Danmu, format!("消息-{index}"));
@@ -6356,8 +5032,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_idle_timeout_tracks_input_not_incoming_messages() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn history_idle_timeout_tracks_input_not_incoming_messages() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut session = DanmuSession::new("1");
         for index in 0..8 {
             session.ingest(DanmuEvent::new(
@@ -6416,8 +5092,8 @@ mod tests {
     }
 
     #[test]
-    fn history_idle_timeout_waits_for_modal_operation_to_finish() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn history_idle_timeout_waits_for_modal_operation_to_finish() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut session = DanmuSession::new("1");
         session.ingest(DanmuEvent::new(DanmuEventKind::Danmu, "正在准备回复的问题"));
         let mut app = test_app(&temp, session);
@@ -6437,8 +5113,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn end_returns_from_history_browsing_to_live_feed() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn end_returns_from_history_browsing_to_live_feed() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         app.selection_active = true;
         app.selected = 7;
@@ -6455,8 +5131,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chinese_archive_search_completes_without_execution() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn chinese_archive_search_completes_without_execution() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let (tx, _rx) = mpsc::channel(1);
         app.input = "/搜索".into();
@@ -6467,8 +5143,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paste_stays_in_draft_and_cannot_cross_modal_confirmation() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn paste_stays_in_draft_and_cannot_cross_modal_confirmation() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         app.handle_paste("/quit\r\n/obs start\t\u{3}\u{10}");
         assert_eq!(app.input, "/quit /obs start ");
@@ -6500,11 +5176,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secret_paste_stays_hidden_and_bypasses_slash_completion() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn secret_paste_stays_hidden_and_bypasses_slash_completion() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let (tx, _rx) = mpsc::channel(1);
-        app.secret_mode = true;
+        app.secret_target = Some(SecretTarget::ObsPassword);
         app.handle_paste("/obs config password\r\nsecret-marker\u{3}");
         let secret = app.input.to_string();
         assert_eq!(secret, "/obs config password secret-marker");
@@ -6521,14 +5197,14 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx)
             .await
             .unwrap();
-        assert!(!app.secret_mode);
+        assert!(app.secret_target.is_none());
         assert!(app.input.is_empty());
         assert!(app.session.recent_events.is_empty());
     }
 
     #[tokio::test]
-    async fn command_search_restores_cursor_and_never_sends_query_text() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn command_search_restores_cursor_and_never_sends_query_text() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let (tx, mut rx) = mpsc::channel(8);
         app.input = "草稿甲🙂乙".into();
@@ -6583,8 +5259,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_search_obs_submenu_and_password_preserve_the_original_draft() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn command_search_obs_submenu_and_password_preserve_the_original_draft() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let (tx, _rx) = mpsc::channel(8);
         app.input = "未完成的人工回复".into();
@@ -6611,7 +5287,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(app.secret_mode);
+        assert!(app.secret_target.is_some());
         assert!(app.input.is_empty());
         app.handle_paste("secret");
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx)
@@ -6619,11 +5295,11 @@ mod tests {
             .unwrap();
         assert_eq!(app.input, "未完成的人工回复");
         assert_eq!(app.input.cursor(), 2);
-        assert!(!app.secret_mode);
+        assert!(app.secret_target.is_none());
     }
 
     #[test]
-    fn optional_ai_commands_stay_out_of_the_idle_palette() {
+    pub(crate) fn optional_ai_commands_stay_out_of_the_idle_palette() {
         let idle = command_suggestions("", false);
         assert!(idle.iter().any(|spec| spec.completion == "/settings"));
         assert!(idle.iter().any(|spec| spec.completion == "/diag"));
@@ -6648,8 +5324,8 @@ mod tests {
     }
 
     #[test]
-    fn every_builtin_theme_reaches_the_rendered_terminal_surface() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn every_builtin_theme_reaches_the_rendered_terminal_surface() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         for theme_name in ["shisui", "catppuccin-mocha", "tokyo-night", "gruvbox-dark"] {
             let mut app = test_app(&temp, DanmuSession::new("1"));
             let (_, palette) = app.config.themes.resolve(theme_name).unwrap();
@@ -6667,10 +5343,10 @@ mod tests {
         }
     }
     #[test]
-    fn obs_poll_failure_clears_stale_status_without_polluting_room_strip() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn obs_poll_failure_clears_stale_status_without_polluting_room_strip() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
-        app.handle_ui_event(UiEvent::ObsStatus(Ok(ObsStatus {
+        app.handle_ui_event(CoreEvent::ObsStatus(Ok(ObsStatus {
             current_scene: "直播".into(),
             stream: crate::obs::StreamState::Live,
             microphone: crate::obs::MicrophoneState::Muted,
@@ -6680,7 +5356,7 @@ mod tests {
         assert!(app.obs_error.is_none());
         assert_eq!(app.runner.microphone_context()["state"], "muted");
 
-        app.handle_ui_event(UiEvent::ObsStatus(Err("OBS WebSocket 连接失败".into())));
+        app.handle_ui_event(CoreEvent::ObsStatus(Err("OBS WebSocket 连接失败".into())));
         assert!(app.obs_status.is_none());
         assert_eq!(app.obs_error.as_deref(), Some("OBS WebSocket 连接失败"));
         assert!(app.obs_checked_at.is_some());
@@ -6701,7 +5377,7 @@ mod tests {
 
         assert!(!rendered.contains("OBS"), "{rendered}");
 
-        app.handle_ui_event(UiEvent::ObsStatus(Ok(ObsStatus {
+        app.handle_ui_event(CoreEvent::ObsStatus(Ok(ObsStatus {
             current_scene: "直播".into(),
             stream: crate::obs::StreamState::Live,
             microphone: MicrophoneState::Unmuted,
@@ -6715,8 +5391,8 @@ mod tests {
     }
 
     #[test]
-    fn long_input_wraps_inside_the_input_frame() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn long_input_wraps_inside_the_input_frame() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         app.input = format!("{}TAIL", "a".repeat(35)).into();
         assert_eq!(
@@ -6741,7 +5417,7 @@ mod tests {
     }
 
     #[test]
-    fn official_custom_emote_metadata_is_visible_in_text_terminals() {
+    pub(crate) fn official_custom_emote_metadata_is_visible_in_text_terminals() {
         let mut event = DanmuEvent::new(DanmuEventKind::Danmu, "你好[主播表情]");
         event.emotes.push(crate::domain::DanmuEmote {
             text: "[主播表情]".into(),
@@ -6757,8 +5433,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mouse_and_arrow_history_navigation_preserve_the_draft() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn mouse_and_arrow_history_navigation_preserve_the_draft() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut session = DanmuSession::new("1");
         for index in 0..8 {
             let mut event = DanmuEvent::new(DanmuEventKind::Danmu, format!("消息 {index}"));
@@ -6836,19 +5512,19 @@ mod tests {
     }
 
     #[test]
-    fn failed_online_refresh_preserves_the_last_successful_value() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) fn failed_online_refresh_preserves_the_last_successful_value() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
-        app.handle_ui_event(UiEvent::OnlineViewers(Ok(Some(11))));
-        app.handle_ui_event(UiEvent::OnlineViewers(Err("暂时失败".into())));
+        app.handle_ui_event(CoreEvent::OnlineViewers(Ok(Some(11))));
+        app.handle_ui_event(CoreEvent::OnlineViewers(Err("暂时失败".into())));
 
         assert_eq!(app.online_viewers, Some(11));
         assert!(app.notice.contains("继续显示上次成功值"));
     }
 
     #[tokio::test]
-    async fn keyboard_palette_restores_unicode_draft_and_direct_page_closes_once() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn keyboard_palette_restores_unicode_draft_and_direct_page_closes_once() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let (tx, mut rx) = mpsc::channel(8);
         app.input = "甲🙂乙".into();
@@ -6892,8 +5568,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn palette_opens_optional_argument_editor_and_preserves_unicode_parameters() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn palette_opens_optional_argument_editor_and_preserves_unicode_parameters() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         app.open_commands();
         let (tx, _rx) = mpsc::channel(1);
@@ -6931,8 +5607,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slash_obs_reports_progress_and_quit_exits() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn slash_obs_reports_progress_and_quit_exits() {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         let (tx, _rx) = mpsc::channel(4);
 
@@ -6943,8 +5619,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_display_setting_persists_even_when_runtime_override_already_matches() {
-        let temp = tempfile::tempdir().unwrap();
+    pub(crate) async fn explicit_display_setting_persists_even_when_runtime_override_already_matches()
+     {
+        let temp = crate::test_support::private_tempdir().unwrap();
         let mut app = test_app(&temp, DanmuSession::new("1"));
         app.config.save_value("show_time", true.into()).unwrap();
         app.show_time = false;

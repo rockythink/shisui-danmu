@@ -21,6 +21,8 @@ export default defineConfig({
       ],
       sidebar: [
         { label: "使用手册", link: "/guide/" },
+        { label: "更新日志", link: "/changelog/" },
+        { label: "返回官网", link: "/" },
       ],
     }),
   ],

@@ -175,6 +175,21 @@ pub struct Bridge {
     state: tokio::sync::watch::Sender<State>,
     changed: Arc<Notify>,
 }
+/// A version cursor over the existing bridge watch channel, without exposing
+/// private state or allocating a second event stream.
+pub(crate) struct BridgeChanges {
+    receiver: tokio::sync::watch::Receiver<State>,
+}
+impl BridgeChanges {
+    pub(crate) fn take_changed(&mut self) -> bool {
+        let changed = self.receiver.has_changed().unwrap_or(true);
+        if changed {
+            drop(self.receiver.borrow_and_update());
+        }
+        changed
+    }
+}
+
 pub struct Job {
     pub reply: Reply,
     pub permit: Permit,
@@ -241,6 +256,11 @@ impl Bridge {
         json!({"session":s.session,"active":s.active,"available":s.available,"sending_enabled":s.granted,
             "local_transport":s.local,"driver":if s.driver.is_some(){"runner"}else{"external"},"cursor":s.sequence,"oldest_cursor":s.messages.front().map(|m|m.cursor),
             "history_capacity":HISTORY,"request_capacity":REQUESTS,"routing":Self::routing_snapshot_state(&s),"version":env!("CARGO_PKG_VERSION")})
+    }
+    pub(crate) fn observe_changes(&self) -> BridgeChanges {
+        BridgeChanges {
+            receiver: self.state.subscribe(),
+        }
     }
     pub fn mark(&self, id: &str) -> Option<Mark> {
         let state = self.state.borrow();

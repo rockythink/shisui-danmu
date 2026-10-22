@@ -900,6 +900,64 @@ fn elapsed(now: Instant, then: Instant) -> Duration {
     now.checked_duration_since(then).unwrap_or_default()
 }
 
+impl super::Bridge {
+    pub(crate) fn inspect_replies<T>(
+        &self,
+        inspect: impl FnOnce(&HashMap<(String, String), super::Reply>) -> T,
+    ) -> T {
+        inspect(&self.state.borrow().replies)
+    }
+
+    pub(crate) fn validate_visible_selection(&self, ids: &[String]) -> anyhow::Result<()> {
+        self.mutate(|state| {
+            let mut unique = std::collections::HashSet::new();
+            anyhow::ensure!(!ids.is_empty(), "未选择可见消息");
+            for id in ids {
+                anyhow::ensure!(unique.insert(id), "可见消息选择包含重复ID");
+                anyhow::ensure!(
+                    state.messages.iter().any(|message| &message.event.id == id),
+                    "可见消息已过期或不属于当前场次"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn start_routing_selected(
+        &self,
+        driver: &str,
+        policy: Policy,
+        ids: &[String],
+    ) -> anyhow::Result<()> {
+        self.mutate(|state| {
+            anyhow::ensure!(
+                state.driver.as_deref() == Some(driver),
+                "runner_expired: 助手归属已失效"
+            );
+            anyhow::ensure!(state.active && state.available, "本场未就绪");
+            let mut unique = std::collections::HashSet::new();
+            anyhow::ensure!(!ids.is_empty(), "未选择可见消息");
+            for id in ids {
+                anyhow::ensure!(unique.insert(id), "可见消息选择包含重复ID");
+                anyhow::ensure!(
+                    state.messages.iter().any(|message| &message.event.id == id),
+                    "可见消息已过期或不属于当前场次"
+                );
+            }
+            let mut inbox = Inbox::new(policy);
+            let now = Instant::now();
+            for message in &state.messages {
+                if unique.contains(&message.event.id) {
+                    inbox.push(message, now);
+                }
+            }
+            state.inbox = Some(inbox);
+            state.routing_active = true;
+            state.leased.clear();
+            Ok(())
+        })
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

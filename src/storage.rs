@@ -32,10 +32,11 @@ impl StoragePaths {
     }
 
     pub fn ensure(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.support_dir).context("创建 TUI 数据目录失败")?;
+        crate::bridge::wire::private_root(&self.support_dir)
+            .context("创建 TUI 私有数据目录失败")?;
         std::fs::create_dir_all(&self.sessions_dir).context("创建会话目录失败")?;
         if let Some(parent) = self.config_file.parent() {
-            std::fs::create_dir_all(parent).context("创建配置目录失败")?;
+            crate::bridge::wire::private_root(parent).context("创建 TUI 私有配置目录失败")?;
         }
         Ok(())
     }

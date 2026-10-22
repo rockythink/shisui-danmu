@@ -1,0 +1,4 @@
+# UniFFI 0.32.2 CLI --config uses global configuration, not flat crate settings.
+# Resolve this crate's uniffi.toml without enabling cargo-metadata in the core.
+[crate-roots]
+danmu_ffi = "."

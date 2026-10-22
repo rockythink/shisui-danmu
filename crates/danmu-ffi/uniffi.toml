@@ -1,0 +1,5 @@
+[bindings.swift]
+module_name = "DanmuCoreFFI"
+ffi_module_name = "DanmuCoreFFIShim"
+ffi_module_filename = "DanmuCoreFFIShim"
+generate_module_map = true

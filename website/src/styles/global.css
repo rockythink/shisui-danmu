@@ -185,7 +185,7 @@ h1 span { display: block; color: var(--info); text-shadow: 3px 3px 0 #0e7490; }
 @media (max-width: 760px) {
   .app-shell { overflow: visible; }
   .topbar { position: fixed; height: 60px; padding: 0 1rem; }
-  .topbar nav a:not(.icon-link):not(.guide-link) { display: none; }
+  .topbar nav a:not(.icon-link):not(.primary-link) { display: none; }
   .main-frame { display: block; width: calc(100vw - 28px); min-height: 0; margin: 60px auto 0; padding: 22px 0 32px; }
   .hero-head { display: block; }
   .hero-brand { display: block; }

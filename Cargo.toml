@@ -1,3 +1,8 @@
+[workspace]
+members = ["crates/danmu-ffi"]
+default-members = ["."]
+resolver = "3"
+
 [package]
 name = "shisui-danmu"
 version = "0.5.1"
@@ -16,26 +21,32 @@ default-run = "danmu"
 [[bin]]
 name = "danmu"
 path = "src/main.rs"
+required-features = ["tui"]
+
+[features]
+default = ["tui"]
+tui = ["dep:clap", "dep:crossterm", "dep:ratatui", "dep:qrcode", "dep:rpassword", "dep:tui-input", "dep:unicode-width"]
+test-support = []
 
 [dependencies]
-agent-client-protocol = { version = "=2.1.0", default-features = false }
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
 brotli = "8"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4.5", features = ["derive"] }
-crossterm = { version = "0.29", features = ["event-stream"] }
+clap = { version = "4.5", features = ["derive"], optional = true }
+crossterm = { version = "0.29", features = ["event-stream"], optional = true }
 directories = "6"
 flate2 = "1"
 fs2 = "0.4"
 futures-util = { version = "0.3", features = ["sink"] }
 hex = "0.4"
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["rust_crypto"] }
 obws = { version = "0.15.0", features = ["events"] }
-qrcode = { version = "0.14", default-features = false }
-ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
+qrcode = { version = "0.14", default-features = false, optional = true }
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "cookies", "gzip", "brotli"] }
-rpassword = "7"
+rpassword = { version = "7", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 sha2 = "0.10"
@@ -46,9 +57,9 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 toml = "0.9"
 toml_edit = "0.23"
 rusqlite = { version = "0.37", features = ["bundled"] }
-tui-input = "0.15.4"
+tui-input = { version = "0.15.4", optional = true }
 unicode-segmentation = "1"
-unicode-width = "0.2"
+unicode-width = { version = "0.2", optional = true }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 

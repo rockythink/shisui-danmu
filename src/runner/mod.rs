@@ -1,6 +1,12 @@
-pub(crate) mod acp;
-pub(crate) mod hosts;
+pub(crate) mod api;
+pub(crate) mod credentials;
+pub(crate) mod model;
+pub(crate) mod responses;
+pub(crate) mod search;
 pub(crate) mod settings;
+pub(crate) mod subscription;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use crate::bridge::{Bridge, RUNNER_CALLER, ReportState, Request};
 use crate::obs::MicrophoneState;
@@ -14,15 +20,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_ROUNDS: u32 = 8;
 const MAX_INPUT: usize = 24 * 1024;
-// Count full application prompts before ACP deduplicates static context.
-// Reserve one complete prompt before taking work, including one-shot repairs.
-// This bounds input bytes, not provider tokens or native tool output.
-const MAX_CONTEXT_INPUT: usize = 64 * 1024;
 const MICROPHONE_MAX_AGE: Duration = Duration::from_secs(5);
 const WORKSPACE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-
+#[cfg(test)]
+/// Test-observation view over the live workspace refresh lifecycle.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceContextStatus<'a> {
     Unread,
@@ -54,13 +56,14 @@ pub(crate) struct Runner {
     history_repair_notice: Option<std::result::Result<String, String>>,
     reading_config: Option<crate::workspace_config::Reading>,
     pub running: bool,
-    pub report: acp::Snapshot,
-    pub pending: Option<acp::Change>,
-    pub configuring: bool,
-    pub needs_rebuild: bool,
+    pub key_status: KeyStatus,
+    pub returned_model: Option<String>,
+    pub last_search: model::SearchState,
+    connection_busy: bool,
     path: PathBuf,
+    workspace_default: PathBuf,
     scene: Option<String>,
-    // Bridge lifetime is independent of the assistant's ACP connection lifetime.
+    // Bridge lifetime is independent of the local model worker lifetime.
     bridge_scene: Option<String>,
     room_context: Option<RoomContext>,
     microphone_observation: Option<(MicrophoneState, Instant)>,
@@ -68,24 +71,16 @@ pub(crate) struct Runner {
     reply_activity_override: Option<ReplyActivity>,
     saved_settings: bool,
     driver: String,
-    workspace: Option<Arc<tempfile::TempDir>>,
-    handle: Option<acp::Handle>,
+    handle: Option<api::Handle>,
     flight: Option<Flight>,
     author: Option<String>,
     routing_dirty: bool,
     round: u32,
-    context_input_bytes: usize,
     generation: u64,
     next: Instant,
     closed: bool,
     stopping: bool,
     error: bool,
-    restorable: bool,
-    restart_after_round: bool,
-    resume_after_restart: bool,
-    restart_visible: bool,
-    config_new_context: bool,
-    config_scope: Option<settings::NativePreferences>,
     history: Option<crate::history::History>,
     history_journal: Option<crate::persistence::SessionJournal>,
     history_load: Option<std::sync::mpsc::Receiver<std::result::Result<LoadedHistory, String>>>,
@@ -94,7 +89,6 @@ pub(crate) struct Runner {
     history_loaded_journal: Option<crate::persistence::SessionJournal>,
     history_load_notice: Option<String>,
     terminal_name: Option<String>,
-    native_prompt_text: Option<String>,
     workspace_context: Option<std::result::Result<serde_json::Value, String>>,
     workspace_checked: Option<Instant>,
     workspace_applied: bool,
@@ -115,10 +109,11 @@ struct Flight {
     expires_at: Instant,
     dispatched_at: Instant,
     input_bytes: usize,
-    native_session: Option<String>,
+    api: settings::ApiConfig,
+    returned_model: Option<String>,
+    search: Option<model::SearchState>,
     microphone: serde_json::Value,
     settings: Settings,
-    options: acp::Options,
     scene: String,
     reply_strategy: settings::DynamicReplyStrategy,
     message_ids: Arc<[String]>,
@@ -132,6 +127,13 @@ struct Batch {
     ids: Vec<String>,
     expires_at: Option<Instant>,
     bytes: usize,
+    search_targets: Vec<model::SearchTarget>,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KeyStatus {
+    Set,
+    Unset,
+    Error(String),
 }
 impl Flight {
     fn report(&self, bridge: &Bridge, driver: &str, state: ReportState) -> Result<()> {
@@ -167,14 +169,14 @@ impl Flight {
     }
 }
 impl Runner {
-    pub fn load(config: &Path) -> Self {
+    pub fn load(config: &Path, workspace_default: &Path) -> Self {
         let path = config.with_file_name("assistant.json");
         let (settings, notice, load_error) = match Settings::load(&path) {
             Ok((s, n)) => (s, n, None),
             Err(e) => (Settings::default(), None, Some(e.to_string())),
         };
         let saved_settings = path.is_file() && load_error.is_none();
-        Self {
+        let mut runner = Self {
             settings,
             load_error,
             config_warning: None,
@@ -183,14 +185,15 @@ impl Runner {
             history_repair_result: None,
             history_repair_notice: None,
             reading_config: None,
-            note: notice.unwrap_or_else(|| "未启用；启动danmu不会连接Agent或调用模型".into()),
+            note: notice.unwrap_or_else(|| "未启用；启动danmu不会调用模型".into()),
             running: false,
-            report: acp::Snapshot::default(),
-            pending: None,
-            configuring: false,
-            needs_rebuild: false,
+            key_status: KeyStatus::Unset,
+            returned_model: None,
+            last_search: model::SearchState::NotRequested,
+            connection_busy: false,
             saved_settings,
             path,
+            workspace_default: workspace_default.to_path_buf(),
             scene: None,
             bridge_scene: None,
             room_context: None,
@@ -198,7 +201,6 @@ impl Runner {
             topic_override: None,
             reply_activity_override: None,
             driver: uuid::Uuid::new_v4().to_string(),
-            workspace: None,
             handle: None,
             flight: None,
             author: None,
@@ -209,18 +211,11 @@ impl Runner {
             quiet_rounds: 0,
             routing_dirty: true,
             round: 0,
-            context_input_bytes: 0,
             generation: 0,
             next: Instant::now(),
             closed: false,
             stopping: false,
             error: false,
-            restorable: false,
-            restart_after_round: false,
-            resume_after_restart: false,
-            restart_visible: false,
-            config_new_context: false,
-            config_scope: None,
             history: None,
             history_journal: None,
             history_load: None,
@@ -228,14 +223,15 @@ impl Runner {
             history_load_failed: false,
             history_loaded_journal: None,
             history_load_notice: None,
-            native_prompt_text: None,
             workspace_context: None,
             workspace_checked: None,
             workspace_applied: false,
             terminal_name: std::env::var("TERM_PROGRAM")
                 .ok()
                 .map(|v| v.chars().filter(|c| !c.is_control()).take(80).collect()),
-        }
+        };
+        runner.refresh_key_status();
+        runner
     }
     pub fn record_reading_config(&mut self, reading: crate::workspace_config::Reading) {
         self.reading_config = Some(reading);
@@ -247,11 +243,7 @@ impl Runner {
         }
         // A snapshot failure is a diagnostic, never a failed settings commit.
         let result = (|| {
-            let directory = self
-                .settings
-                .workspace
-                .clone()
-                .map_or_else(crate::workspace::default_path, Ok)?;
+            let directory = self.workspace_path()?;
             crate::workspace_config::record(
                 &directory,
                 &self.settings,
@@ -264,24 +256,13 @@ impl Runner {
             )
         });
     }
+    #[cfg(test)]
     pub fn workspace_context_status(&self) -> WorkspaceContextStatus<'_> {
         match &self.workspace_context {
             None => WorkspaceContextStatus::Unread,
             Some(Err(error)) => WorkspaceContextStatus::Error(error),
             Some(Ok(_)) if self.workspace_applied => WorkspaceContextStatus::Loaded,
             Some(Ok(_)) => WorkspaceContextStatus::Pending,
-        }
-    }
-    pub fn workspace_context_note(&self) -> &str {
-        match self.workspace_context_status() {
-            WorkspaceContextStatus::Unread => {
-                "尚未读取；仅选中资料会载入，外部聊天须写入文件才生效"
-            }
-            WorkspaceContextStatus::Pending => {
-                "待应用；下个新消息轮载入，旧轮结果不采用；不会自动授予发送权"
-            }
-            WorkspaceContextStatus::Loaded => "本轮已载入选中资料（ACP输入）；不代表模型效果已验证",
-            WorkspaceContextStatus::Error(error) => error,
         }
     }
     /// Shared by prompt admission and dispatch. Never read documents once per frame.
@@ -308,7 +289,9 @@ impl Runner {
         self.workspace_applied = false;
         if invalidate {
             self.generation = self.generation.wrapping_add(1);
-            self.restorable = false;
+            if let Some(handle) = &self.handle {
+                handle.cancel();
+            }
             // The queue consumes selected messages before launch; stale rounds never replay.
             bridge.context_changed();
             self.note = "选中资料变化或读取失败：旧轮结果及未发自动候选失效，待审候选/人工草稿保留；已发请求继续确认。助手保持可用，发送须本人重新授权".into();
@@ -360,7 +343,7 @@ impl Runner {
         );
         ensure!(
             !self.history_load_failed,
-            "历史索引载入失败；原件保留，输入 /diag 查看"
+            "历史索引载入失败；原件保留，请在诊断中查看"
         );
         let workspace = self.workspace_path()?;
         let workspace = if workspace.try_exists()? {
@@ -373,7 +356,7 @@ impl Runner {
             self.history_warning = self
                 .restore_history(self.history.as_ref().context("缺少历史索引")?, &workspace)
                 .err()
-                .map(|error| format!("旧历史恢复不完整；新弹幕仍写入当前索引。原件保留，输入 /diag 查看并修复：{error:#}"));
+                .map(|error| format!("旧历史恢复不完整；新弹幕仍写入当前索引。原件保留，请在诊断中查看并修复：{error:#}"));
         }
         self.history.as_mut().context("缺少历史索引")
     }
@@ -466,7 +449,7 @@ impl Runner {
             Ok(())
         })();
         self.history_warning = result.err().map(|error|
-            format!("设置已保存；历史副本绑定失败，私有原件保留且旧工作区停止追加；输入 /diag 查看并修复：{error:#}"));
+            format!("设置已保存；历史副本绑定失败，私有原件保留且旧工作区停止追加；请在诊断中查看并修复：{error:#}"));
     }
     pub fn record_history(&mut self, room: &str, event: &crate::domain::DanmuEvent) -> Result<()> {
         if event.kind != crate::domain::DanmuEventKind::Danmu {
@@ -493,7 +476,7 @@ impl Runner {
             .context("工作区副本未完整绑定；私有原件保留");
         let recovery = Self::restore_history_sources(&history, &workspace, legacy, Some(&journal));
         let warning = binding.and(recovery).err().map(|error| {
-            format!("历史恢复或副本绑定不完整；原件保留，输入 /diag 查看并修复：{error:#}")
+            format!("历史恢复或副本绑定不完整；原件保留，请在诊断中查看并修复：{error:#}")
         });
         Ok(LoadedHistory {
             history,
@@ -501,6 +484,7 @@ impl Runner {
             warning,
         })
     }
+    #[cfg(test)]
     pub fn import_history(
         &mut self,
         room: &str,
@@ -528,9 +512,8 @@ impl Runner {
                 }
             }
             Err(error) => {
-                self.history_warning = Some(format!(
-                    "历史载入失败；原件保留，输入 /diag 查看：{error:#}"
-                ));
+                self.history_warning =
+                    Some(format!("历史载入失败；原件保留，请在诊断中查看：{error:#}"));
                 Err(error)
             }
         }
@@ -559,7 +542,7 @@ impl Runner {
             .name("danmu-history-load".into())
             .spawn(move || {
                 let result = Self::load_history_sources(&room, journal, &workspace, &legacy)
-                    .map_err(|error| format!("历史载入失败；原件保留，输入 /diag 查看：{error:#}"));
+                    .map_err(|error| format!("历史载入失败；原件保留，请在诊断中查看：{error:#}"));
                 let _ = sender.send(result);
             })
             .context("无法启动后台历史加载")?;
@@ -583,7 +566,7 @@ impl Runner {
                 Ok(result) => result,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    Err("后台历史加载中断；原始记录保留，输入 /diag 查看".into())
+                    Err("后台历史加载中断；原始记录保留，请在诊断中查看".into())
                 }
             };
             self.history_load = None;
@@ -617,7 +600,7 @@ impl Runner {
                 Err(error) => {
                     self.history_pending.clear();
                     let error = format!(
-                        "后台加载期间的新弹幕索引补齐失败；私有原件保留，输入 /diag 查看：{error:#}"
+                        "后台加载期间的新弹幕索引补齐失败；私有原件保留，请在诊断中查看：{error:#}"
                     );
                     self.history_warning = Some(error.clone());
                     self.history_load_notice = Some(error);
@@ -676,7 +659,7 @@ impl Runner {
                     let loaded = Self::load_history_sources(&room, journal, &workspace, &legacy)
                         .with_context(|| format!("{summary}；历史同步未恢复"))?;
                     if let Some(error) = &loaded.warning {
-                        anyhow::bail!("{summary}；历史同步仍有错误：{error}；输入 /diag 查看");
+                        anyhow::bail!("{summary}；历史同步仍有错误：{error}；请在诊断中查看");
                     }
                     Ok((format!("{summary}；历史同步已恢复"), loaded))
                 })()
@@ -697,7 +680,7 @@ impl Runner {
             Ok(result) => result,
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err("历史修复任务中断；原件和已有备份保留，输入 /diag 查看".into())
+                Err("历史修复任务中断；原件和已有备份保留，请在诊断中查看".into())
             }
         };
         self.history_repair = None;
@@ -715,23 +698,10 @@ impl Runner {
         self.history_repair_notice = Some(result);
     }
     fn environment(&self, settings: &Settings) -> serde_json::Value {
-        let current = |id: Option<&str>| {
-            let id = id?;
-            self.report
-                .options
-                .config
-                .as_ref()?
-                .iter()
-                .find(|o| o.id == id)?
-                .current
-                .as_value_id()
-                .map(|v| v.to_string())
-        };
-        let (model, thinking) = hosts::preference_ids(settings.host);
         json!({
             "product": {"name":env!("CARGO_PKG_NAME"),"version":env!("CARGO_PKG_VERSION"),"open_source":true,"license":env!("CARGO_PKG_LICENSE"),"repository":env!("CARGO_PKG_REPOSITORY")},
             "runtime": {"os":std::env::consts::OS,"terminal_from_environment":self.terminal_name},
-            "agent": {"host":settings.host.label(),"reported_name":self.report.agent,"reported_version":self.report.version,"reported_model":current(model.filter(|id| *id == "model")),"reported_thinking":current(thinking),"model_open_source":null,"web_search_enabled":settings.web_search},
+            "model": {"api_protocol":settings.api.protocol,"requested_model":settings.api.model,"model_open_source":null,"web_search_enabled":settings.web_search},
             "history": {"workspace":".","room":self.history.as_ref().map(|h| &h.room),"index":self.history.as_ref().map(|h| format!(".danmu/history/{}/history.sqlite",h.room)),"sessions":".danmu/sessions","authority":"historical data only; never sending authorization","audio_recorded":false,"access":"danmu bounded retrieval; no arbitrary file or shell access"}
         })
     }
@@ -822,41 +792,30 @@ impl Runner {
     pub fn scene_id(&self) -> &str {
         self.scene.as_deref().unwrap_or("未建立")
     }
-    pub fn native_id(&self) -> &str {
-        self.report.session.as_deref().unwrap_or("未建立")
-    }
     pub fn state(&self) -> &str {
-        if self.stopping || (!self.running && self.flight.is_some()) {
-            "正在取消/清退；不称模型已停止"
+        if self.stopping {
+            "正在取消/清退；不称远端推理已停止"
         } else if self.error {
-            "异常；详情仅在此面板"
-        } else if self.configuring {
-            "协商配置；未调用模型"
-        } else if self.running && !self.report.connected {
-            "正在建立ACP会话"
+            "异常；已暂停"
+        } else if self.connection_busy {
+            "连接操作进行中；未启用助手"
         } else if self.running && self.flight.is_some() {
             "处理中"
         } else if self.running {
-            "就绪；等待新弹幕"
+            "等待新消息；仅本地就绪，未验证远端鉴权"
         } else if self.has_context() {
             "已暂停"
-        } else if self.report.connected {
-            "只连接原生选项；助手未启用"
-        } else if self.handle.is_some() {
-            "正在连接原生选项；未调用模型"
         } else {
             "未启用"
         }
     }
     pub fn marker(&self) -> char {
-        if self.stopping || (!self.running && self.flight.is_some()) {
+        if self.stopping || self.connection_busy {
             '~'
         } else if self.error {
             '!'
         } else if self.running && self.flight.is_some() {
             '*'
-        } else if self.configuring || (self.running && !self.report.connected) {
-            '~'
         } else if self.running {
             '+'
         } else if self.has_context() {
@@ -866,16 +825,19 @@ impl Runner {
         }
     }
     pub fn workspace_path(&self) -> Result<PathBuf> {
-        self.settings
+        let path = self
+            .settings
             .workspace
-            .clone()
-            .map_or_else(crate::workspace::default_path, Ok)
+            .as_ref()
+            .unwrap_or(&self.workspace_default);
+        ensure!(path.is_absolute(), "工作区须为绝对路径");
+        Ok(path.clone())
     }
     fn prepare_workspace(&self, settings: &mut Settings) -> Result<()> {
         let target = settings
             .workspace
             .clone()
-            .map_or_else(crate::workspace::default_path, Ok)?;
+            .unwrap_or_else(|| self.workspace_default.clone());
         ensure!(target.is_absolute(), "工作区须为绝对路径");
         let private = self.path.parent().context("缺少私有配置目录")?;
         std::fs::create_dir_all(private)?;
@@ -899,44 +861,190 @@ impl Runner {
         settings.workspace = Some(directory);
         Ok(())
     }
-    pub fn set_workspace(&mut self, path: PathBuf, bridge: &Bridge) -> Result<()> {
-        ensure!(
-            !self.history_repair_running(),
-            "历史修复中，暂不能切换工作区"
-        );
-        ensure!(
-            !self.history_loading(),
-            "历史仍在后台加载，暂不能切换工作区"
-        );
-        ensure!(
-            self.load_error.is_none(),
-            "设置损坏，禁止覆盖；请修复原文件"
-        );
-        let mut settings = self.settings.clone();
-        settings.workspace = Some(path);
-        self.prepare_workspace(&mut settings)?;
-        let history = self.relocate_history(&settings)?;
-        settings.save(&self.path)?;
-        self.stop(bridge);
-        self.settings = settings;
-        self.workspace_checked = None;
-        self.workspace_applied = false;
-        self.history = history;
-        self.rebind_history_journal();
-        self.saved_settings = true;
-        self.record_config();
-        self.note = "工作区已保存；助手暂停且发送权已撤销，候选和人工草稿保留。可自行用编辑器或维护Agent打开目录；不会自动启动应用。".into();
-        if let Some(warning) = &self.history_warning {
-            self.note.push_str(&format!("；{warning}"));
-        }
-        Ok(())
+    pub fn connection_busy(&self) -> bool {
+        self.connection_busy
     }
-    pub fn save(&mut self, mut settings: Settings, bridge: &Bridge, rebuild: bool) -> Result<()> {
+    pub fn check_connection_change(&self, bridge: &Bridge) -> Result<()> {
+        ensure!(
+            !self.running
+                && !self.in_flight()
+                && !self.stopping
+                && !self.connection_busy
+                && !bridge.sending_enabled(),
+            "请先暂停助手并等待本机请求清退，再更换连接、密钥或联网设置"
+        );
         ensure!(
             self.load_error.is_none(),
             "设置损坏，禁止覆盖；请本人修复原文件"
         );
+        Ok(())
+    }
+    pub fn refresh_key_status(&mut self) {
+        self.key_status = if self.settings.api.base_url.trim().is_empty() {
+            KeyStatus::Unset
+        } else if self.settings.api.protocol == settings::ApiProtocol::ChatgptSubscription {
+            match self.settings.api.validate().and_then(|_| {
+                let Some(id) = self.settings.api.chatgpt_account.as_deref() else {
+                    return Ok(false);
+                };
+                let accounts = subscription::load_accounts(&self.path)?;
+                Ok(accounts
+                    .iter()
+                    .any(|account| account.id == id && account.signed_in && account.plan_enabled))
+            }) {
+                Ok(true) => KeyStatus::Set,
+                Ok(false) => KeyStatus::Unset,
+                Err(error) => KeyStatus::Error(format!("{error:#}")),
+            }
+        } else {
+            match credentials::load(&self.path, &self.settings.api) {
+                Ok(Some(_)) => KeyStatus::Set,
+                Ok(None) => KeyStatus::Unset,
+                Err(error) => KeyStatus::Error(format!("{error:#}")),
+            }
+        };
+    }
+    fn retire_idle_handle(&mut self) {
+        self.handle = None;
+    }
+    pub fn save_api_key(&mut self, input: &str, bridge: &Bridge) -> Result<()> {
+        self.check_connection_change(bridge)?;
+        ensure!(
+            self.settings.api.protocol != settings::ApiProtocol::ChatgptSubscription,
+            "订阅连接不使用API Key"
+        );
+        credentials::save(&self.path, &self.settings.api, input)?;
+        self.retire_idle_handle();
+        self.refresh_key_status();
+        self.note = "当前连接Key已保存；替换唯一私有记录，下次显式启动读取".into();
+        Ok(())
+    }
+    pub fn clear_api_key(&mut self, bridge: &Bridge) -> Result<()> {
+        self.check_connection_change(bridge)?;
+        ensure!(
+            self.settings.api.protocol != settings::ApiProtocol::ChatgptSubscription,
+            "订阅连接不使用API Key"
+        );
+        credentials::clear(&self.path)?;
+        self.retire_idle_handle();
+        self.refresh_key_status();
+        self.note = "本地API Key已清除；不声称服务端已撤销".into();
+        Ok(())
+    }
+    pub fn chatgpt_accounts(&self) -> Result<Vec<subscription::AccountInfo>> {
+        subscription::load_accounts(&self.path)
+    }
+    pub fn begin_chatgpt_login(
+        &mut self,
+        bridge: &Bridge,
+        account_id: Option<&str>,
+    ) -> Result<subscription::Login> {
+        self.check_connection_change(bridge)?;
+        let login = subscription::begin_login(&self.path, account_id)?;
+        self.connection_busy = true;
+        Ok(login)
+    }
+    pub fn finish_chatgpt_login(
+        &mut self,
+        bridge: &Bridge,
+        result: std::result::Result<subscription::PendingLogin, subscription::SubscriptionError>,
+    ) -> Result<()> {
+        ensure!(self.connection_busy, "没有待完成的订阅连接操作");
+        self.connection_busy = false;
+        self.check_connection_change(bridge)?;
+        let account = subscription::complete_login(&self.path, result?)?;
+        let mut settings = self.settings.clone();
+        let account_changed = settings.api.protocol != settings::ApiProtocol::ChatgptSubscription
+            || settings.api.chatgpt_account.as_deref() != Some(account.id.as_str());
+        settings.api.protocol = settings::ApiProtocol::ChatgptSubscription;
+        settings.api.base_url = settings::ApiProtocol::ChatgptSubscription
+            .default_base_url()
+            .into();
+        settings.api.chatgpt_account = Some(account.id);
+        if account_changed {
+            settings.api.model.clear();
+        }
+        if let Err(error) = self.save(settings, bridge) {
+            self.refresh_key_status();
+            return Err(error.context("账号已保存在本地，但活动连接设置未提交；未启动助手"));
+        }
+        self.retire_idle_handle();
+        self.note = if account.plan_enabled {
+            "ChatGPT账号已保存；模型须由账号目录显式选择，助手仍未启用"
+        } else {
+            "账号已保存，但未获得订阅推理授权；未启用助手"
+        }
+        .into();
+        Ok(())
+    }
+    pub fn cancel_chatgpt_operation(&mut self) {
+        self.connection_busy = false;
+        self.refresh_key_status();
+    }
+    pub fn begin_chatgpt_sign_out(&mut self, bridge: &Bridge, account_id: &str) -> Result<PathBuf> {
+        self.check_connection_change(bridge)?;
+        ensure!(
+            self.chatgpt_accounts()?
+                .iter()
+                .any(|account| account.id == account_id),
+            "订阅账号不存在"
+        );
+        self.connection_busy = true;
+        Ok(self.path.clone())
+    }
+    pub fn complete_chatgpt_sign_out(
+        &mut self,
+        bridge: &Bridge,
+        result: std::result::Result<subscription::SignOutOutcome, subscription::SubscriptionError>,
+    ) -> Result<()> {
+        ensure!(self.connection_busy, "没有待完成的订阅连接操作");
+        self.connection_busy = false;
+        // A completed local sign-out must never resurrect an idle credential snapshot.
+        self.retire_idle_handle();
+        self.refresh_key_status();
+        self.check_connection_change(bridge)?;
+        let outcome = result?;
+        self.note = if outcome.remote_revoked {
+            "已清除本地订阅Token，官方远端撤销已确认"
+        } else {
+            "已清除本地订阅Token；远端撤销未确认，可在ChatGPT设置撤销"
+        }
+        .into();
+        Ok(())
+    }
+    pub fn begin_chatgpt_models(&mut self, bridge: &Bridge) -> Result<subscription::Session> {
+        self.check_connection_change(bridge)?;
+        ensure!(
+            self.settings.api.protocol == settings::ApiProtocol::ChatgptSubscription,
+            "当前不是订阅连接"
+        );
+        let id = self
+            .settings
+            .api
+            .chatgpt_account
+            .as_deref()
+            .context("请先选择订阅账号")?;
+        let session = subscription::session(&self.path, id)?;
+        self.connection_busy = true;
+        Ok(session)
+    }
+    pub fn finish_chatgpt_models(&mut self) {
+        self.connection_busy = false;
+        self.refresh_key_status();
+    }
+    pub fn save(&mut self, mut settings: Settings, bridge: &Bridge) -> Result<()> {
+        ensure!(
+            self.load_error.is_none(),
+            "设置损坏，禁止覆盖；请本人修复原文件"
+        );
+        ensure!(!self.connection_busy, "请先完成或取消订阅连接操作");
         settings.validate()?;
+        settings.api.normalize()?;
+        let connection_changed =
+            self.settings.api != settings.api || self.settings.web_search != settings.web_search;
+        if connection_changed {
+            self.check_connection_change(bridge)?;
+        }
         ensure!(
             !self.history_loading() || self.settings.workspace == settings.workspace,
             "历史仍在后台加载，暂不能切换工作区"
@@ -951,12 +1059,6 @@ impl Runner {
             || self.settings.persona != settings.persona
             || self.settings.skills != settings.skills
             || self.settings.use_project != settings.use_project;
-        let boundary =
-            (self.has_context() || self.handle.is_some()) && !self.settings.same_context(&settings);
-        ensure!(
-            !boundary || rebuild || workspace_changed,
-            "更换宿主/配置来源须明确重建会话；在途轮不替换"
-        );
         let history = if workspace_changed {
             self.relocate_history(&settings)?
         } else {
@@ -967,6 +1069,10 @@ impl Runner {
             self.stop(bridge);
         }
         self.settings = settings;
+        if connection_changed {
+            self.retire_idle_handle();
+            self.refresh_key_status();
+        }
         if self.running {
             bridge.update_routing(&self.driver, self.routing_policy())?;
             self.routing_dirty = false;
@@ -981,98 +1087,43 @@ impl Runner {
         }
         self.saved_settings = true;
         self.record_config();
-        if workspace_changed {
-            self.note = "工作区已保存；助手暂停且发送权撤销，草稿候选保留".into();
-        } else if boundary {
-            self.pending = None;
-            self.restart_after_round = true;
-            self.resume_after_restart = self.running;
-            self.restart_visible = false;
-            self.note = "新配置已保存；当前轮结束后重建专用ACP会话，候选/人工草稿保留".into();
-            if self.flight.is_none() && !self.configuring {
-                self.begin_restart(bridge);
-            }
+        self.note = if workspace_changed {
+            "工作区已保存；助手暂停且发送权撤销，草稿候选保留"
         } else {
-            self.note = "偏好已保存；本轮快照不变，下一轮采用。".into();
+            "偏好已保存；本轮快照不变，下一轮采用"
         }
+        .into();
         if let Some(warning) = &self.history_warning {
             self.note.push_str(&format!("；{warning}"));
         }
         Ok(())
     }
-    pub fn change(&mut self, mut change: acp::Change) -> Result<()> {
-        ensure!(self.report.connected && !self.stopping, "ACP会话尚未就绪");
+    pub(crate) fn process_visible(&mut self, bridge: &Bridge, ids: &[String]) -> Result<()> {
         ensure!(
-            self.pending.is_none() && !self.configuring && !self.restart_after_round,
-            "请先等待上一配置的完整回执和依赖选项刷新"
+            self.flight.is_none(),
+            "原请求尚未终结，不能更改已冻结消息批次"
         );
-        self.report.options.validate_change(&change)?;
-        change.new_context =
-            hosts::permit_option(self.settings.host, change.id.as_deref(), &change.value)?;
-        self.pending = Some(change);
-        self.note = "配置请求已排队；当前轮不变，下一个空闲边界执行，回执前不称生效".into();
-        Ok(())
+        bridge.validate_visible_selection(ids)?;
+        self.start(bridge, false)?;
+        bridge.start_routing_selected(&self.driver, self.routing_policy(), ids)
     }
-    fn prepare_connection(&mut self) -> Result<()> {
-        ensure!(self.load_error.is_none(), "助手设置损坏，未连接");
+
+    pub fn start(&mut self, bridge: &Bridge, visible: bool) -> Result<()> {
+        ensure!(self.load_error.is_none(), "助手设置损坏，未启动");
+        ensure!(
+            !self.connection_busy && !self.stopping && !self.closed,
+            "本机连接操作或旧请求仍在清退"
+        );
+        ensure!(self.flight.is_none(), "原请求尚未终结，不启动并发轮次");
         self.settings.ready()?;
-        ensure!(
-            !self.stopping && !self.closed,
-            "旧ACP进程正在清退，结束后再连接"
-        );
-        let mut settings = self.settings.clone();
-        self.prepare_workspace(&mut settings)?;
-        if settings != self.settings {
-            settings.save(&self.path)?;
-            self.settings = settings;
-            self.saved_settings = true;
-            self.record_config();
-        }
-        Ok(())
-    }
-    fn connect(&mut self) -> Result<()> {
-        if self.handle.is_some() {
+        if self.running {
+            if visible {
+                bridge.start_routing(&self.driver, self.routing_policy(), true)?;
+            } else {
+                bridge.update_routing(&self.driver, self.routing_policy())?;
+            }
             return Ok(());
         }
-        self.native_prompt_text = match &self.settings.source {
-            settings::Source::NativePrompt(path) => Some(hosts::native_prompt_text(path)?),
-            _ => None,
-        };
-        if self.workspace.is_none() {
-            self.workspace = Some(Arc::new(
-                tempfile::Builder::new().prefix("danmu-acp-").tempdir()?,
-            ));
-        }
-        let restore = if self.restorable {
-            self.report.session.as_ref().map(|session| acp::Restore {
-                session: session.clone(),
-                capabilities: self.report.capabilities.clone(),
-            })
-        } else {
-            None
-        };
-        self.handle = Some(acp::Handle::spawn(
-            self.settings.clone(),
-            acp::Workspace {
-                runtime: self.workspace.as_ref().context("缺少专用运行目录")?.clone(),
-            },
-            restore,
-        ));
-        Ok(())
-    }
-    pub fn connect_options(&mut self) -> Result<()> {
-        ensure!(
-            !self.running && self.flight.is_none() && !self.configuring,
-            "正在运行或配置中，请等待现有连接"
-        );
-        self.prepare_connection()?;
-        // This does not bind a scene, claim the bridge driver, or enable prompts/sending.
-        self.connect()?;
-        self.error = false;
-        self.note = "只连接读取 Agent 原生选项；不处理弹幕、不调用推理、不授予发送权。完成选择后仍须主动启动助手。".into();
-        Ok(())
-    }
-    pub fn start(&mut self, bridge: &Bridge, visible: bool, rebuild: bool) -> Result<()> {
         let preserve_routing = self.running;
         let history_room = self
             .history
@@ -1081,149 +1132,128 @@ impl Runner {
             .or_else(|| {
                 self.room_context
                     .as_ref()
-                    .map(|r| r.room_id.as_str())
+                    .map(|r| r.room_id.clone())
                     .filter(|r| !r.is_empty())
-                    .map(str::to_owned)
             })
             .unwrap_or_else(|| "local".into());
+        let mut settings = self.settings.clone();
+        settings.api.normalize()?;
+        self.prepare_workspace(&mut settings)?;
+        if settings != self.settings {
+            settings.save(&self.path)?;
+            self.settings = settings;
+            self.saved_settings = true;
+            self.record_config();
+        }
         self.history(&history_room)?;
         self.sync_bridge_scene(&bridge.status());
-        self.prepare_connection()?;
-        if rebuild && self.handle.is_some() {
-            self.remember_enabled(true)?;
-            self.restart_after_round = true;
-            self.resume_after_restart = true;
-            self.restart_visible = visible;
-            if self.flight.is_none() && !self.configuring {
-                self.begin_restart(bridge);
-            }
-            self.note = "已请求在本轮结束后重建ACP上下文；不替换在途轮".into();
-            return Ok(());
-        }
-        ensure!(self.flight.is_none(), "原prompt尚未终结，不启动并发轮次");
-        ensure!(
-            !self.needs_rebuild || rebuild,
-            "取消或不完整轮次后须确认新上下文，不能续接未知状态"
-        );
         let status = bridge.status();
         ensure!(
             status["active"] == true && status["available"] == true,
             "本场尚未就绪"
         );
         let scene = status["session"].as_str().context("场次缺少ID")?;
-        if rebuild {
-            bridge.release_driver(&self.driver);
-            self.scene = None;
-            self.workspace = None;
-            self.report = acp::Snapshot::default();
-            self.restorable = false;
-        }
+        // Every explicit start loads fresh private credentials. No HTTP, auth probe or catalog query.
+        self.refresh_key_status();
+        let handle = if self.settings.api.protocol == settings::ApiProtocol::ChatgptSubscription {
+            let id = self
+                .settings
+                .api
+                .chatgpt_account
+                .as_deref()
+                .context("请先选择订阅账号")?;
+            api::Handle::spawn_subscription(
+                self.settings.api.clone(),
+                subscription::session(&self.path, id)?,
+            )?
+        } else {
+            let key = credentials::load(&self.path, &self.settings.api)?
+                .context("当前连接未设置API Key")?;
+            api::Handle::spawn(self.settings.api.clone(), key)?
+        };
         if self.scene.as_deref() != Some(scene) {
-            if self.scene.is_some() {
-                bridge.release_driver(&self.driver);
-            }
+            bridge.release_driver(&self.driver);
             self.driver = uuid::Uuid::new_v4().to_string();
             bridge.claim_driver(&self.driver)?;
             self.scene = Some(scene.to_owned());
             self.round = 0;
-            self.context_input_bytes = 0;
-
-            if self.handle.is_none() {
-                self.report = acp::Snapshot::default();
-            }
-            self.restorable = false;
         }
         self.remember_enabled(true)?;
-        self.connect()?;
-        if !preserve_routing || rebuild || visible {
+        if !preserve_routing || visible {
             bridge.start_routing(&self.driver, self.routing_policy(), visible)?;
         } else {
             bridge.update_routing(&self.driver, self.routing_policy())?;
         }
+        self.handle = Some(handle);
         self.routing_dirty = false;
         self.error = false;
-        self.needs_rebuild = false;
         self.running = true;
+        self.workspace_checked = None;
+        self.refresh_workspace_context(bridge);
         if !preserve_routing {
             self.quiet_rounds = 0;
             self.next = Instant::now();
         }
-        self.note =
-            "已请求ACP专用会话；无新弹幕不发prompt。Agent自管账号与额度，不自动登录或授予发送权"
-                .into();
+        self.note = "本机请求worker已准备；等待新消息，尚未验证远端鉴权；不授予发送权".into();
         Ok(())
     }
     pub fn pause(&mut self, bridge: &Bridge) {
-        let report_error = self.flight.as_mut().and_then(|flight| {
-            flight
-                .finish(bridge, &self.driver, ReportState::Finished)
-                .err()
-        });
         bridge.stop_routing(&self.driver);
         self.running = false;
         self.generation = self.generation.wrapping_add(1);
-        self.pending = None;
-        self.restart_after_round = false;
-        self.resume_after_restart = false;
+        let terminal = if self.error {
+            ReportState::Failed
+        } else {
+            ReportState::Finished
+        };
+        let report_error = self
+            .flight
+            .as_mut()
+            .and_then(|flight| flight.finish(bridge, &self.driver, terminal).err());
+        let permission_error = bridge.permission(false).err();
         if let Some(handle) = &self.handle {
-            if self.flight.is_some() || self.configuring {
-                handle.cancel();
-                self.needs_rebuild = true;
-                self.restorable = false;
-                self.stopping = true;
-            } else if !self.report.connected {
-                handle.stop();
-                self.stopping = true;
+            handle.stop();
+            self.stopping = true;
+        }
+        if !self.error {
+            self.note =
+                "已暂停生成与发送；本机请求清退中，不声称远端推理或收费已停止；候选/人工草稿保留"
+                    .into();
+        }
+        for (label, error) in [
+            ("逐消息终态未写入", report_error),
+            ("撤销发送许可失败", permission_error),
+        ] {
+            if let Some(error) = error {
+                self.error = true;
+                self.note.push_str(&format!("；{label}：{error:#}"));
             }
         }
-        let _ = bridge.permission(false);
-        self.note = if self.stopping {
-            "已撤销发送许可；ACP取消/清退仍在进行，不能称模型已停止"
+    }
+    fn fatal(&mut self, bridge: &Bridge, reason: impl std::fmt::Display) {
+        let reason = reason.to_string();
+        if self.error {
+            if !self.note.contains(&reason) {
+                self.note.push_str(&format!("；{reason}"));
+            }
         } else {
-            "已暂停生成与发送；候选、编辑、人工草稿保留；在途平台发送仍按实际结果确认"
+            self.note = reason;
         }
-        .into();
-        if let Some(error) = report_error {
-            self.error = true;
-            self.note
-                .push_str(&format!("；逐消息结束状态未写入：{error}"));
-        }
+        self.error = true;
+        self.pause(bridge);
     }
     pub fn stop(&mut self, bridge: &Bridge) {
         self.pause(bridge);
-        if let Some(handle) = &self.handle {
-            handle.stop();
-            self.stopping = true;
-        }
         bridge.release_driver(&self.driver);
         self.scene = None;
-        self.restorable = false;
-        self.needs_rebuild = false;
-        if self.handle.is_none() {
-            self.workspace = None;
-            self.report = acp::Snapshot::default();
-        }
-        self.note = "助手已结束；正在释放自有连接/进程，不影响候选和人工草稿".into();
-    }
-    fn begin_restart(&mut self, bridge: &Bridge) {
-        // ACP rotation preserves scene-owned queue and send permits.
-        self.restorable = false;
-        self.needs_rebuild = false;
-        if let Some(handle) = &self.handle {
-            handle.stop();
-            self.stopping = true;
-        }
-        bridge.finish_routing_models(&self.driver);
-        self.round = 0;
-        self.context_input_bytes = 0;
-        self.workspace = None;
     }
     pub async fn shutdown(&mut self, bridge: &Bridge) {
         self.stop(bridge);
         if let Some(mut handle) = self.handle.take() {
             let _ = (&mut handle.task).await;
         }
-        self.workspace = None;
+        self.stopping = false;
+        self.closed = false;
     }
     pub fn tick(&mut self, bridge: &Bridge) {
         self.poll_history_load();
@@ -1244,80 +1274,75 @@ impl Runner {
             self.stop(bridge);
         }
         if self.running && status["available"] != true {
-            self.pause(bridge);
+            self.fatal(bridge, "本场发送身份或存储不可用");
         }
         if self.running {
             bridge.maintain_routing(&self.driver);
             if self.routing_dirty {
                 if let Err(error) = bridge.update_routing(&self.driver, self.routing_policy()) {
-                    self.pause(bridge);
-                    self.error = true;
-                    self.note = format!("消息分流配置失败：{error}");
+                    self.fatal(bridge, format!("消息分流配置失败：{error:#}"));
                 } else {
                     self.routing_dirty = false;
                 }
             }
         }
-        if let Some(handle) = self.handle.as_mut()
-            && handle.snapshot.has_changed().unwrap_or(false)
-        {
-            self.report = handle.snapshot.borrow_and_update().clone();
-        }
         loop {
-            let event = self.handle.as_mut().and_then(|h| h.events.try_recv().ok());
+            let event = self
+                .handle
+                .as_mut()
+                .and_then(|handle| handle.events.try_recv().ok());
             let Some(event) = event else {
                 break;
             };
             match event {
-                acp::Event::Ready => {
-                    if let Some(handle) = self.handle.as_mut() {
-                        self.report = handle.snapshot.borrow_and_update().clone();
-                    }
-                    if let Some(error) = self.report.restoration_error.clone() {
-                        self.pause(bridge);
-                        self.error = true;
-                        self.note = error;
-                    } else {
-                        self.note = if self.running {
-                            "ACP会话已就绪，已恢复保存的模型与思考强度"
-                        } else {
-                            "原生选项已就绪；可选择模型，仍未启用助手或授予发送权"
-                        }
-                        .into();
-                    }
-                }
-                acp::Event::Started { round_id } => {
-                    if let Some(flight) = self.flight.as_mut()
-                        && flight.round_id == round_id
-                        && flight.generation == self.generation
-                        && self.running
-                        && status["session"].as_str() == Some(flight.scene.as_str())
-                    {
-                        flight.started = true;
-                        self.workspace_applied = true;
-                        if let Err(error) =
-                            flight.report(bridge, &self.driver, ReportState::Processing)
-                        {
-                            self.pause(bridge);
-                            self.error = true;
-                            self.note = format!("逐消息开始状态未写入：{error}");
-                        }
-                    }
-                }
-                acp::Event::Answer { round_id, result } => {
-                    self.refresh_workspace_context(bridge);
-                    let Some(mut flight) = self.flight.take() else {
-                        self.error = true;
-                        self.note = "ACP出现无归属轮次结果".into();
+                api::Event::Started { round_id } => {
+                    let Some(flight) = self.flight.as_mut() else {
+                        self.fatal(bridge, "worker出现无归属Started");
                         continue;
                     };
+                    if flight.round_id != round_id || flight.started {
+                        self.fatal(bridge, "worker Started归属错误或重复");
+                        continue;
+                    }
+                    if flight.generation != self.generation
+                        || !self.running
+                        || status["session"].as_str() != Some(flight.scene.as_str())
+                    {
+                        continue;
+                    }
+                    flight.started = true;
+                    self.workspace_applied = true;
+                    if let Err(error) = flight.report(bridge, &self.driver, ReportState::Processing)
+                    {
+                        self.fatal(bridge, format!("逐消息开始状态未写入：{error:#}"));
+                    }
+                }
+                api::Event::Answer { round_id, result } => {
+                    self.refresh_workspace_context(bridge);
+                    let Some(mut flight) = self.flight.take() else {
+                        self.fatal(bridge, "worker出现无归属轮次结果");
+                        continue;
+                    };
+                    if flight.round_id != round_id {
+                        self.flight = Some(flight);
+                        self.fatal(bridge, "worker结果轮次归属错误，未提交候选");
+                        continue;
+                    }
+                    if let Ok(output) = &result {
+                        flight.returned_model = output.returned_model.clone();
+                        flight.search = Some(output.search);
+                        self.returned_model = output.returned_model.clone();
+                        self.last_search = output.search;
+                    }
+                    let result = result.map(|output| output.answer);
                     let candidate_count = match &result {
-                        Ok(acp::Answer::Candidates(candidates)) => Some(candidates.len()),
-                        Ok(acp::Answer::NoMessage) => Some(0),
+                        Ok(model::Answer::Candidates(candidates)) => Some(candidates.len()),
+                        Ok(model::Answer::NoMessage) => Some(0),
                         _ => None,
                     };
+                    let was_started = flight.started;
                     let terminal = if result.is_err()
-                        || matches!(&result, Ok(acp::Answer::Rejected(_)))
+                        || matches!(&result, Ok(model::Answer::Rejected(_)))
                         || flight.round_id != round_id
                     {
                         ReportState::Failed
@@ -1332,17 +1357,35 @@ impl Runner {
                             .context("逐消息终态未写入")?;
                         ensure!(
                             flight.round_id == round_id,
-                            "ACP结果轮次归属错误，未提交候选"
+                            "worker结果轮次归属错误，未提交候选"
                         );
                         if flight.generation != self.generation
                             || !self.running
                             || self.scene.as_deref() != status["session"].as_str()
                         {
-                            return Ok("stale");
+                            return Ok(if self.error {
+                                "error"
+                            } else if matches!(&result, Ok(model::Answer::Cancelled)) {
+                                "cancelled"
+                            } else {
+                                "stale"
+                            });
+                        }
+                        ensure!(
+                            was_started
+                                || matches!(
+                                    &result,
+                                    Ok(model::Answer::Cancelled | model::Answer::Expired)
+                                ),
+                            "worker未报告Started即返回结果"
+                        );
+                        if flight.repair.is_some() && Instant::now() >= flight.expires_at {
+                            anyhow::bail!("改写操作超过180秒，已暂停且须重新授权");
                         }
                         if flight.repair.is_none()
                             && Instant::now() >= flight.expires_at
-                            && matches!(&result, Ok(acp::Answer::Candidates(_)))
+                            && result.is_ok()
+                            && !matches!(&result, Ok(model::Answer::Cancelled))
                         {
                             bridge
                                 .expire_routing_flight(&self.driver)
@@ -1359,26 +1402,23 @@ impl Runner {
                             return Ok("stale");
                         }
                         match result {
-                            Ok(acp::Answer::Rejected(reason)) => {
-                                self.restorable = true;
+                            Ok(model::Answer::Rejected(reason)) => {
                                 self.note = format!(
                                     "本批候选已拒绝，未发送、不重试；继续处理新消息：{reason}"
                                 );
                                 Ok("rejected")
                             }
-                            Ok(acp::Answer::NoMessage) => {
-                                ensure!(
-                                    flight.repair.is_none(),
-                                    "改写须返回且仅返回一个候选，不循环补答"
-                                );
-                                self.restorable = true;
-                                self.note =
-                                    "原生轮次已结束但无回复正文；不当作已回答，不重试旧消息".into();
+                            Ok(model::Answer::NoMessage) => {
+                                if flight.repair.is_some() {
+                                    self.note =
+                                        "改写未返回唯一候选，原失败结果保留，不再改写".into();
+                                    return Ok("rejected");
+                                }
+                                self.note = "本轮无回复正文；不当作已回答，不重试旧消息".into();
                                 Ok("no_message")
                             }
-                            Ok(acp::Answer::Candidates(candidates)) => {
+                            Ok(model::Answer::Candidates(candidates)) => {
                                 if candidates.is_empty() && flight.repair.is_none() {
-                                    self.restorable = true;
                                     self.note =
                                         "本轮返回零候选，助手仍在运行；等待新消息，不重试旧消息"
                                             .into();
@@ -1394,8 +1434,8 @@ impl Runner {
                                 {
                                     review_reasons.push("activity_changed");
                                 }
-                                if flight.options != self.report.options {
-                                    review_reasons.push("options_changed");
+                                if flight.search == Some(model::SearchState::Unavailable) {
+                                    review_reasons.push("search_unavailable");
                                 }
                                 if flight.reply_strategy != self.dynamic_reply_strategy() {
                                     review_reasons.push("strategy_changed");
@@ -1410,12 +1450,17 @@ impl Runner {
                                 let automatic = review_reasons.is_empty();
                                 let count = candidates.len();
                                 if let Some(repair) = &flight.repair {
-                                    ensure!(count == 1, "改写须返回且仅返回一个候选，不循环补答");
+                                    if count != 1 {
+                                        self.note =
+                                            "改写候选数量无效，原失败结果保留，不再改写".into();
+                                        return Ok("rejected");
+                                    }
                                     let candidate = candidates.into_iter().next().unwrap();
-                                    ensure!(
-                                        candidate.message_id == repair.original.message_id,
-                                        "改写目标不匹配"
-                                    );
+                                    if candidate.message_id != repair.original.message_id {
+                                        self.note =
+                                            "改写目标不匹配，原失败结果保留，不再改写".into();
+                                        return Ok("rejected");
+                                    }
                                     let submitted = bridge.apply_repair(
                                         &self.driver,
                                         repair,
@@ -1440,7 +1485,6 @@ impl Runner {
                                         admission_states.push(submitted["state"].clone());
                                     }
                                 }
-                                self.restorable = true;
                                 if admission_states.iter().any(|state| {
                                     state != "accepted" && state != "awaiting_approval"
                                 }) {
@@ -1460,18 +1504,25 @@ impl Runner {
                                 );
                                 Ok(if queued { "queued" } else { "review" })
                             }
-                            Err(error) => {
-                                self.needs_rebuild = true;
-                                Err(anyhow::anyhow!(error))
+                            Ok(model::Answer::Cancelled) => {
+                                self.note = "本轮取消，不重放旧消息".into();
+                                Ok("cancelled")
                             }
+                            Ok(model::Answer::Expired) => {
+                                if flight.repair.is_some() {
+                                    anyhow::bail!("改写操作超过180秒，已暂停且须重新授权");
+                                }
+                                bridge.expire_routing_flight(&self.driver)?;
+                                self.note = "问题已过期，继续新消息，不重放旧批".into();
+                                Ok("expired")
+                            }
+                            Err(error) => Err(anyhow::anyhow!(error)),
                         }
                     })();
                     let outcome = match outcome {
                         Ok(outcome) => outcome,
                         Err(error) => {
-                            self.pause(bridge);
-                            self.error = true;
-                            self.note = format!("{error:#}");
+                            self.fatal(bridge, format!("{error:#}"));
                             "error"
                         }
                     };
@@ -1481,192 +1532,83 @@ impl Runner {
                     }
                     bridge.finish_routing_models(&self.driver);
                 }
-                acp::Event::Configured(result) => {
-                    self.configuring = false;
-                    if let Some(handle) = self.handle.as_mut() {
-                        self.report = handle.snapshot.borrow_and_update().clone();
-                    }
-                    let scope = self.config_scope.take();
-                    match result {
-                        Ok(()) => {
-                            if self.config_new_context {
-                                self.round = 0;
-                                self.context_input_bytes = 0;
-                            }
-                            if let Some(mut preferences) = scope {
-                                preferences.capture(&self.report.options);
-                                let mut settings = self.settings.clone();
-                                settings.remember_native(preferences);
-                                match settings.save(&self.path) {
-                                    Ok(()) => {
-                                        self.settings = settings;
-                                        self.saved_settings = true;
-                                        self.record_config();
-                                        self.error = false;
-                                        self.note = "模型与思考强度已保存，下次启动自动恢复".into();
-                                    }
-                                    Err(error) => {
-                                        self.pause(bridge);
-                                        self.error = true;
-                                        self.note = format!("参数已应用，但保存失败：{error}");
-                                    }
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            self.pause(bridge);
-                            self.error = true;
-                            self.needs_rebuild = true;
-                            self.note = error;
-                        }
-                    }
-                }
-                acp::Event::Closed(result) => {
-                    self.config_scope = None;
-                    // watch::has_changed returns Err after sender teardown, even with
-                    // an unread final snapshot. Preserve identity before dropping Handle.
-                    if let Some(handle) = self.handle.as_mut() {
-                        self.report = handle.snapshot.borrow_and_update().clone();
-                    }
+                api::Event::Closed(result) => {
+                    let expected = self.stopping;
                     self.closed = true;
-                    self.report.connected = false;
-                    if !self.stopping {
-                        self.running = false;
-                        self.generation = self.generation.wrapping_add(1);
-                        self.pending = None;
-                        self.restart_after_round = false;
-                        self.resume_after_restart = false;
-                        self.restorable = false;
-                        self.needs_rebuild = true;
-                        let _ = bridge.permission(false);
-                        match result {
-                            Err(error) if !self.error => self.note = error,
-                            Ok(()) if !self.error => {
-                                self.note = "ACP连接意外结束；已暂停并撤销发送许可".into();
-                            }
-                            Err(_) | Ok(()) => {}
-                        }
-                        self.error = true;
+                    if !expected {
+                        self.fatal(
+                            bridge,
+                            match result {
+                                Err(error) => error.to_string(),
+                                Ok(()) => "模型worker意外终止".into(),
+                            },
+                        );
+                    } else if let Err(error) = result {
+                        self.fatal(bridge, error);
                     }
                     if let Some(mut flight) = self.flight.take() {
-                        let terminal = if self.stopping {
-                            ReportState::Finished
-                        } else {
-                            ReportState::Failed
-                        };
-                        if let Err(error) = flight.finish(bridge, &self.driver, terminal) {
-                            self.error = true;
-                            self.note
-                                .push_str(&format!("；连接关闭，逐消息终态未写入：{error}"));
+                        if let Err(error) = flight.finish(
+                            bridge,
+                            &self.driver,
+                            if expected && !self.error {
+                                ReportState::Finished
+                            } else {
+                                ReportState::Failed
+                            },
+                        ) {
+                            self.fatal(bridge, format!("连接关闭，逐消息终态未写入：{error:#}"));
                         }
-                        self.needs_rebuild = true;
-                        self.restorable = false;
                         self.record_round(
                             &flight,
-                            if self.stopping { "cancelled" } else { "error" },
+                            if expected && !self.error {
+                                "cancelled"
+                            } else {
+                                "error"
+                            },
                             None,
                             &[],
                         );
+                        bridge.finish_routing_models(&self.driver);
                     }
-                    if !self.running {
-                        bridge.stop_routing(&self.driver);
-                    }
-                    self.configuring = false;
                 }
             }
         }
-        if self.closed && self.handle.as_ref().is_some_and(|h| h.task.is_finished()) {
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.task.is_finished())
+        {
+            if !self.closed {
+                self.fatal(bridge, "模型worker未报告Closed即退出");
+                if let Some(flight) = self.flight.take() {
+                    self.record_round(&flight, "error", None, &[]);
+                    bridge.finish_routing_models(&self.driver);
+                }
+            }
             self.handle = None;
             self.closed = false;
             self.stopping = false;
-            if self.scene.is_none() {
-                self.workspace = None;
-                self.report = acp::Snapshot::default();
-            }
-            if self.restart_after_round {
-                self.restart_after_round = false;
-                if self.resume_after_restart {
-                    self.resume_after_restart = false;
-
-                    if let Err(e) = self.start(bridge, self.restart_visible, false) {
-                        self.pause(bridge);
-                        self.needs_rebuild = true;
-                        self.error = true;
-                        self.note = e.to_string();
-                    }
-                }
-            }
         }
-        if self.restart_after_round && self.flight.is_none() && !self.configuring && !self.stopping
-        {
-            self.begin_restart(bridge);
+        if !self.running || self.stopping || self.handle.is_none() {
             return;
         }
-        if self.running
-            && self.report.connected
-            && !self.stopping
-            && !self.configuring
-            && self.pending.is_none()
-            && matches!(self.workspace_context, Some(Ok(_)))
-        {
+        if matches!(self.workspace_context, Some(Ok(_))) {
             let automatic = self.settings.automatic && bridge.sending_enabled();
-            match bridge.submit_routing_template(&self.driver, automatic) {
-                Ok(true) if self.flight.is_none() => {
-                    self.note =
-                        "互动已合并为代码致谢，未调用模型；仍按现有审核与发送许可处理".into()
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    self.pause(bridge);
-                    self.error = true;
-                    self.note = format!("互动致谢提交失败：{error}");
-                }
+            if let Err(error) = bridge.submit_routing_template(&self.driver, automatic) {
+                self.fatal(bridge, format!("互动致谢提交失败：{error:#}"));
+                return;
             }
         }
-        if !self.report.connected || self.stopping || self.flight.is_some() || self.configuring {
-            return;
-        }
-        if let Some(change) = self.pending.take() {
-            self.config_new_context = change.new_context;
-            self.config_scope = Some(settings::NativePreferences::scope(&self.settings));
-            match self.handle.as_ref().context("ACP连接缺失").and_then(|h| {
-                h.actions
-                    .try_send(acp::Action::Configure(change))
-                    .map_err(anyhow::Error::from)
-            }) {
-                Ok(()) => self.configuring = true,
-                Err(e) => {
-                    self.pause(bridge);
-                    self.error = true;
-                    self.needs_rebuild = true;
-                    self.note = format!("ACP请求队列已关闭：{e}");
-                }
-            }
-            return;
-        }
-        if !self.running
+        if self.flight.is_some()
+            || self.round_record.is_some()
             || (Instant::now() < self.next
                 && !(self.quiet_rounds > 0 && bridge.routing_has_priority()))
             || bridge.routing_backlog() >= 8
         {
             return;
         }
-        if self.round >= MAX_ROUNDS || self.context_input_bytes > MAX_CONTEXT_INPUT - MAX_INPUT {
-            // Rotate only ACP: retain scene ownership, inbox and current send permits.
-            // Reclaiming the driver would cancel accepted replies or reject in-flight sends.
-            self.restart_after_round = true;
-            self.resume_after_restart = true;
-            self.restart_visible = false;
-            self.begin_restart(bridge);
-            self.note =
-                "已达上下文预算（最多8轮/64KiB输入）；正在轮换，保留近期对话、处理进度与当前授权"
-                    .into();
-            return;
-        }
         if let Err(error) = self.launch(bridge) {
-            self.pause(bridge);
-            self.error = true;
-            self.note = error.to_string();
+            self.fatal(bridge, format!("{error:#}"));
         }
     }
     fn record_round(
@@ -1691,7 +1633,7 @@ impl Runner {
             .min(u64::MAX as u128) as u64;
         let label = match outcome {
             "no_reply" => "零候选，仍在运行",
-            "no_message" => "原生无正文，未回答",
+            "no_message" => "无正文，未回答",
             "queued" => "已入发送队列，非送达确认",
             "review" => "候选待批准",
             "not_queued" => "候选未全部入队",
@@ -1717,8 +1659,11 @@ impl Runner {
             "stage": "round_completed",
             "bridge_session": flight.scene,
             "round_id": flight.round_id,
-            "native_session": flight.native_session,
-            "message_ids": flight.message_ids,
+            "api_protocol": flight.api.protocol,
+            "requested_model": flight.api.model,
+            "returned_model": flight.returned_model,
+            "search_state": flight.search,
+            "message_ids": flight.message_ids.as_ref(),
             "elapsed_ms": elapsed_ms,
             "input_bytes": flight.input_bytes,
             "reply_activity": flight.settings.reply_activity,
@@ -1749,6 +1694,11 @@ impl Runner {
         session: &crate::domain::DanmuSession,
         force: bool,
     ) -> Result<()> {
+        // A session that never connected to a room has no journal yet; writing here would
+        // leave an orphan journal without `sessionStarted` that later blocks workspace binding.
+        if session.room_id.is_empty() {
+            return Ok(());
+        }
         let now = Instant::now();
         if !force && now < self.routing_audit_next {
             return Ok(());
@@ -1768,6 +1718,9 @@ impl Runner {
         let now = Instant::now();
         let wall_now = chrono::Utc::now();
         for message in bridge.routing_models(&self.driver)? {
+            if batch.ids.len() == 8 {
+                break;
+            }
             let projected = self.message_context(&serde_json::to_value(&message)?);
             let size = crate::workspace::encoded_len(&projected);
             if size > 12 * 1024 {
@@ -1784,6 +1737,18 @@ impl Runner {
                 .unwrap_or_default();
             let deadline = now + crate::bridge::routing::MAX_AGE.saturating_sub(age);
             batch.expires_at = Some(batch.expires_at.map_or(deadline, |old| old.min(deadline)));
+            if batch.search_targets.len() < 8
+                && matches!(
+                    message.event.kind,
+                    crate::domain::DanmuEventKind::Danmu | crate::domain::DanmuEventKind::Superchat
+                )
+                && let Some(target) = model::SearchTarget::from_public_question(
+                    &message.event.id,
+                    &message.event.content,
+                )
+            {
+                batch.search_targets.push(target);
+            }
             batch.ids.push(message.event.id);
             batch.messages.push(projected);
         }
@@ -1836,20 +1801,8 @@ impl Runner {
         let scene = self.scene.clone().context("未建立本场")?;
         let mut settings = self.settings.clone();
         settings.reply_activity = self.effective_reply_activity();
-        if let settings::Source::NativePrompt(path) = &settings.source
-            && Some(hosts::native_prompt_text(path)?) != self.native_prompt_text
-        {
-            self.restart_after_round = true;
-            self.resume_after_restart = true;
-            self.restart_visible = false;
-            self.begin_restart(bridge);
-            self.note =
-                "原生system文本已修改；正在重建私有进程，保留消息游标、候选和草稿，下一轮使用新版"
-                    .into();
-            return Ok(());
-        }
         if let Some(repair) = bridge.take_repair(&self.driver) {
-            return self.launch_repair(scene, settings, repair);
+            return self.launch_repair(scene, settings, repair, &bridge.recent_results());
         }
         let batch = self.select_messages(bridge, &scene)?;
         if batch.messages.is_empty() {
@@ -1863,51 +1816,58 @@ impl Runner {
             &settings,
             &bridge.recent_results(),
         )?;
-        let input_bytes = input.len();
+        let input_bytes = crate::workspace::CONTRACT.len() + input.len();
+        let deadline = batch
+            .expires_at
+            .context("批次缺少有效期")?
+            .min(Instant::now() + Duration::from_secs(180));
         let ids: Arc<[String]> = batch.ids.into();
-        let prompt = acp::Prompt {
+        let prompt = model::Prompt {
             round_id: round_id.clone(),
             text: input,
             message_ids: ids.clone(),
-            cancel_epoch: self.handle.as_ref().context("ACP连接缺失")?.epoch(),
+            cancel_epoch: self.handle.as_ref().context("模型worker缺失")?.epoch(),
+            deadline,
+            web_search: settings.web_search,
+            search_targets: batch.search_targets,
         };
         bridge.consume_routing_models(&self.driver, &ids)?;
         self.handle
             .as_ref()
-            .context("ACP连接缺失")?
-            .actions
-            .try_send(acp::Action::Prompt(prompt))?;
+            .context("模型worker缺失")?
+            .prompts
+            .try_send(prompt)?;
+        self.returned_model = None;
+        self.last_search = model::SearchState::NotRequested;
         self.round += 1;
-        self.context_input_bytes += input_bytes;
-        self.restorable = false;
         self.flight = Some(Flight {
             generation: self.generation,
             round_id,
-            expires_at: batch.expires_at.context("批次缺少有效期")?,
+            expires_at: deadline,
             dispatched_at: Instant::now(),
             input_bytes,
-            native_session: self.report.session.clone(),
+            api: settings.api.clone(),
+            returned_model: None,
+            search: None,
             microphone: self.microphone_context(),
             reply_strategy: self.reply_strategy_for(&settings),
             settings,
-            options: self.report.options.clone(),
             scene,
             message_ids: ids,
             started: false,
             repair: None,
         });
-        self.note = format!(
-            "第{}轮ACP prompt处理中；连接保留供下一轮，不使用CLI resume",
-            self.round
-        );
+        self.note = format!("第{}轮模型请求处理中；每轮独立完整上下文", self.round);
         Ok(())
     }
     fn launch_repair(
         &mut self,
         scene: String,
-        settings: Settings,
+        mut settings: Settings,
         repair: crate::bridge::Repair,
+        results: &[crate::bridge::Reply],
     ) -> Result<()> {
+        settings.web_search = false;
         let round_id = uuid::Uuid::new_v4().to_string();
         let original = repair.original_message().context("缺少冻结的原消息")?;
         let batch = Batch {
@@ -1916,7 +1876,7 @@ impl Runner {
 
             ..Batch::default()
         };
-        let base = self.round_input(&round_id, &scene, &batch, &settings, &[])?;
+        let base = self.round_input(&round_id, &scene, &batch, &settings, results)?;
         let mut payload: serde_json::Value = serde_json::from_str(&base)?;
         payload["repair"] = json!({
             "retry_of": repair.original.request_id,
@@ -1933,30 +1893,38 @@ impl Runner {
             &payload,
             &mut serde_json::Serializer::with_formatter(&mut input, InputJson),
         )?;
-        ensure!(input.len() <= MAX_INPUT, "改写输入超过24KiB，停止且不截断");
-        let input_bytes = input.len();
+        ensure!(
+            crate::workspace::CONTRACT.len() + input.len() <= MAX_INPUT,
+            "改写输入超过24KiB，停止且不截断"
+        );
+        let input_bytes = crate::workspace::CONTRACT.len() + input.len();
         let ids: Arc<[String]> = batch.ids.into();
-        let handle = self.handle.as_ref().context("ACP连接缺失")?;
-        handle.actions.try_send(acp::Action::Prompt(acp::Prompt {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let handle = self.handle.as_ref().context("模型worker缺失")?;
+        handle.prompts.try_send(model::Prompt {
             round_id: round_id.clone(),
             text: String::from_utf8(input)?,
             message_ids: ids.clone(),
             cancel_epoch: handle.epoch(),
-        }))?;
+            deadline,
+            web_search: false,
+            search_targets: Vec::new(),
+        })?;
+        self.returned_model = None;
+        self.last_search = model::SearchState::NotRequested;
         self.round += 1;
-        self.context_input_bytes += input_bytes;
-        self.restorable = false;
         self.flight = Some(Flight {
             generation: self.generation,
             round_id,
-            expires_at: Instant::now() + crate::bridge::routing::MAX_AGE,
+            expires_at: deadline,
             dispatched_at: Instant::now(),
             input_bytes,
-            native_session: self.report.session.clone(),
+            api: settings.api.clone(),
+            returned_model: None,
+            search: None,
             microphone: self.microphone_context(),
             reply_strategy: self.reply_strategy_for(&settings),
             settings,
-            options: self.report.options.clone(),
             scene,
             message_ids: ids,
             started: false,
@@ -2001,7 +1969,6 @@ impl Runner {
             "current_time": chrono::Utc::now().to_rfc3339(),
             "round": self.round + 1,
             "contract": {
-                "instruction": crate::workspace::CONTRACT,
                 "schema": {"round_id": round_id, "candidates": [{"message_id": "本批原消息ID", "text": "候选正文"}]},
                 "target_rule": "message_id只可逐字复制本轮untrusted_messages中的id，每个id最多一条候选。author_id是观众UID，不是消息ID；历史、近期对话、旧轮次和发送结果中的id均不可作为回复目标。想补充多句话请合并到同一候选text，不要重复id；不确定目标则不生成该候选。",
             },
@@ -2038,7 +2005,8 @@ impl Runner {
         });
         // References yield to this round's candidates and operator context, never vice versa.
         let mut payload_bytes = crate::workspace::encoded_len(&payload);
-        while payload_bytes > MAX_INPUT {
+        let text_budget = MAX_INPUT.saturating_sub(crate::workspace::CONTRACT.len());
+        while payload_bytes > text_budget {
             let recent = payload["untrusted_recent_conversation"]
                 .as_array_mut()
                 .unwrap();
@@ -2049,7 +2017,7 @@ impl Runner {
             payload_bytes -=
                 crate::workspace::encoded_len(&removed) + usize::from(!recent.is_empty());
         }
-        let history_budget = MAX_INPUT.saturating_sub(payload_bytes).min(4096);
+        let history_budget = text_budget.saturating_sub(payload_bytes).min(4096);
         if let Some(history) = &self.history {
             history.environment(&environment)?;
             let mut excluded = batch.ids.clone();
@@ -2103,7 +2071,7 @@ impl Runner {
             &mut serde_json::Serializer::with_formatter(&mut input, InputJson),
         )?;
         ensure!(
-            input.len() <= MAX_INPUT,
+            crate::workspace::CONTRACT.len() + input.len() <= MAX_INPUT,
             "输入超过24KiB；未调用模型，请精简偏好或关闭公开简介"
         );
         Ok(String::from_utf8(input)?)

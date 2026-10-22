@@ -3,10 +3,8 @@ use clap::Parser;
 use shisui_danmu::{
     bilibili::AccountClient,
     config::{Cli, TerminalConfig},
-    obs::{ObsConfiguration, ObsController},
-    persistence::SessionJournal,
     storage::StoragePaths,
-    terminal::{TerminalApp, configure_obs, interactive_login},
+    terminal::{configure_obs, interactive_login},
 };
 
 #[tokio::main]
@@ -21,28 +19,6 @@ async fn main() -> std::process::ExitCode {
 }
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(shisui_danmu::config::Command::Setup { adapter }) = &cli.command {
-        anyhow::ensure!(
-            cli.instance.is_none()
-                && cli.positional_room.is_none()
-                && cli.room.is_none()
-                && cli.single_line.is_none()
-                && cli.show_time.is_none()
-                && cli.show_name.is_none()
-                && !cli.hide_name
-                && cli.history_idle_seconds.is_none()
-                && cli.config.is_none()
-                && cli.theme.is_none()
-                && !cli.login
-                && !cli.logout
-                && !cli.configure_obs
-                && cli.replay.is_none(),
-            "setup 不能混用 --instance、房间、账号、OBS、回放、配置或显示参数"
-        );
-        return match adapter {
-            shisui_danmu::config::SetupAdapter::Pi => shisui_danmu::setup::prepare_pi().await,
-        };
-    }
     anyhow::ensure!(
         cli.command.is_none()
             || (cli.positional_room.is_none()
@@ -63,7 +39,6 @@ async fn run() -> Result<()> {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("必须显式指定 --instance 绝对私有目录"))?;
         return match command {
-            shisui_danmu::config::Command::Setup { .. } => unreachable!("setup 已独立分流"),
             shisui_danmu::config::Command::Local { assistant } => {
                 shisui_danmu::terminal::local(root, *assistant).await
             }
@@ -83,7 +58,9 @@ async fn run() -> Result<()> {
         };
     }
     let paths = StoragePaths::discover()?;
-    paths.ensure()?;
+    if cli.login || cli.logout || cli.configure_obs {
+        paths.ensure()?;
+    }
 
     if cli.login {
         return interactive_login(AccountClient::new(paths.account_session.clone())?).await;
@@ -98,8 +75,5 @@ async fn run() -> Result<()> {
     }
 
     let config = TerminalConfig::load(&cli, paths.config_file.clone(), paths.themes_file.clone())?;
-    let obs_configuration = ObsConfiguration::load(&paths.obs_configuration)?;
-    let obs = ObsController::new(obs_configuration, paths.obs_configuration.clone());
-    let journal = SessionJournal::new(paths.sessions_dir.clone());
-    TerminalApp::run(config, paths.account_session, obs, journal).await
+    shisui_danmu::terminal::run(config, paths).await
 }
