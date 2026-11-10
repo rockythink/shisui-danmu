@@ -4,6 +4,12 @@ description: DANMU 各版本的新增功能、体验改进、问题修复与升�
 tableOfContents:
   minHeadingLevel: 2
   maxHeadingLevel: 2
+head:
+  - tag: script
+    attrs:
+      type: application/ld+json
+    content: |
+      {"@context":"https://schema.org","@type":"WebPage","name":"更新日志","description":"DANMU 各版本的新增功能、体验改进、问题修复与升级提示，从早期 TUI 到 v0.5.1。","url":"https://danmu.elazer.wang/changelog/","isPartOf":{"@type":"WebSite","name":"DANMU","url":"https://danmu.elazer.wang/"}}
 ---
 
 每次更新，具体改了什么。
