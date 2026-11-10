@@ -6,7 +6,7 @@ head:
     attrs:
       type: application/ld+json
     content: |
-      {"@context":"https://schema.org","@type":"TechArticle","headline":"DANMU 使用手册","description":"DANMU 中文使用手册，正式版仍为 v0.5.1；设置与 AI 配置另注明未发布源码行为。","url":"https://danmu.elazer.wang/guide/"}
+      {"@context":"https://schema.org","@type":"TechArticle","headline":"DANMU 使用手册","description":"DANMU 中文使用手册，正式版仍为 v0.5.1；设置与 AI 配置另注明未发布源码行为。","url":"https://danmu.elazer.wang/guide/","isPartOf":{"@type":"WebSite","name":"DANMU","url":"https://danmu.elazer.wang/"}}
 ---
 
 当前最新正式版仍为 **DANMU v0.5.1**。DANMU 是面向知识型主播的免费开源 B 站弹幕与直播监控工作台；当前只接入 B 站，不是播放器，也不替代 OBS。程序免费开源不代表模型或搜索免费：API 计费、ChatGPT 订阅资格与额度、搜索可用性遵循各服务规则，没有默认免费模型或自动付费回退。
